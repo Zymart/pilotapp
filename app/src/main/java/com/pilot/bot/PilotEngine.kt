@@ -29,7 +29,7 @@ import kotlin.random.Random
 data class AccInfo(val pkg: String, val user: String, val status: String)
 
 object SuShell {
-    private var proc: Process? = null
+    private var proc: java.lang.Process? = null
     private var writer: BufferedWriter? = null
     private var reader: BufferedReader? = null
 
@@ -59,7 +59,7 @@ object SuShell {
         }
     }
 
-    private fun isAlive(p: Process): Boolean = try {
+    private fun isAlive(p: java.lang.Process): Boolean = try {
         p.exitValue()
         false
     } catch (_: IllegalThreadStateException) {
