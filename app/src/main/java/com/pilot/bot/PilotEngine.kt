@@ -247,17 +247,20 @@ object PilotCore {
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
             val cropped = FileInputStream(rawFile).use { fis ->
-                val decoder = BitmapRegionDecoder.newInstance(fis, false)
-                val safeRect = Rect(
-                    bounds.left.coerceIn(0, decoder.width - 1),
-                    bounds.top.coerceIn(0, decoder.height - 1),
-                    bounds.right.coerceIn(1, decoder.width),
-                    bounds.bottom.coerceIn(1, decoder.height)
-                )
-                val bmp = decoder.decodeRegion(safeRect, opts)
-                decoder.recycle()
-                bmp
-            }
+                val decoder = BitmapRegionDecoder.newInstance(fis, false) ?: return@use null
+                try {
+                    val safeRect = Rect(
+                        bounds.left.coerceIn(0, decoder.width - 1),
+                        bounds.top.coerceIn(0, decoder.height - 1),
+                        bounds.right.coerceIn(1, decoder.width),
+                        bounds.bottom.coerceIn(1, decoder.height)
+                    )
+                    decoder.decodeRegion(safeRect, opts)
+                } finally {
+                    decoder.recycle()
+                }
+            } ?: return rawFile to false
+
             val outFile = File(outPath)
             FileOutputStream(outFile).use { cropped.compress(Bitmap.CompressFormat.JPEG, 88, it) }
             cropped.recycle()
@@ -635,7 +638,7 @@ class PilotService : Service() {
         val chId = "pilot_svc"
         if (Build.VERSION.SDK_INT >= 26) {
             val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(NotificationChannel(chId, "Pilot Bot", NotificationManager.IMPORTANCE_LOW))
+            nm?.createNotificationChannel(NotificationChannel(chId, "Pilot Bot", NotificationManager.IMPORTANCE_LOW))
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)})")
