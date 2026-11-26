@@ -5,6 +5,8 @@ import android.content.*
 import android.os.*
 import android.util.Base64
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -169,11 +171,11 @@ class DiscordBot(private val ctx: Context) {
         if (!pkt.isNull("s")) seq = pkt.getInt("s")
         when (pkt.optInt("op")) {
             10 -> {
-                val interval = pkt.getJSONObject("d").getLong("heartbeat_interval")
+                val interval = max(1000L, pkt.getJSONObject("d").getLong("heartbeat_interval"))
                 hbTask?.cancel(true)
                 hbTask = exec.scheduleAtFixedRate({
                     w.send(JSONObject().put("op", 1).put("d", seq ?: JSONObject.NULL).toString())
-                }, Random.nextLong(500, interval), interval, TimeUnit.MILLISECONDS)
+                }, Random.nextLong(500L, interval), interval, TimeUnit.MILLISECONDS)
 
                 val idPayload = JSONObject().put("op", 2).put("d", JSONObject()
                     .put("token", PilotCore.getToken(ctx))
@@ -316,9 +318,10 @@ class DiscordBot(private val ctx: Context) {
     }
 
     private fun apiPost(url: String, json: JSONObject, auth: Boolean = true): String = runCatching {
-        val b = Request.Builder().url(url).post(RequestBody.create(MediaType.parse("application/json"), json.toString()))
+        val body = json.toString().toRequestBody("application/json".toMediaType())
+        val b = Request.Builder().url(url).post(body)
         if (auth) b.header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-        client.newCall(b.build()).execute().use { it.body()?.string() ?: "" }
+        client.newCall(b.build()).execute().use { it.body?.string() ?: "" }
     }.getOrDefault("")
 }
 
