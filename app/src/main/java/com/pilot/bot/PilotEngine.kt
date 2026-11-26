@@ -224,7 +224,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.2.4"
+    const val APP_VERSION = "v1.2.5"
 
     var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
@@ -434,7 +434,6 @@ object PilotCore {
         val lua = """
             repeat task.wait(0.5) until game:IsLoaded()
             local Players = game:GetService("Players")
-            local CaptureService = game:GetService("CaptureService")
             local HttpService = game:GetService("HttpService")
 
             local lp = Players.LocalPlayer
@@ -446,93 +445,22 @@ object PilotCore {
             local req = request or http_request or (syn and syn.request)
             if not req then return end
 
-            local capturing = false
-
-            local function notifyPilot(path)
+            local function snapMe()
                 pcall(function()
                     req({
-                        Url = "http://127.0.0.1:8765" .. path,
+                        Url = "http://127.0.0.1:8765/ss?user=" .. HttpService:UrlEncode(lp.Name),
                         Method = "GET"
                     })
                 end)
             end
 
-            local function onCaptured(contentId, captureObj)
-                pcall(function()
-                    if contentId and CaptureService.SaveCaptureToExternalStorage then
-                        CaptureService:SaveCaptureToExternalStorage(contentId)
-                    elseif captureObj and CaptureService.SaveCapturesToExternalStorageAsync then
-                        CaptureService:SaveCapturesToExternalStorageAsync({ captureObj })
-                    end
-                end)
-                task.wait(0.35)
-                notifyPilot("/done?user=" .. HttpService:UrlEncode(lp.Name) .. "&cid=" .. HttpService:UrlEncode(tostring(contentId or "")))
-                capturing = false
-            end
-
-            local function takeRobloxScreenshot(isAuto)
-                if capturing then return end
-                capturing = true
-                if isAuto then
-                    notifyPilot("/pre_auto?user=" .. HttpService:UrlEncode(lp.Name))
-                end
-
-                local ok = pcall(function()
-                    if CaptureService.CaptureScreenshot then
-                        CaptureService:CaptureScreenshot(function(contentId)
-                            if contentId and tostring(contentId) ~= "" then
-                                onCaptured(contentId, nil)
-                            else
-                                capturing = false
-                                notifyPilot("/fail?user=" .. HttpService:UrlEncode(lp.Name))
-                            end
-                        end)
-                    elseif CaptureService.TakeScreenshotCaptureAsync then
-                        CaptureService:TakeScreenshotCaptureAsync(function(result, screenshotCapture)
-                            if result == Enum.ScreenshotCaptureResult.Success and screenshotCapture then
-                                onCaptured(screenshotCapture.ContentId, screenshotCapture)
-                            else
-                                capturing = false
-                                notifyPilot("/fail?user=" .. HttpService:UrlEncode(lp.Name))
-                            end
-                        end, {
-                            UICaptureMode = Enum.UICaptureMode.All
-                        })
-                    else
-                        capturing = false
-                        notifyPilot("/fail?user=" .. HttpService:UrlEncode(lp.Name))
-                    end
-                end)
-
-                if not ok then
-                    capturing = false
-                    notifyPilot("/fail?user=" .. HttpService:UrlEncode(lp.Name))
-                end
-            end
-
-            getgenv().PilotSnap = function()
-                takeRobloxScreenshot(true)
-            end
+            getgenv().PilotSnap = snapMe
 
             task.spawn(function()
-                while task.wait(1.0) do
-                    local ok, res = pcall(function()
-                        return req({
-                            Url = "http://127.0.0.1:8765/poll?user=" .. HttpService:UrlEncode(lp.Name),
-                            Method = "GET"
-                        })
-                    end)
-                    if ok and res and res.Body == "SNAP" then
-                        takeRobloxScreenshot(false)
-                    end
-                end
-            end)
-
-            task.spawn(function()
-                task.wait(6)
-                takeRobloxScreenshot(true)
+                task.wait(5)
+                snapMe()
                 while task.wait(3600) do
-                    takeRobloxScreenshot(true)
+                    snapMe()
                 end
             end)
         """.trimIndent()
@@ -554,113 +482,183 @@ object PilotCore {
             for (d in dirs) {
                 SuShell.exec("mkdir -p '$d' && cp '${tmp.absolutePath}' '$d/pilot_bridge.lua' && chmod 666 '$d/pilot_bridge.lua'")
             }
-            log("[AUTOEXEC] CaptureService bridge ready in ${dirs.size} folder(s)")
+            log("[AUTOEXEC] Ready in ${dirs.size} folder(s)")
         }
     }
 
-    fun createMarker(): String {
-        val path = "/data/local/tmp/pilot_mark_${System.nanoTime()}"
-        SuShell.exec("touch '$path'")
-        return path
-    }
-
     /**
-     * Grabs the in-game image written by Roblox's built-in CaptureService—checking both
-     * external gallery folders (/sdcard/Pictures/Roblox) and Roblox's internal rbxtemp://
-     * cache (/data/data/<pkg>/cache & files), detecting PNG/JPEG headers even without extensions.
-     */
-    @Synchronized
-    fun grabLatestRobloxCapture(c: Context, pkg: String, markerPath: String): File? {
-        val destFile = File(c.cacheDir, "rbx_cap_${System.nanoTime()}.png")
-        val sh = """
-            found=""
-            for dir in /storage/emulated/0/Pictures/Roblox /storage/emulated/0/DCIM/Roblox /storage/emulated/0/Pictures /storage/emulated/0/DCIM; do
-              [ -d "${'$'}dir" ] || continue
-              for f in ${'$'}(find -L "${'$'}dir" -maxdepth 2 -type f -newer '$markerPath' 2>/dev/null); do
-                hdr=${'$'}(od -An -tx1 -N4 "${'$'}f" 2>/dev/null | tr -d ' \n')
-                case "${'$'}hdr" in
-                  89504e47*|ffd8ff*) found="${'$'}f"; break ;;
-                esac
-              done
-              [ -n "${'$'}found" ] && break
-            done
-
-            if [ -z "${'$'}found" ] && [ -n "$pkg" ]; then
-              for f in ${'$'}(find "/data/data/$pkg/cache" "/data/data/$pkg/files" -maxdepth 4 -type f -newer '$markerPath' 2>/dev/null); do
-                sz=${'$'}(stat -c '%s' "${'$'}f" 2>/dev/null || echo 0)
-                [ "${'$'}sz" -gt 4096 ] || continue
-                hdr=${'$'}(od -An -tx1 -N4 "${'$'}f" 2>/dev/null | tr -d ' \n')
-                case "${'$'}hdr" in
-                  89504e47*|ffd8ff*) found="${'$'}f"; break ;;
-                esac
-              done
-            fi
-
-            rm -f '$markerPath'
-            if [ -n "${'$'}found" ] && [ -f "${'$'}found" ]; then
-              cp "${'$'}found" '${destFile.absolutePath}'
-              chmod 666 '${destFile.absolutePath}'
-              case "${'$'}found" in
-                /storage/emulated/0/*) rm -f "${'$'}found" ;;
-              esac
-              echo "FOUND"
-            fi
-        """.trimIndent()
-
-        val out = SuShell.exec(sh)
-        return if (out.contains("FOUND") && destFile.exists() && destFile.length() > 4096L) destFile else null
-    }
-
-    /**
-     * Fallback window-bounds cropper when an account is still on the login screen (before Autoexecute runs).
-     * Ignores full-display buffer rects (e.g., 1280x720) so floating multi-window bounds are chosen accurately.
+     * Locates the exact in-game Roblox viewport for `pkg` (e.g. com.roblox.clienw) while
+     * explicitly ignoring full-display containers (`w >= fullW - 24 && h >= fullH - 96`)
+     * and trimming the floating window titlebar (`~38px`) so only the inside of that
+     * player's Roblox screen is captured.
      */
     fun findWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
-        val dump = SuShell.exec("dumpsys window windows 2>/dev/null")
-        if (dump.isEmpty()) return null
-
         val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
         val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
-        var bestFloating: Rect? = null
-        var bestFloatingArea = 0
+        val surfaceRectRx = Regex("""rect=\((-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)\)\s+(\d+)\s*x\s*(\d+)""")
 
-        for (block in dump.split("Window #")) {
-            if (!pkgRx.containsMatchIn(block)) continue
-            if (block.contains("mHasSurface=false") || block.contains("mViewVisibility=0x8")) continue
+        fun isFullDisplayContainer(w: Int, h: Int): Boolean {
+            return w >= fullW - 24 && h >= fullH - 96
+        }
 
-            for (line in block.lines()) {
-                val trimmed = line.trim()
-                if (!trimmed.contains("mFrame=") && !trimmed.contains("mBounds=") &&
-                    !trimmed.contains("content=") && !trimmed.contains("frame=")) continue
+        var bestSurfaceRect: Rect? = null
+        var bestSurfaceArea = 0
+        var bestWindowRect: Rect? = null
+        var bestWindowArea = 0
 
-                val bm = bracketRx.find(trimmed) ?: continue
-                val l = bm.groupValues[1].toIntOrNull() ?: 0
-                val t = bm.groupValues[2].toIntOrNull() ?: 0
-                val r = bm.groupValues[3].toIntOrNull() ?: 0
-                val b = bm.groupValues[4].toIntOrNull() ?: 0
-                val w = r - l
-                val h = b - t
-                // Ignore full-screen display frames; pick actual floating window bounds
-                if (w >= 150 && h >= 150 && (w < fullW - 10 || h < fullH - 10)) {
+        // 1. Parse `dumpsys window windows` for the exact package window / SurfaceView
+        val winDump = SuShell.exec("dumpsys window windows 2>/dev/null")
+        if (winDump.isNotEmpty()) {
+            for (block in winDump.split("Window #")) {
+                if (!pkgRx.containsMatchIn(block)) continue
+                if (block.contains("mHasSurface=false") || block.contains("mViewVisibility=0x8")) continue
+
+                val isSurface = block.contains("SurfaceView")
+                for (line in block.lines()) {
+                    val trimmed = line.trim()
+                    if (trimmed.contains("mParentFrame=") || trimmed.contains("mDisplayFrame=") ||
+                        trimmed.contains("parent=[") || trimmed.contains("display=[") ||
+                        trimmed.contains("mStable=") || trimmed.contains("mOverscan=")) {
+                        continue
+                    }
+
+                    val sm = surfaceRectRx.find(trimmed)
+                    if (sm != null) {
+                        val l = sm.groupValues[1].toFloatOrNull()?.toInt() ?: 0
+                        val t = sm.groupValues[2].toFloatOrNull()?.toInt() ?: 0
+                        val w = sm.groupValues[3].toIntOrNull() ?: 0
+                        val h = sm.groupValues[4].toIntOrNull() ?: 0
+                        if (w >= 140 && h >= 140 && !isFullDisplayContainer(w, h)) {
+                            val area = w * h
+                            val r = Rect(l, t, l + w, t + h)
+                            if (isSurface && area > bestSurfaceArea) {
+                                bestSurfaceArea = area
+                                bestSurfaceRect = r
+                            } else if (area > bestWindowArea) {
+                                bestWindowArea = area
+                                bestWindowRect = r
+                            }
+                        }
+                    }
+
+                    if (!trimmed.contains("mFrame=") && !trimmed.contains("mBounds=") &&
+                        !trimmed.contains("content=") && !trimmed.contains("frame=") &&
+                        !trimmed.contains("bounds=")) continue
+
+                    val bm = bracketRx.find(trimmed) ?: continue
+                    val l = bm.groupValues[1].toIntOrNull() ?: 0
+                    val t = bm.groupValues[2].toIntOrNull() ?: 0
+                    val r = bm.groupValues[3].toIntOrNull() ?: 0
+                    val b = bm.groupValues[4].toIntOrNull() ?: 0
+                    val w = r - l
+                    val h = b - t
+                    if (w < 140 || h < 140 || isFullDisplayContainer(w, h)) continue
+
                     val area = w * h
-                    if (area > bestFloatingArea) {
-                        bestFloatingArea = area
-                        bestFloating = Rect(l, t, r, b)
+                    val rect = Rect(l, t, r, b)
+                    if (isSurface && area > bestSurfaceArea) {
+                        bestSurfaceArea = area
+                        bestSurfaceRect = rect
+                    } else if (area > bestWindowArea) {
+                        bestWindowArea = area
+                        bestWindowRect = rect
                     }
                 }
             }
         }
 
-        if (bestFloating != null && bestFloating.height() > 240) {
-            return Rect(bestFloating.left, bestFloating.top + 38, bestFloating.right, bestFloating.bottom)
+        // 2. Parse `dumpsys SurfaceFlinger` BLAST SurfaceView layers
+        if (bestSurfaceRect == null && bestWindowRect == null) {
+            val sfDump = SuShell.exec("dumpsys SurfaceFlinger 2>/dev/null")
+            if (sfDump.isNotEmpty()) {
+                val sfBoundsRx = Regex("""bounds[:=\s]+\[(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\]""")
+                var activePkgBlock = false
+                var isSurfLayer = false
+                for (line in sfDump.lines()) {
+                    if (line.startsWith("+ ") || line.startsWith("Layer ") || line.startsWith("  Layer ")) {
+                        activePkgBlock = pkgRx.containsMatchIn(line)
+                        isSurfLayer = line.contains("SurfaceView")
+                    } else if (activePkgBlock) {
+                        val m = sfBoundsRx.find(line)
+                        if (m != null) {
+                            val l = m.groupValues[1].toIntOrNull() ?: 0
+                            val t = m.groupValues[2].toIntOrNull() ?: 0
+                            val r = m.groupValues[3].toIntOrNull() ?: 0
+                            val b = m.groupValues[4].toIntOrNull() ?: 0
+                            val w = r - l
+                            val h = b - t
+                            if (w >= 140 && h >= 140 && !isFullDisplayContainer(w, h)) {
+                                val area = w * h
+                                val rect = Rect(l, t, r, b)
+                                if (isSurfLayer && area > bestSurfaceArea) {
+                                    bestSurfaceArea = area
+                                    bestSurfaceRect = rect
+                                } else if (area > bestWindowArea) {
+                                    bestWindowArea = area
+                                    bestWindowRect = rect
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        return bestFloating
+
+        // 3. Parse `dumpsys activity activities` Task bounds for `pkg`
+        if (bestSurfaceRect == null && bestWindowRect == null) {
+            val actDump = SuShell.exec("dumpsys activity activities 2>/dev/null")
+            if (actDump.isNotEmpty()) {
+                for (block in actDump.split("Task{")) {
+                    if (!pkgRx.containsMatchIn(block)) continue
+                    val bm = Regex("""\b(?:mBounds|bounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""").find(block) ?: continue
+                    val l = bm.groupValues[1].toIntOrNull() ?: 0
+                    val t = bm.groupValues[2].toIntOrNull() ?: 0
+                    val r = bm.groupValues[3].toIntOrNull() ?: 0
+                    val b = bm.groupValues[4].toIntOrNull() ?: 0
+                    val w = r - l
+                    val h = b - t
+                    if (w >= 140 && h >= 140 && !isFullDisplayContainer(w, h)) {
+                        val area = w * h
+                        if (area > bestWindowArea) {
+                            bestWindowArea = area
+                            bestWindowRect = Rect(l, t, r, b)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (bestSurfaceRect != null) return bestSurfaceRect
+        if (bestWindowRect != null) {
+            // Trim the floating window's blue titlebar (~38px) & 2px border so only the inner Roblox screen remains
+            val topTrim = if (bestWindowRect.height() > 220) 38 else 0
+            val sideTrim = if (bestWindowRect.width() > 220) 2 else 0
+            return Rect(
+                bestWindowRect.left + sideTrim,
+                bestWindowRect.top + topTrim,
+                bestWindowRect.right - sideTrim,
+                bestWindowRect.bottom - sideTrim
+            )
+        }
+        return null
     }
 
     @Synchronized
-    fun captureScreen(c: Context, pkg: String? = null): Pair<File?, Boolean> {
+    fun captureScreen(c: Context, pkg: String? = null, tapInsideFirst: Boolean = false): Pair<File?, Boolean> {
         val rawPath = File(c.cacheDir, "raw.png").absolutePath
         val outPath = File(c.cacheDir, "crop.jpg").absolutePath
+
+        if (!pkg.isNullOrEmpty() && tapInsideFirst) {
+            val preBounds = findWindowBounds(pkg, 1280, 720)
+            if (preBounds != null) {
+                // Tap safe top-center inside the Roblox game viewport to wake/focus the window
+                val tapX = preBounds.centerX().coerceAtLeast(10)
+                val tapY = (preBounds.top + 28).coerceAtMost(preBounds.bottom - 10)
+                SuShell.exec("input tap $tapX $tapY")
+                runCatching { Thread.sleep(250) }
+            }
+        }
+
         SuShell.exec("screencap -p '$rawPath' && chmod 666 '$rawPath'")
         val rawFile = File(rawPath)
         if (!rawFile.exists() || rawFile.length() == 0L) return null to false
@@ -690,7 +688,7 @@ object PilotCore {
             full.recycle()
 
             val outFile = File(outPath)
-            FileOutputStream(outFile).use { cropped.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+            FileOutputStream(outFile).use { cropped.compress(Bitmap.CompressFormat.JPEG, 92, it) }
             cropped.recycle()
             rawFile.delete()
             outFile to true
@@ -865,6 +863,10 @@ class DiscordBot(private val ctx: Context) {
     @Volatile private var botId: String = ""
     @Volatile private var alive = true
 
+    // Coordinator state for multi-phone check-ins (PILOT_HERE:<anchorMsgId>:<cloud>:<ver>)
+    private val checkIns = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
+    private val checkInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
+
     fun start() { connect() }
 
     fun stop() {
@@ -886,11 +888,15 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    // !checkstatus <username> — triggers Roblox built-in CaptureService inside that player's client
-    fun sendAccountShot(ch: String, triggerMsgId: String, query: String) {
+    // !checkstatus <username> [click] — taps/focuses the player's Roblox window and crops strictly inside it
+    fun sendAccountShot(ch: String, triggerMsgId: String, rawQuery: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+        val tokens = rawQuery.trim().split(Regex("""\s+"""))
+        val tapFirst = tokens.any { it.equals("click", true) || it.equals("tap", true) }
+        val query = tokens.filterNot { it.equals("click", true) || it.equals("tap", true) }.joinToString(" ")
         val q = query.trim().lowercase()
+
         var matches = list.mapIndexedNotNull { i, a ->
             if (a.user != "Empty" && a.user.lowercase().contains(q)) i to a else null
         }
@@ -901,7 +907,7 @@ class DiscordBot(private val ctx: Context) {
         }
 
         if (matches.isEmpty()) {
-            runCatching { Thread.sleep(2000L + (abs(cl.hashCode()) % 12) * 100L) }
+            runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
             if (!hasBotRepliedAfter(ch, triggerMsgId)) {
                 sendMsg(ch, "⚠️ No matching account found for `$query` on any online cloud phone.")
             }
@@ -909,35 +915,19 @@ class DiscordBot(private val ctx: Context) {
         }
 
         for ((idx, acc) in matches) {
-            val key = acc.user.lowercase()
-            val marker = PilotCore.createMarker()
-            val req = ShotRequest(ch, idx, acc, marker)
-            PilotCore.pendingShots[key] = req
-
-            val gotLua = runCatching { req.latch.await(6000, TimeUnit.MILLISECONDS) }.getOrDefault(false)
-            PilotCore.pendingShots.remove(key)
-
-            val capFile = req.capturedFile
-            if (gotLua && capFile != null && capFile.exists()) {
-                val caption = "**📱 $cl** — In-Game Capture for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}"
-                sendImage(ch, caption, capFile)
-                capFile.delete()
+            val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg, tapInsideFirst = tapFirst)
+            val note = if (!croppedOk) "\n*(Window minimized/hidden — showing full screen)*" else ""
+            val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
+            if (img != null) {
+                sendImage(ch, caption, img)
+                img.delete()
             } else {
-                SuShell.exec("rm -f '$marker'")
-                val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
-                val note = if (!croppedOk) "\n*(Player not in-game yet — showing full screen)*" else "\n*(Window crop)*"
-                val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
-                if (img != null) {
-                    sendImage(ch, caption, img)
-                    img.delete()
-                } else {
-                    sendMsg(ch, caption)
-                }
+                sendMsg(ch, caption)
             }
         }
     }
 
-    fun sendAutoCaptureToChannel(ch: String, exactUser: String, capFile: File?) {
+    fun sendLuaWindowShot(ch: String, exactUser: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
         val q = exactUser.trim().lowercase()
@@ -946,18 +936,12 @@ class DiscordBot(private val ctx: Context) {
         }.firstOrNull() ?: return
 
         val (idx, acc) = match
-        if (capFile != null && capFile.exists()) {
-            val caption = "**📱 $cl** — In-Game Capture for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}"
-            sendImage(ch, caption, capFile)
-            capFile.delete()
-        } else {
-            val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
-            val note = if (!croppedOk) "\n*(Window minimized/hidden — showing full screen)*" else ""
-            val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
-            if (img != null) {
-                sendImage(ch, caption, img)
-                img.delete()
-            }
+        val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg, tapInsideFirst = false)
+        val note = if (!croppedOk) "\n*(Window minimized/hidden — showing full screen)*" else ""
+        val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
+        if (img != null) {
+            sendImage(ch, caption, img)
+            img.delete()
         }
     }
 
@@ -1020,10 +1004,27 @@ class DiscordBot(private val ctx: Context) {
         val ch = d.getString("channel_id")
 
         if (authorId == botId) {
-            if (content.startsWith("PILOT_PACK_REQ:")) {
-                ioExec.execute { handlePackRequest(d) }
-            } else if (content.startsWith("PILOT_XFER:")) {
-                ioExec.execute { handleTransferPayload(d) }
+            when {
+                content.startsWith("PILOT_HERE:") -> {
+                    // PILOT_HERE:<anchorMsgId>:<cloud>:<ver>
+                    val p = content.split(":", limit = 4)
+                    if (p.size >= 4) {
+                        val anchor = p[1]
+                        val cloud = p[2]
+                        val ver = p[3]
+                        checkIns.computeIfAbsent(anchor) { ConcurrentHashMap() }[cloud] = ver
+                        val mid = d.optString("id")
+                        if (mid.isNotEmpty()) {
+                            checkInMsgIds.computeIfAbsent(anchor) { ConcurrentLinkedQueue() }.add(mid)
+                        }
+                    }
+                }
+                content.startsWith("PILOT_PACK_REQ:") -> {
+                    ioExec.execute { handlePackRequest(d) }
+                }
+                content.startsWith("PILOT_XFER:") -> {
+                    ioExec.execute { handleTransferPayload(d) }
+                }
             }
             return
         }
@@ -1039,7 +1040,9 @@ class DiscordBot(private val ctx: Context) {
         when (cmd) {
             "!help", "!commands" -> ioExec.execute { sendHelp(ch, msgId) }
             "!version", "!ver" -> ioExec.execute {
-                upsertSharedTextLine(ch, msgId, "**📱 Online Pilot Instances:**", "• **$cl** — `${PilotCore.APP_VERSION}`")
+                collectAndPostSharedText(ch, msgId, "**📱 Online Pilot Instances:**") { cloud, ver ->
+                    "• **$cloud** — `$ver`"
+                }
             }
             "!createconfig", "!newconfig" -> ioExec.execute {
                 val delayMs = (abs(cl.hashCode()) % 14) * 110L
@@ -1058,17 +1061,17 @@ class DiscordBot(private val ctx: Context) {
                 )
             }
             "!scan" -> ioExec.execute {
-                upsertSharedCloudMenu(ch, msgId, "s", "**Select Cloud to Scan:**")
+                collectAndPostSharedCloudMenu(ch, msgId, "s", "**Select Cloud to Scan:**")
             }
             "!logout" -> ioExec.execute {
-                upsertSharedCloudMenu(ch, msgId, "l", "**Select Cloud to Logout:**")
+                collectAndPostSharedCloudMenu(ch, msgId, "l", "**Select Cloud to Logout:**")
             }
             "!delete" -> ioExec.execute {
-                upsertSharedCloudMenu(ch, msgId, "d", "**Select Cloud to Delete Account & History:**")
+                collectAndPostSharedCloudMenu(ch, msgId, "d", "**Select Cloud to Delete Account & History:**")
             }
             "!changeslot" -> ioExec.execute {
                 if (arg.isEmpty()) {
-                    upsertSharedCloudMenu(ch, msgId, "cs1", "**Select Source Cloud (where the account is now):**")
+                    collectAndPostSharedCloudMenu(ch, msgId, "cs1", "**Select Source Cloud (where the account is now):**")
                 } else {
                     val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
                     val match = list.firstOrNull { it.user != "Empty" && it.user.equals(arg, ignoreCase = true) }
@@ -1076,7 +1079,7 @@ class DiscordBot(private val ctx: Context) {
                         val header = "**📦 Moving `${match.user}`** (from **$cl** `${match.pkg}`)\nSelect Destination Cloud Phone:"
                         val sentRes = apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", header))
                         val anchorId = runCatching { JSONObject(sentRes).getString("id") }.getOrDefault(msgId)
-                        upsertSharedCloudMenu(ch, anchorId, "cs_dst:$cl:${match.pkg}:${match.user}", header)
+                        collectAndPostSharedCloudMenu(ch, anchorId, "cs_dst:$cl:${match.pkg}:${match.user}", header)
                     }
                 }
             }
@@ -1087,7 +1090,7 @@ class DiscordBot(private val ctx: Context) {
                     }
                 } else {
                     ioExec.execute {
-                        upsertSharedCloudMenu(ch, msgId, "r:$arg", "**Select Cloud to Rename to `$arg`:**")
+                        collectAndPostSharedCloudMenu(ch, msgId, "r:$arg", "**Select Cloud to Rename to `$arg`:**")
                     }
                 }
             }
@@ -1095,20 +1098,24 @@ class DiscordBot(private val ctx: Context) {
                 if (arg.isNotEmpty()) PilotCore.saveUpdateUrl(ctx, arg)
                 ioExec.execute {
                     val status = AppUpdater.checkAndInstall(ctx, force = true)
-                    upsertSharedTextLine(ch, msgId, "**🔄 Pilot OTA Update:**", "• **$cl** — $status")
+                    collectAndPostSharedText(ch, msgId, "**🔄 Pilot OTA Update:**") { cloud, _ ->
+                        if (cloud == cl) "• **$cloud** — $status" else "• **$cloud** — Update triggered"
+                    }
                 }
             }
             "!sschannel" -> {
                 PilotCore.saveSsChannel(ctx, ch)
                 ioExec.execute {
-                    upsertSharedTextLine(ch, msgId, "✅ **Screenshot Channel Updated:**", "• **$cl** — synced")
+                    collectAndPostSharedText(ch, msgId, "✅ **Screenshot Channel Updated:**") { cloud, ver ->
+                        "• **$cloud** (`$ver`) — synced"
+                    }
                 }
             }
             "!ss" -> ioExec.execute {
                 if (arg.equals("all", ignoreCase = true)) {
                     captureAndSendAll(ch)
                 } else {
-                    upsertSharedCloudMenu(ch, msgId, "ss", "**Select Cloud to Screenshot:**")
+                    collectAndPostSharedCloudMenu(ch, msgId, "ss", "**Select Cloud to Screenshot:**")
                 }
             }
             "!checkstatus" -> {
@@ -1136,9 +1143,9 @@ class DiscordBot(private val ctx: Context) {
                         } else null
                     }
                     if (hits.isNotEmpty()) {
-                        upsertSharedTextLine(ch, msgId, "🔍 **Search Results for `$arg`:**", hits.joinToString("\n"))
+                        sendMsg(ch, "🔍 **Match for `$arg`:**\n${hits.joinToString("\n")}")
                     } else {
-                        runCatching { Thread.sleep(2000L + (abs(cl.hashCode()) % 12) * 100L) }
+                        runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
                         if (!hasBotRepliedAfter(ch, msgId)) {
                             sendMsg(ch, "⚠️ No matching account found for `$arg` on any online cloud phone.")
                         }
@@ -1169,129 +1176,150 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    @Synchronized
-    private fun upsertSharedCloudMenu(ch: String, anchorMsgId: String, mode: String, title: String) {
-        val myCloud = PilotCore.getCloud(ctx)
-        val jitterMs = (abs(myCloud.hashCode()) % 14) * 115L
-        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
+    private fun naturalCompare(a: String, b: String): Int {
+        val rx = Regex("""(\d+|\D+)""")
+        val pa = rx.findAll(a).map { it.value }.toList()
+        val pb = rx.findAll(b).map { it.value }.toList()
+        for (i in 0 until min(pa.size, pb.size)) {
+            val na = pa[i].toLongOrNull()
+            val nb = pb[i].toLongOrNull()
+            val cmp = if (na != null && nb != null) na.compareTo(nb) else pa[i].compareTo(pb[i], ignoreCase = true)
+            if (cmp != 0) return cmp
+        }
+        return pa.size.compareTo(pb.size)
+    }
 
-        val myOption = JSONObject()
-            .put("label", "📱 $myCloud")
-            .put("value", myCloud)
-            .put("description", "${PilotCore.APP_VERSION} • Tap to select")
+    /**
+     * Single-Coordinator Collector:
+     * - One phone becomes the Coordinator (the lowest-ID canonical message).
+     * - All other online phones post a tiny `PILOT_HERE` check-in and do NOT `PATCH` the message.
+     * - The Coordinator collects all check-ins over 2.2s, deletes the `PILOT_HERE` messages, and
+     *   performs ONE clean `PATCH` so no cloud phone is ever overwritten or dropped.
+     */
+    private fun electAndCollectClouds(ch: String, anchorMsgId: String, title: String, initialBuilder: (String, String) -> JSONObject): Pair<String, Map<String, String>>? {
+        val myCloud = PilotCore.getCloud(ctx)
+        val myVer = PilotCore.APP_VERSION
+        val map = checkIns.computeIfAbsent(anchorMsgId) { ConcurrentHashMap() }
+        map[myCloud] = myVer
+
+        val jitterMs = (abs(myCloud.hashCode()) % 14) * 95L
+        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
 
         var existing = findCanonicalBotMessage(ch, anchorMsgId, title)
         if (existing == null) {
-            val menu = JSONObject()
-                .put("type", 3)
-                .put("custom_id", "pilot_cloud:$mode:row0")
-                .put("placeholder", "Select Cloud ($myCloud)...")
-                .put("options", JSONArray().put(myOption))
-            val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-            val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", title).put("components", row))
+            val initBody = initialBuilder(myCloud, myVer)
+            val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", initBody)
             val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
 
-            runCatching { Thread.sleep(320) }
+            runCatching { Thread.sleep(300) }
             val canonical = findCanonicalBotMessage(ch, anchorMsgId, title)
             if (canonical != null && postedId.isNotEmpty() && canonical.getString("id") != postedId) {
+                // Another phone won coordinator election; remove duplicate and send check-in
                 apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
-                existing = canonical
-            } else {
-                return
+                sendMsg(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
+                return null
             }
+            existing = canonical ?: JSONObject().put("id", postedId)
+        } else {
+            // Another phone is already the Coordinator; send check-in and exit
+            sendMsg(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
+            return null
         }
 
-        repeat(2) { attempt ->
-            val target = if (attempt == 0) existing!! else (findCanonicalBotMessage(ch, anchorMsgId, title) ?: return)
-            val targetId = target.getString("id")
-            val optMap = LinkedHashMap<String, JSONObject>()
+        val targetId = existing.optString("id")
+        if (targetId.isEmpty()) return null
 
-            val oldRows = target.optJSONArray("components")
-            if (oldRows != null) {
-                for (r in 0 until oldRows.length()) {
-                    val comps = oldRows.getJSONObject(r).optJSONArray("components") ?: continue
-                    for (c in 0 until comps.length()) {
-                        val opts = comps.getJSONObject(c).optJSONArray("options") ?: continue
-                        for (o in 0 until opts.length()) {
-                            val obj = opts.getJSONObject(o)
-                            val v = obj.optString("value")
-                            if (v.isNotEmpty()) optMap[v] = obj
-                        }
+        // Coordinator waits 2.2 seconds to gather all online cloud phones
+        runCatching { Thread.sleep(2200) }
+
+        // Also scan recent messages in case a PILOT_HERE arrived just before WebSocket listener indexed it
+        val recentRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$anchorMsgId&limit=50")
+        runCatching {
+            val arr = JSONArray(recentRaw)
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                val c = m.optString("content")
+                if (c.startsWith("PILOT_HERE:$anchorMsgId:")) {
+                    val p = c.split(":", limit = 4)
+                    if (p.size >= 4) {
+                        map[p[2]] = p[3]
+                        val mid = m.optString("id")
+                        if (mid.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$mid")
                     }
                 }
             }
-            optMap[myCloud] = myOption
-
-            val sortedOpts = optMap.values.sortedWith { a, b ->
-                a.optString("value").compareTo(b.optString("value"), ignoreCase = true)
-            }
-
-            val rows = JSONArray()
-            val chunks = sortedOpts.chunked(25).take(5)
-            chunks.forEachIndexed { idx, chunk ->
-                val arr = JSONArray()
-                chunk.forEach { arr.put(it) }
-                val ph = if (chunks.size > 1) {
-                    "Select Cloud (${idx * 25 + 1}–${idx * 25 + chunk.size})..."
-                } else {
-                    "Select Cloud (${sortedOpts.size} online)..."
-                }
-                val menu = JSONObject()
-                    .put("type", 3)
-                    .put("custom_id", "pilot_cloud:$mode:row$idx")
-                    .put("placeholder", ph)
-                    .put("options", arr)
-                rows.put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-            }
-
-            apiPatch("https://discord.com/api/v10/channels/$ch/messages/$targetId", JSONObject().put("content", title).put("components", rows))
-            runCatching { Thread.sleep(280) }
-            val verify = findCanonicalBotMessage(ch, anchorMsgId, title)
-            if (verify != null && verify.toString().contains("\"value\":\"$myCloud\"")) return
         }
+
+        // Clean up any queued check-in messages
+        val q = checkInMsgIds.remove(anchorMsgId)
+        if (q != null) {
+            while (true) {
+                val mid = q.poll() ?: break
+                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$mid")
+            }
+        }
+
+        val snapshot = LinkedHashMap<String, String>()
+        map.keys.sortedWith { a, b -> naturalCompare(a, b) }.forEach { k ->
+            snapshot[k] = map[k] ?: myVer
+        }
+        checkIns.remove(anchorMsgId)
+        return targetId to snapshot
     }
 
-    @Synchronized
-    private fun upsertSharedTextLine(ch: String, anchorMsgId: String, header: String, myLine: String) {
-        val myCloud = PilotCore.getCloud(ctx)
-        val jitterMs = (abs(myCloud.hashCode()) % 14) * 115L
-        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
+    private fun collectAndPostSharedCloudMenu(ch: String, anchorMsgId: String, mode: String, title: String) {
+        val result = electAndCollectClouds(ch, anchorMsgId, title) { myCloud, myVer ->
+            val opt = JSONObject()
+                .put("label", "📱 $myCloud")
+                .put("value", myCloud)
+                .put("description", "$myVer • Tap to select")
+            val menu = JSONObject()
+                .put("type", 3)
+                .put("custom_id", "pilot_cloud:$mode:row0")
+                .put("placeholder", "Scanning online clouds...")
+                .put("options", JSONArray().put(opt))
+            val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+            JSONObject().put("content", title).put("components", row)
+        } ?: return
 
-        var existing = findCanonicalBotMessage(ch, anchorMsgId, header)
-        if (existing == null) {
-            val body = "$header\n$myLine"
-            val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", body))
-            val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
+        val (targetId, cloudsMap) = result
+        val allOpts = cloudsMap.map { (cloud, ver) ->
+            JSONObject()
+                .put("label", "📱 $cloud")
+                .put("value", cloud)
+                .put("description", "$ver • Tap to select")
+        }
 
-            runCatching { Thread.sleep(320) }
-            val canonical = findCanonicalBotMessage(ch, anchorMsgId, header)
-            if (canonical != null && postedId.isNotEmpty() && canonical.getString("id") != postedId) {
-                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
-                existing = canonical
+        val rows = JSONArray()
+        val chunks = allOpts.chunked(25).take(5)
+        chunks.forEachIndexed { idx, chunk ->
+            val arr = JSONArray()
+            chunk.forEach { arr.put(it) }
+            val ph = if (chunks.size > 1) {
+                "Select Cloud (${idx * 25 + 1}–${idx * 25 + chunk.size})..."
             } else {
-                return
+                "Select Cloud (${allOpts.size} online)..."
             }
+            val menu = JSONObject()
+                .put("type", 3)
+                .put("custom_id", "pilot_cloud:$mode:row$idx")
+                .put("placeholder", ph)
+                .put("options", arr)
+            rows.put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
         }
 
-        repeat(2) { attempt ->
-            val target = if (attempt == 0) existing!! else (findCanonicalBotMessage(ch, anchorMsgId, header) ?: return)
-            val targetId = target.getString("id")
-            val curLines = target.optString("content").lines()
-                .drop(1)
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .toMutableList()
+        apiPatch("https://discord.com/api/v10/channels/$ch/messages/$targetId", JSONObject().put("content", title).put("components", rows))
+    }
 
-            curLines.removeAll { it.contains("**$myCloud**") }
-            curLines.add(myLine)
-            val sorted = curLines.sortedWith { a, b -> a.compareTo(b, ignoreCase = true) }
-            val newContent = "$header\n${sorted.joinToString("\n")}".take(1950)
+    private fun collectAndPostSharedText(ch: String, anchorMsgId: String, header: String, lineFormatter: (String, String) -> String) {
+        val result = electAndCollectClouds(ch, anchorMsgId, header) { myCloud, myVer ->
+            JSONObject().put("content", "$header\n${lineFormatter(myCloud, myVer)}")
+        } ?: return
 
-            apiPatch("https://discord.com/api/v10/channels/$ch/messages/$targetId", JSONObject().put("content", newContent))
-            runCatching { Thread.sleep(280) }
-            val verify = findCanonicalBotMessage(ch, anchorMsgId, header)
-            if (verify != null && verify.optString("content").contains("**$myCloud**")) return
-        }
+        val (targetId, cloudsMap) = result
+        val lines = cloudsMap.map { (cloud, ver) -> lineFormatter(cloud, ver) }
+        val newContent = "$header\n${lines.joinToString("\n")}".take(1950)
+        apiPatch("https://discord.com/api/v10/channels/$ch/messages/$targetId", JSONObject().put("content", newContent))
     }
 
     private fun findCanonicalBotMessage(ch: String, anchorMsgId: String, prefix: String): JSONObject? {
@@ -1312,11 +1340,12 @@ class DiscordBot(private val ctx: Context) {
 
     private fun hasBotRepliedAfter(ch: String, triggerMsgId: String): Boolean {
         if (botId.isEmpty() || triggerMsgId.isEmpty()) return false
-        val afterRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$triggerMsgId&limit=8")
+        val afterRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$triggerMsgId&limit=10")
         return runCatching {
             val arr = JSONArray(afterRaw)
             (0 until arr.length()).any { i ->
-                arr.getJSONObject(i).optJSONObject("author")?.optString("id") == botId
+                val m = arr.getJSONObject(i)
+                m.optJSONObject("author")?.optString("id") == botId && !m.optString("content").startsWith("PILOT_HERE:")
             }
         }.getOrDefault(false)
     }
@@ -1421,7 +1450,7 @@ class DiscordBot(private val ctx: Context) {
             **🔍 Monitoring & Search**
             • `!scan` — Select a cloud phone to list all Roblox instances & statuses
             • `!search <username>` — Find which cloud & slot has an account (exact or close match)
-            • `!checkstatus <username>` — Capture an **in-game** screenshot via Roblox `CaptureService`
+            • `!checkstatus <username> [click]` — Capture **only** inside that player's Roblox screen (add `click` to tap/focus it first)
             • `!version` — Show the installed Pilot version on every online cloud phone
 
             **📸 Screenshots & Auto-Capture**
@@ -1595,8 +1624,6 @@ class DiscordBot(private val ctx: Context) {
         val mode = cid.substring(firstColon + 1, lastColon)
         val suffix = cid.substring(lastColon + 1)
 
-        // Reply with type = 4 (CHANNEL_MESSAGE_WITH_SOURCE) so the shared cloud dropdown stays
-        // visible in chat and all online cloud phones (Cloud Phone 1, CLOUD PHONE 2, etc.) remain selectable!
         if (kind == "pilot_cloud") {
             if (!sel.equals(myCloud, ignoreCase = true)) return
 
@@ -1707,7 +1734,7 @@ class DiscordBot(private val ctx: Context) {
             replyInteraction(id, token, 7, JSONObject().put("content", header).put("components", JSONArray()))
             if (ch.isNotEmpty() && msgId.isNotEmpty()) {
                 ioExec.execute {
-                    upsertSharedCloudMenu(ch, msgId, "cs_dst:$myCloud:$srcPkg:$srcUser", header)
+                    collectAndPostSharedCloudMenu(ch, msgId, "cs_dst:$myCloud:$srcPkg:$srcUser", header)
                 }
             }
         } else if (kind == "pilot_cs3") {
@@ -1821,7 +1848,7 @@ class PilotService : Service() {
     private var bot: DiscordBot? = null
     private var wl: PowerManager.WakeLock? = null
     private val syncExec = Executors.newSingleThreadScheduledExecutor()
-    private val bridgePool = Executors.newFixedThreadPool(3)
+    private val bridgePool = Executors.newFixedThreadPool(2)
     private var localServer: ServerSocket? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -1838,7 +1865,7 @@ class PilotService : Service() {
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
-            .setContentText("GVIP Optimized • CaptureService Bridge Active")
+            .setContentText("GVIP Optimized • Auto-syncing Roblox")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)
@@ -1863,74 +1890,20 @@ class PilotService : Service() {
 
         Thread {
             runCatching {
-                localServer = ServerSocket(8765, 30, InetAddress.getByName("127.0.0.1"))
+                localServer = ServerSocket(8765, 20, InetAddress.getByName("127.0.0.1"))
                 while (isRunning) {
                     val sock = localServer?.accept() ?: break
                     bridgePool.execute {
                         runCatching {
                             val reqLine = sock.getInputStream().bufferedReader().readLine() ?: ""
-                            val pathAndQuery = reqLine.substringAfter(" ", "").substringBefore(" ")
-                            val userParam = Regex("""[?&]user=([^&\s]+)""").find(pathAndQuery)?.groupValues?.get(1)
-                            val user = if (!userParam.isNullOrEmpty()) URLDecoder.decode(userParam, "UTF-8").trim() else ""
-                            val key = user.lowercase()
-
-                            when {
-                                pathAndQuery.startsWith("/poll") -> {
-                                    val reply = if (key.isNotEmpty() && PilotCore.pendingShots.containsKey(key)) "SNAP" else "IDLE"
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: ${reply.length}\r\n\r\n$reply".toByteArray())
-                                    sock.close()
-                                }
-
-                                pathAndQuery.startsWith("/pre_auto") -> {
-                                    if (key.isNotEmpty()) {
-                                        val old = PilotCore.autoMarkers.put(key, PilotCore.createMarker())
-                                        if (!old.isNullOrEmpty()) SuShell.exec("rm -f '$old'")
-                                    }
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                }
-
-                                pathAndQuery.startsWith("/done") || pathAndQuery.startsWith("/ss") -> {
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                    if (key.isNotEmpty()) {
-                                        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(this) }
-                                        val pkg = list.firstOrNull { it.user.equals(user, ignoreCase = true) }?.pkg ?: ""
-                                        val pending = PilotCore.pendingShots[key]
-                                        if (pending != null) {
-                                            pending.capturedFile = PilotCore.grabLatestRobloxCapture(this, pkg, pending.markerPath)
-                                            pending.latch.countDown()
-                                            PilotCore.log("[CAPTURE] In-game shot ready for $user")
-                                        } else {
-                                            val autoMark = PilotCore.autoMarkers.remove(key)
-                                            val capFile = if (!autoMark.isNullOrEmpty()) {
-                                                PilotCore.grabLatestRobloxCapture(this, pkg, autoMark)
-                                            } else null
-                                            val ch = PilotCore.getSsChannel(this)
-                                            if (ch.isNotEmpty()) {
-                                                PilotCore.log("[LUA-SS] $user")
-                                                bot?.sendAutoCaptureToChannel(ch, user, capFile)
-                                            } else {
-                                                capFile?.delete()
-                                            }
-                                        }
-                                    }
-                                }
-
-                                pathAndQuery.startsWith("/fail") -> {
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                    if (key.isNotEmpty()) {
-                                        PilotCore.pendingShots[key]?.latch?.countDown()
-                                        val old = PilotCore.autoMarkers.remove(key)
-                                        if (!old.isNullOrEmpty()) SuShell.exec("rm -f '$old'")
-                                    }
-                                }
-
-                                else -> {
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                }
+                            sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
+                            sock.close()
+                            val userParam = Regex("""[?&]user=([^&\s]+)""").find(reqLine)?.groupValues?.get(1)
+                            val ch = PilotCore.getSsChannel(this)
+                            if (!userParam.isNullOrEmpty() && ch.isNotEmpty()) {
+                                val user = URLDecoder.decode(userParam, "UTF-8")
+                                PilotCore.log("[LUA-SS] $user")
+                                bot?.sendLuaWindowShot(ch, user)
                             }
                         }
                     }
