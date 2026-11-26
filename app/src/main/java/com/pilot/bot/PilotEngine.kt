@@ -461,7 +461,7 @@ object PilotCore {
             done
             cnt=0
             if [ -n "$safeUser" ]; then
-              cd /storage/emulated/0 2>/dev/null && find -L . -maxdepth 8 -iname "*${safeUser}*" ! -path "./Android/data/*" ! -path "./Android/obb/*" 2>/dev/null | while IFS= read -r rel; do
+              cd /storage/emulated/0 2>/dev/null && find -L . -maxdepth 8 -iname "*${safeUser}*" ! -path "./Android/data/*" ! -path "./Android/obb/*" ! -path "./DCIM/*" ! -path "./Pictures/*" ! -path "./Movies/*" ! -path "./Music/*" 2>/dev/null | while IFS= read -r rel; do
                 [ -z "${'$'}rel" ] && continue
                 clean=${'$'}{rel#./}
                 mkdir -p "$stageDir/ext/${'$'}(dirname "${'$'}clean")"
@@ -555,6 +555,7 @@ object PilotCore {
 class DiscordBot(private val ctx: Context) {
     private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
     private val exec = Executors.newSingleThreadScheduledExecutor()
+    private val ioExec = Executors.newFixedThreadPool(2)
     private var ws: WebSocket? = null
     private var hbTask: ScheduledFuture<*>? = null
     private var seq: Int? = null
@@ -568,6 +569,7 @@ class DiscordBot(private val ctx: Context) {
         hbTask?.cancel(true)
         ws?.close(1000, "Stopped")
         exec.shutdownNow()
+        ioExec.shutdownNow()
     }
 
     fun captureAndSendAll(ch: String) {
@@ -668,6 +670,28 @@ class DiscordBot(private val ctx: Context) {
         val content = d.optString("content").trim()
         val ch = d.getString("channel_id")
 
+        // Live cropped screenshot request from main.py Ongoing Ticket Panel / /checkstatus
+        if (content.startsWith("PILOT_SHOT_REQ:") && (author.optBoolean("bot", false) || authorId == ownerId)) {
+            val p = content.split(":", limit = 3)
+            if (p.size == 3) {
+                val reqId = p[1]
+                val targetUser = p[2].trim()
+                ioExec.execute {
+                    val exactAcc = PilotCore.scanRbx(ctx).firstOrNull {
+                        it.user != "Empty" && it.user.equals(targetUser, ignoreCase = true)
+                    }
+                    if (exactAcc != null) {
+                        val (img, _) = PilotCore.captureScreen(ctx, exactAcc.pkg)
+                        if (img != null) {
+                            sendImage(ch, "PILOT_SHOT_RES:$reqId:${exactAcc.user}", img)
+                            img.delete()
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         // Cross-cloud slot transfer relay & destination menu broadcast
         if (authorId == botId) {
             if (content.startsWith("PILOT_DEST_REQ:")) {
@@ -680,7 +704,7 @@ class DiscordBot(private val ctx: Context) {
                     postDestinationSlots(ch, p[2], p[3], p[4])
                 }
             } else if (content.startsWith("PILOT_XFER:")) {
-                handleTransferPayload(d)
+                ioExec.execute { handleTransferPayload(d) }
             }
             return
         }
@@ -694,7 +718,7 @@ class DiscordBot(private val ctx: Context) {
         val arg = parts.getOrNull(1)?.trim() ?: ""
 
         when (cmd) {
-            "!help", "!commands" -> sendHelp(ch, msgId)
+            "!help", "!commands" -> ioExec.execute { sendHelp(ch, msgId) }
             "!scan" -> sendCloudMenu(ch, cl, "s", "**Select Cloud to Scan:**")
             "!logout" -> sendCloudMenu(ch, cl, "l", "**Select Cloud to Logout:**")
             "!delete" -> sendCloudMenu(ch, cl, "d", "**Select Cloud to Delete Account & History:**")
@@ -716,17 +740,19 @@ class DiscordBot(private val ctx: Context) {
             }
             "!update" -> {
                 if (arg.isNotEmpty()) PilotCore.saveUpdateUrl(ctx, arg)
-                val status = AppUpdater.checkAndInstall(ctx, force = true)
-                sendMsg(ch, "**📱 $cl** — $status")
+                ioExec.execute {
+                    val status = AppUpdater.checkAndInstall(ctx, force = true)
+                    sendMsg(ch, "**📱 $cl** — $status")
+                }
             }
             "!sschannel" -> {
                 PilotCore.saveSsChannel(ctx, ch)
                 sendMsg(ch, "✅ **📱 $cl** — Screenshots will now post to this channel.")
             }
-            "!ss" -> captureAndSendAll(ch)
+            "!ss" -> ioExec.execute { captureAndSendAll(ch) }
             "!checkstatus" -> {
                 if (arg.isEmpty()) sendMsg(ch, "⚠️ **Missing username!** Usage: `!checkstatus <username>`")
-                else sendAccountShot(ch, arg)
+                else ioExec.execute { sendAccountShot(ch, arg) }
             }
             "!search" -> {
                 if (arg.isEmpty()) {
@@ -788,7 +814,6 @@ class DiscordBot(private val ctx: Context) {
         val content = d.optString("content").trim()
         val ch = d.optString("channel_id")
         val msgId = d.optString("id")
-        // Format: PILOT_XFER:go:<srcCloud>:<srcPkg>:<srcUser>:<dstCloud>:<dstPkg>
         val parts = content.split(":", limit = 7)
         if (parts.size < 7) return
         val srcCloud = parts[2]
@@ -965,24 +990,26 @@ class DiscordBot(private val ctx: Context) {
 
             replyInteraction(id, token, 7, JSONObject().put("content", "⏳ Moving **$srcUser** (`$srcCloud` `$srcPkg` → **$dstCloud** `$dstPkg`)...").put("components", JSONArray()))
 
-            val (bundle, fileCount) = PilotCore.packAccountBundle(ctx, srcPkg, srcUser)
-            PilotCore.wipe(ctx, srcPkg, true)
+            ioExec.execute {
+                val (bundle, fileCount) = PilotCore.packAccountBundle(ctx, srcPkg, srcUser)
+                PilotCore.wipe(ctx, srcPkg, true)
 
-            if (bundle == null) {
-                if (ch.isNotEmpty()) sendMsg(ch, "❌ Failed to package **$srcUser** from **$srcCloud**.")
-                return
-            }
-
-            if (srcCloud == dstCloud) {
-                val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
-                if (ch.isNotEmpty()) {
-                    if (ok) sendMsg(ch, "✅ Moved **$srcUser** locally on **$myCloud**: `$srcPkg` → `$dstPkg` (`$restoredFiles` script file(s)).")
-                    else sendMsg(ch, "❌ Target slot `$dstPkg` not found on **$myCloud**.")
+                if (bundle == null) {
+                    if (ch.isNotEmpty()) sendMsg(ch, "❌ Failed to package **$srcUser** from **$srcCloud**.")
+                    return@execute
                 }
-            } else if (ch.isNotEmpty()) {
-                PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
-                sendFile(ch, "PILOT_XFER:go:$srcCloud:$srcPkg:$srcUser:$dstCloud:$dstPkg", bundle, "xfer_${srcUser}.tar.gz")
-                bundle.delete()
+
+                if (srcCloud == dstCloud) {
+                    val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
+                    if (ch.isNotEmpty()) {
+                        if (ok) sendMsg(ch, "✅ Moved **$srcUser** locally on **$myCloud**: `$srcPkg` → `$dstPkg` (`$restoredFiles` script file(s)).")
+                        else sendMsg(ch, "❌ Target slot `$dstPkg` not found on **$myCloud**.")
+                    }
+                } else if (ch.isNotEmpty()) {
+                    PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
+                    sendFile(ch, "PILOT_XFER:go:$srcCloud:$srcPkg:$srcUser:$dstCloud:$dstPkg", bundle, "xfer_${srcUser}.tar.gz")
+                    bundle.delete()
+                }
             }
         } else if (kind == "pilot_acc") {
             val isDel = mode == "d"
