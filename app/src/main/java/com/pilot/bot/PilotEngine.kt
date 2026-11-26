@@ -23,7 +23,6 @@ import java.net.ServerSocket
 import java.net.URLDecoder
 import java.util.concurrent.*
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.random.Random
 
 data class AccInfo(val pkg: String, val user: String, val status: String)
@@ -81,7 +80,7 @@ object AppUpdater {
         val u = raw.trim()
         if (u.isEmpty()) return ""
         val driveId = Regex("""drive\.google\.com/(?:file/d/|open\?id=|uc\?.*?\bid=)([a-zA-Z0-9_-]{15,})""").find(u)?.groupValues?.get(1)
-        return if (!driveId.isNullOrEmpty()) "https://drive.google.com/uc?export=download&id=$driveId" else u
+        return if (!driveId.isNullOrEmpty()) "[https://drive.google.com/uc?export=download&id=$driveId](https://drive.google.com/uc?export=download&id=$driveId)" else u
     }
 
     @Synchronized
@@ -110,7 +109,7 @@ object AppUpdater {
                 }.getOrDefault("$downloadUrl|${System.currentTimeMillis() / 3600000}")
                 newTag = sig
             } else {
-                val apiUrl = "https://api.github.com/repos/Zymart/pilotapp/releases/tags/latest"
+                val apiUrl = "[https://api.github.com/repos/Zymart/pilotapp/releases/tags/latest](https://api.github.com/repos/Zymart/pilotapp/releases/tags/latest)"
                 val req = Request.Builder().url(apiUrl)
                     .header("Accept", "application/vnd.github+json")
                     .header("User-Agent", "PilotUpdater").build()
@@ -144,14 +143,40 @@ object AppUpdater {
 
             PilotCore.log("[UPD] Installing silently via root...")
             val tmpPath = "/data/local/tmp/pilot_upd.apk"
-            val res = SuShell.exec("cp '${apkFile.absolutePath}' '$tmpPath' && chmod 644 '$tmpPath' && pm install -r -d '$tmpPath' && rm -f '$tmpPath'")
+            val res = SuShell.exec("cp '${apkFile.absolutePath}' '$tmpPath' && chmod 644 '$tmpPath' && pm install -r -d '$tmpPath'")
             apkFile.delete()
 
             return if (res.contains("Success", ignoreCase = true)) {
+                SuShell.exec("rm -f '$tmpPath'")
                 prefs.edit().putString("last_upd_tag", newTag).apply()
                 PilotCore.log("[UPD] Installed! Restarting service...")
-                "Update installed! Restarting bot..."
+                "Update installed! Restarting agent..."
+            } else if (res.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE", ignoreCase = true)) {
+                prefs.edit().putString("last_upd_tag", newTag).apply()
+                PilotCore.log("[UPD] Signature changed — migrating data & reinstalling...")
+                val swapScript = """
+                    nohup sh -c '
+                      sleep 2
+                      rm -rf /data/local/tmp/pilot_prefs_bak
+                      cp -rf /data/data/com.pilot.bot/shared_prefs /data/local/tmp/pilot_prefs_bak 2>/dev/null
+                      pm uninstall com.pilot.bot >/dev/null 2>&1
+                      pm install -g "$tmpPath" >/dev/null 2>&1
+                      rm -f "$tmpPath"
+                      if [ -d /data/local/tmp/pilot_prefs_bak ]; then
+                        mkdir -p /data/data/com.pilot.bot/shared_prefs
+                        cp -rf /data/local/tmp/pilot_prefs_bak/. /data/data/com.pilot.bot/shared_prefs/
+                        uid=${'$'}(stat -c "%u:%g" /data/data/com.pilot.bot 2>/dev/null)
+                        [ -n "${'$'}uid" ] && chown -R ${'$'}uid /data/data/com.pilot.bot/shared_prefs
+                        restorecon -RF /data/data/com.pilot.bot 2>/dev/null
+                        rm -rf /data/local/tmp/pilot_prefs_bak
+                      fi
+                      am start-foreground-service -n com.pilot.bot/.PilotService >/dev/null 2>&1 || am startservice -n com.pilot.bot/.PilotService >/dev/null 2>&1
+                    ' >/dev/null 2>&1 &
+                """.trimIndent()
+                SuShell.exec(swapScript)
+                "Signature migrated! Reinstalling & restarting agent in 3s..."
             } else {
+                SuShell.exec("rm -f '$tmpPath'")
                 PilotCore.log("[UPD] Install error: $res")
                 "Install failed: $res"
             }
@@ -172,7 +197,7 @@ object AppUpdater {
                     val uuid = Regex("""name="uuid"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
                     val id = Regex("""[?&]id=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1)
                     if (!id.isNullOrEmpty() && !confirm.isNullOrEmpty()) {
-                        val bypass = "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=$confirm" +
+                        val bypass = "[https://drive.usercontent.google.com/download?id=$id&export=download&confirm=$confirm](https://drive.usercontent.google.com/download?id=$id&export=download&confirm=$confirm)" +
                                 (if (!uuid.isNullOrEmpty()) "&uuid=$uuid" else "")
                         return downloadBinary(bypass, dest)
                     }
@@ -189,7 +214,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    var logs = "Engine initialized.\n"
+    var logs = "Agent initialized.\n"
     var onLog: (() -> Unit)? = null
 
     fun log(msg: String) {
@@ -305,7 +330,7 @@ object PilotCore {
             local function snapMe()
                 pcall(function()
                     req({
-                        Url = "http://127.0.0.1:8765/ss?user=" .. lp.Name,
+                        Url = "[http://127.0.0.1:8765/ss?user=](http://127.0.0.1:8765/ss?user=)" .. lp.Name,
                         Method = "GET"
                     })
                 end)
@@ -530,29 +555,15 @@ object PilotCore {
         }
         return "`[${idx + 1}]` **${a.user}** $tag — `${a.pkg}`"
     }
-
-    fun fmtAll(list: List<AccInfo>) = list.mapIndexed { i, a -> fmtLine(i, a) }.joinToString("\n")
-
-    fun similarity(s1: String, s2: String): Double {
-        val longer = if (s1.length >= s2.length) s1 else s2
-        val shorter = if (s1.length >= s2.length) s2 else s1
-        if (longer.isEmpty()) return 1.0
-        val costs = IntArray(shorter.length + 1) { it }
-        for (i in 1..longer.length) {
-            var lastVal = i
-            for (j in 1..shorter.length) {
-                val newVal = if (longer[i - 1] == shorter[j - 1]) costs[j - 1]
-                else min(min(costs[j - 1], lastVal), costs[j]) + 1
-                costs[j - 1] = lastVal
-                lastVal = newVal
-            }
-            costs[shorter.length] = lastVal
-        }
-        return (longer.length - costs[shorter.length]) / longer.length.toDouble()
-    }
 }
 
-class DiscordBot(private val ctx: Context) {
+/**
+ * Silent background agent for UGPhone.
+ * All user-facing commands live inside the central Python bot (main.py) so 43+ cloud phones
+ * never produce duplicate responses. This agent only answers internal PILOT_PING, PILOT_CMD,
+ * and PILOT_XFER bridge messages, plus local Lua screenshot triggers on 127.0.0.1:8765.
+ */
+class PilotBridgeAgent(private val ctx: Context) {
     private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
     private val exec = Executors.newSingleThreadScheduledExecutor()
     private val ioExec = Executors.newFixedThreadPool(2)
@@ -572,42 +583,22 @@ class DiscordBot(private val ctx: Context) {
         ioExec.shutdownNow()
     }
 
-    fun captureAndSendAll(ch: String) {
-        val cl = PilotCore.getCloud(ctx)
-        val list = PilotCore.scanRbx(ctx)
-        val summary = if (list.isNotEmpty()) "\n${PilotCore.fmtAll(list)}" else ""
-        val (img, _) = PilotCore.captureScreen(ctx, null)
-        if (img != null) {
-            sendImage(ch, "**📱 $cl** — Full Screen:$summary", img)
-            img.delete()
-        }
-    }
-
     fun sendAccountShot(ch: String, query: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.scanRbx(ctx)
         val q = query.trim().lowercase()
-        var matches = list.mapIndexedNotNull { i, a ->
-            if (a.user != "Empty" && a.user.lowercase().contains(q)) i to a else null
+        val matches = list.mapIndexedNotNull { i, a ->
+            if (a.user != "Empty" && a.user.lowercase() == q) i to a else null
         }
-        if (matches.isEmpty()) {
-            matches = list.mapIndexedNotNull { i, a ->
-                if (a.user != "Empty" && PilotCore.similarity(q, a.user.lowercase()) >= 0.45) i to a else null
-            }
-        }
-        if (matches.isEmpty()) {
-            sendMsg(ch, "⚠️ **📱 $cl** — No matching account found for `$query`.")
-            return
-        }
+        if (matches.isEmpty()) return
+
         for ((idx, acc) in matches) {
             val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
             val note = if (!croppedOk) "\n*(Window hidden — showing full screen)*" else ""
-            val caption = "**📱 $cl** — Status for `${query}`:\n${PilotCore.fmtLine(idx, acc)}$note"
+            val caption = "**📱 $cl** — Auto Screenshot:\n${PilotCore.fmtLine(idx, acc)}$note"
             if (img != null) {
-                sendImage(ch, caption, img)
+                sendFile(ch, caption, img, if (img.name.endsWith(".jpg")) "screen.jpg" else "screen.png")
                 img.delete()
-            } else {
-                sendMsg(ch, caption)
             }
         }
     }
@@ -643,8 +634,8 @@ class DiscordBot(private val ctx: Context) {
 
                 val idPayload = JSONObject().put("op", 2).put("d", JSONObject()
                     .put("token", PilotCore.getToken(ctx))
-                    .put("intents", 37377)
-                    .put("properties", JSONObject().put("os", "android").put("browser", "pilot").put("device", "pilot")))
+                    .put("intents", 33281)
+                    .put("properties", JSONObject().put("os", "android").put("browser", "pilot-agent").put("device", "pilot-agent")))
                 w.send(idPayload.toString())
             }
             1 -> w.send(JSONObject().put("op", 1).put("d", seq ?: JSONObject.NULL).toString())
@@ -656,173 +647,158 @@ class DiscordBot(private val ctx: Context) {
                     val userObj = d.getJSONObject("user")
                     botId = userObj.optString("id", "")
                     val u = userObj.getString("username")
-                    PilotCore.log("[ONLINE] $u | ${PilotCore.getCloud(ctx)}")
-                } else if (type == "MESSAGE_CREATE") onMessageCreate(d)
-                else if (type == "INTERACTION_CREATE") onInteraction(d)
+                    PilotCore.log("[ONLINE] Agent ready ($u) | ${PilotCore.getCloud(ctx)}")
+                } else if (type == "MESSAGE_CREATE") {
+                    onBridgeMessage(d)
+                }
             }
         }
     }
 
-    private fun onMessageCreate(d: JSONObject) {
+    private fun onBridgeMessage(d: JSONObject) {
         val ownerId = PilotCore.getUserId(ctx).toString()
         val author = d.optJSONObject("author") ?: return
         val authorId = author.optString("id")
-        val content = d.optString("content").trim()
-        val ch = d.getString("channel_id")
+        val isTrusted = author.optBoolean("bot", false) || authorId == ownerId || (botId.isNotEmpty() && authorId == botId)
+        if (!isTrusted) return
 
-        // Live cropped screenshot request from main.py Ongoing Ticket Panel / /checkstatus
-        if (content.startsWith("PILOT_SHOT_REQ:") && (author.optBoolean("bot", false) || authorId == ownerId)) {
-            val p = content.split(":", limit = 3)
-            if (p.size == 3) {
-                val reqId = p[1]
-                val targetUser = p[2].trim()
+        val content = d.optString("content").trim()
+        val ch = d.optString("channel_id")
+        if (ch.isEmpty() || content.isEmpty()) return
+
+        when {
+            content.startsWith("PILOT_PING:") -> {
+                val reqId = content.removePrefix("PILOT_PING:").trim()
+                if (reqId.isEmpty()) return
                 ioExec.execute {
-                    val exactAcc = PilotCore.scanRbx(ctx).firstOrNull {
-                        it.user != "Empty" && it.user.equals(targetUser, ignoreCase = true)
+                    val myCloud = PilotCore.getCloud(ctx)
+                    val list = PilotCore.scanRbx(ctx)
+                    val arr = JSONArray()
+                    for (a in list) {
+                        arr.put(JSONObject().put("pkg", a.pkg).put("user", a.user).put("status", a.status))
                     }
-                    if (exactAcc != null) {
-                        val (img, _) = PilotCore.captureScreen(ctx, exactAcc.pkg)
-                        if (img != null) {
-                            sendImage(ch, "PILOT_SHOT_RES:$reqId:${exactAcc.user}", img)
-                            img.delete()
-                        }
-                    }
+                    val payload = JSONObject().put("cloud", myCloud).put("accs", arr).toString()
+                    sendMsg(ch, "PILOT_PONG:$reqId:$payload")
                 }
             }
-            return
-        }
 
-        // Cross-cloud slot transfer relay & destination menu broadcast
-        if (authorId == botId) {
-            if (content.startsWith("PILOT_DEST_REQ:")) {
-                val p = content.split(":", limit = 5)
-                if (p.size == 5) {
-                    val msgIdToDel = d.optString("id")
-                    if (p[2] == PilotCore.getCloud(ctx) && msgIdToDel.isNotEmpty()) {
-                        apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgIdToDel")
-                    }
-                    postDestinationSlots(ch, p[2], p[3], p[4])
-                }
-            } else if (content.startsWith("PILOT_XFER:")) {
+            content.startsWith("PILOT_CMD:") -> {
+                // Format: PILOT_CMD:<reqId>:<targetCloud>:<action>:<arg>
+                val parts = content.split(":", limit = 5)
+                if (parts.size < 4) return
+                val reqId = parts[1]
+                val targetCloud = parts[2]
+                val action = parts[3].uppercase()
+                val arg = parts.getOrNull(4) ?: ""
+                val myCloud = PilotCore.getCloud(ctx)
+                if (targetCloud != "*" && !targetCloud.equals(myCloud, ignoreCase = true)) return
+
+                ioExec.execute { handleBridgeCommand(ch, reqId, myCloud, action, arg) }
+            }
+
+            content.startsWith("PILOT_XFER:") -> {
                 ioExec.execute { handleTransferPayload(d) }
             }
-            return
-        }
-
-        if (authorId != ownerId) return
-        if (!content.startsWith("!")) return
-        val msgId = d.optString("id", "")
-        val cl = PilotCore.getCloud(ctx)
-        val parts = content.split(" ", limit = 2)
-        val cmd = parts[0].lowercase()
-        val arg = parts.getOrNull(1)?.trim() ?: ""
-
-        when (cmd) {
-            "!help", "!commands" -> ioExec.execute { sendHelp(ch, msgId) }
-            "!scan" -> sendCloudMenu(ch, cl, "s", "**Select Cloud to Scan:**")
-            "!logout" -> sendCloudMenu(ch, cl, "l", "**Select Cloud to Logout:**")
-            "!delete" -> sendCloudMenu(ch, cl, "d", "**Select Cloud to Delete Account & History:**")
-            "!changeslot" -> {
-                if (arg.isEmpty()) {
-                    sendCloudMenu(ch, cl, "cs1", "**Select Source Cloud (where the account is now):**")
-                } else {
-                    val list = PilotCore.scanRbx(ctx)
-                    val match = list.firstOrNull { it.user != "Empty" && it.user.equals(arg, ignoreCase = true) }
-                    if (match != null) {
-                        val xferId = (1..6).map { ('a'..'z').random() }.joinToString("")
-                        sendMsg(ch, "PILOT_DEST_REQ:$xferId:$cl:${match.pkg}:${match.user}")
-                    }
-                }
-            }
-            "!rename" -> {
-                if (arg.isEmpty()) sendMsg(ch, "⚠️ **Missing name!** Usage: `!rename <New Cloud Name>`")
-                else sendCloudMenu(ch, cl, "r:$arg", "**Select Cloud to Rename to `$arg`:**")
-            }
-            "!update" -> {
-                if (arg.isNotEmpty()) PilotCore.saveUpdateUrl(ctx, arg)
-                ioExec.execute {
-                    val status = AppUpdater.checkAndInstall(ctx, force = true)
-                    sendMsg(ch, "**📱 $cl** — $status")
-                }
-            }
-            "!sschannel" -> {
-                PilotCore.saveSsChannel(ctx, ch)
-                sendMsg(ch, "✅ **📱 $cl** — Screenshots will now post to this channel.")
-            }
-            "!ss" -> ioExec.execute { captureAndSendAll(ch) }
-            "!checkstatus" -> {
-                if (arg.isEmpty()) sendMsg(ch, "⚠️ **Missing username!** Usage: `!checkstatus <username>`")
-                else ioExec.execute { sendAccountShot(ch, arg) }
-            }
-            "!search" -> {
-                if (arg.isEmpty()) {
-                    sendMsg(ch, "⚠️ **Missing username!** Usage: `!search <username>`")
-                    return
-                }
-                val list = PilotCore.scanRbx(ctx)
-                val q = arg.lowercase()
-                val exact = list.mapIndexedNotNull { i, a -> if (a.user != "Empty" && a.user.lowercase().contains(q)) PilotCore.fmtLine(i, a) else null }
-                if (exact.isNotEmpty()) {
-                    sendMsg(ch, "**📱 $cl** — Match for `$arg`:\n${exact.joinToString("\n")}")
-                } else {
-                    val near = list.mapIndexedNotNull { i, a ->
-                        if (a.user != "Empty" && PilotCore.similarity(q, a.user.lowercase()) >= 0.45) PilotCore.fmtLine(i, a) else null
-                    }
-                    if (near.isNotEmpty()) sendMsg(ch, "**📱 $cl** — No exact match for `$arg`, near match:\n${near.joinToString("\n")}")
-                    else sendMsg(ch, "⚠️ **📱 $cl** — No matching account found for `$arg`.")
-                }
-            }
-            "!config" -> {
-                val code = PilotCore.makeCode(ctx)
-                val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", ownerId))
-                val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
-                if (dmCh.isNotEmpty()) {
-                    sendMsg(dmCh, "**Your Pilot Sync Code:**\n`$code`\n```\n$code\n```")
-                    sendMsg(ch, "Sent your new config code to your DMs!")
-                }
-            }
-            else -> sendMsg(ch, "⚠️ **Invalid command!** Type `!help` to view all available commands.")
         }
     }
 
-    private fun postDestinationSlots(ch: String, srcCloud: String, srcPkg: String, srcUser: String) {
-        val myCloud = PilotCore.getCloud(ctx)
-        val list = PilotCore.scanRbx(ctx)
-        if (list.isEmpty()) return
-        val opts = JSONArray()
-        list.forEachIndexed { i, a ->
-            if (!(myCloud == srcCloud && a.pkg == srcPkg)) {
-                opts.put(
-                    JSONObject()
-                        .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})")
-                        .put("value", "$srcCloud|$srcPkg|$srcUser|$myCloud|${a.pkg}")
-                        .put("description", "Move $srcUser into this slot on $myCloud")
-                )
+    private fun handleBridgeCommand(ch: String, reqId: String, myCloud: String, action: String, arg: String) {
+        when (action) {
+            "SHOT" -> {
+                val pkg = if (arg.isEmpty() || arg.equals("ALL", ignoreCase = true)) null else arg
+                val (img, _) = PilotCore.captureScreen(ctx, pkg)
+                if (img != null) {
+                    val fname = if (img.name.endsWith(".jpg")) "crop.jpg" else "screen.png"
+                    sendFile(ch, "PILOT_RES:$reqId:$myCloud", img, fname)
+                    img.delete()
+                }
+            }
+            "LOGOUT" -> {
+                if (arg.equals("ALL", ignoreCase = true)) {
+                    PilotCore.scanRbx(ctx).forEach { PilotCore.wipe(ctx, it.pkg, false) }
+                    sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:Logged out ALL slots.")
+                } else if (arg.isNotEmpty()) {
+                    PilotCore.wipe(ctx, arg, false)
+                    sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:Logged out `$arg`.")
+                }
+            }
+            "DELETE" -> {
+                if (arg.equals("ALL", ignoreCase = true)) {
+                    PilotCore.scanRbx(ctx).forEach { PilotCore.wipe(ctx, it.pkg, true) }
+                    sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:Deleted ALL accounts & history (now Empty).")
+                } else if (arg.isNotEmpty()) {
+                    PilotCore.wipe(ctx, arg, true)
+                    sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:Deleted `$arg` & history (now Empty).")
+                }
+            }
+            "RENAME" -> {
+                val newName = arg.trim()
+                if (newName.isNotEmpty()) {
+                    PilotCore.setCloudName(ctx, newName)
+                    PilotCore.log("[RENAME] $myCloud -> $newName")
+                    sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:Renamed to **$newName**.")
+                }
+            }
+            "SSCHAN" -> {
+                val targetCh = arg.trim()
+                if (targetCh.isNotEmpty()) {
+                    PilotCore.saveSsChannel(ctx, targetCh)
+                    sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:Screenshot channel set.")
+                }
+            }
+            "UPDATE" -> {
+                if (arg.trim().isNotEmpty()) PilotCore.saveUpdateUrl(ctx, arg.trim())
+                val status = AppUpdater.checkAndInstall(ctx, force = true)
+                sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:$status")
+            }
+            "PACK" -> {
+                // arg: <srcPkg>|<srcUser>|<dstCloud>|<dstPkg>
+                val p = arg.split("|", limit = 4)
+                if (p.size < 4) return
+                val srcPkg = p[0]
+                val srcUser = p[1]
+                val dstCloud = p[2]
+                val dstPkg = p[3]
+
+                val (bundle, fileCount) = PilotCore.packAccountBundle(ctx, srcPkg, srcUser)
+                PilotCore.wipe(ctx, srcPkg, true)
+
+                if (bundle == null) {
+                    sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:❌ Failed to package **$srcUser**.")
+                    return
+                }
+
+                if (dstCloud.equals(myCloud, ignoreCase = true)) {
+                    val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
+                    if (ok) {
+                        sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:✅ Moved **$srcUser** locally (`$srcPkg` → `$dstPkg`, `$restoredFiles` script file(s)).")
+                    } else {
+                        sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:❌ Target slot `$dstPkg` not found.")
+                    }
+                } else {
+                    PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
+                    sendFile(ch, "PILOT_XFER:$reqId:$myCloud:$srcPkg:$srcUser:$dstCloud:$dstPkg", bundle, "xfer_${srcUser}.tar.gz")
+                    bundle.delete()
+                }
             }
         }
-        if (opts.length() == 0) return
-        val menu = JSONObject()
-            .put("type", 3)
-            .put("custom_id", "pilot_cs3:go:$srcCloud")
-            .put("placeholder", "📱 $myCloud — Pick destination slot for $srcUser...")
-            .put("options", opts)
-        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-        sendMsg(ch, "**📱 $myCloud** — Select destination slot to receive **$srcUser** (from **$srcCloud**):", row)
     }
 
     private fun handleTransferPayload(d: JSONObject) {
         val content = d.optString("content").trim()
         val ch = d.optString("channel_id")
         val msgId = d.optString("id")
+        // Format: PILOT_XFER:<reqId>:<srcCloud>:<srcPkg>:<srcUser>:<dstCloud>:<dstPkg>
         val parts = content.split(":", limit = 7)
         if (parts.size < 7) return
+        val reqId = parts[1]
         val srcCloud = parts[2]
         val srcPkg = parts[3]
         val srcUser = parts[4]
         val dstCloud = parts[5]
         val dstPkg = parts[6]
         val myCloud = PilotCore.getCloud(ctx)
-        if (dstCloud != myCloud) return
+        if (!dstCloud.equals(myCloud, ignoreCase = true)) return
 
         val atts = d.optJSONArray("attachments") ?: return
         if (atts.length() == 0) return
@@ -842,238 +818,46 @@ class DiscordBot(private val ctx: Context) {
         }.getOrDefault(false)
 
         if (!downloaded) {
-            sendMsg(ch, "❌ **📱 $myCloud** — Failed to download transfer bundle for **$srcUser**.")
+            sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:❌ Failed to download transfer bundle for **$srcUser**.")
             return
         }
 
         val (ok, scriptCount) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, tmpBundle)
-        if (msgId.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgId")
+        if (msgId.isNotEmpty()) apiDelete("[https://discord.com/api/v10/channels/$ch/messages/$msgId](https://discord.com/api/v10/channels/$ch/messages/$msgId)")
 
         if (ok) {
             PilotCore.log("[XFER-OK] $srcUser restored to $dstPkg (+$scriptCount script files)")
             sendMsg(
                 ch,
-                "✅ **Slot Transfer Complete!**\n" +
-                "• **Account:** `$srcUser`\n" +
-                "• **From:** **$srcCloud** (`$srcPkg` → now Empty)\n" +
-                "• **To:** **$myCloud** (`$dstPkg`)\n" +
-                "• **Script Data Restored:** `$scriptCount` file(s)"
+                "PILOT_ACK:$reqId:$myCloud:✅ Moved **$srcUser** from **$srcCloud** (`$srcPkg`) → **$myCloud** (`$dstPkg`) • `$scriptCount` script file(s) restored."
             )
         } else {
-            sendMsg(ch, "❌ **📱 $myCloud** — Target package `$dstPkg` not found on this cloud phone.")
+            sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:❌ Target package `$dstPkg` not found.")
         }
     }
 
-    private fun sendHelp(ch: String, triggerMsgId: String) {
-        val delayMs = ((PilotCore.getCloud(ctx).hashCode() and 0x7fffffff) % 1400).toLong()
-        if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
-
-        if (botId.isNotEmpty() && triggerMsgId.isNotEmpty()) {
-            val afterRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$triggerMsgId&limit=5")
-            val alreadyReplied = runCatching {
-                val arr = JSONArray(afterRaw)
-                (0 until arr.length()).any { i ->
-                    arr.getJSONObject(i).optJSONObject("author")?.optString("id") == botId
-                }
-            }.getOrDefault(false)
-            if (alreadyReplied) return
-        }
-
-        val helpText = """
-            **📖 PILOT BOT COMMANDS**
-
-            **🔍 Monitoring & Search**
-            • `!scan` — Select a cloud phone to list all Roblox instances & statuses
-            • `!search <username>` — Find which cloud & slot has an account (exact or close match)
-            • `!checkstatus <username>` — Capture & crop **only** that player's Roblox window
-
-            **📸 Screenshots & Auto-Capture**
-            • `!ss` — Capture a full-screen screenshot of your cloud phone(s)
-            • `!sschannel` — Set this channel for hourly Delta auto-screenshots & Lua triggers
-            • *Lua Trigger:* Call `getgenv().PilotSnap()` inside any Delta script
-
-            **⚙️ Account & Cloud Management**
-            • `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
-            • `!logout` — Log out one or all accounts on a cloud (keeps last username history)
-            • `!delete` — Wipe session data **and** clear username history (resets to Empty)
-            • `!rename <new name>` — Remotely rename a cloud phone
-            • `!update [drive_url]` — Check & silently install the latest Pilot APK
-            • `!config` — DM yourself a `XXXXXXX-...` sync code to clone settings
-            • `!help` — Show this command guide
-        """.trimIndent()
-
-        sendMsg(ch, helpText)
-    }
-
-    private fun onInteraction(d: JSONObject) {
-        if (d.optInt("type") != 3) return
-        val id = d.getString("id")
-        val token = d.getString("token")
-        val user = d.optJSONObject("member")?.optJSONObject("user") ?: d.optJSONObject("user") ?: return
-        val ownerId = PilotCore.getUserId(ctx).toString()
-        val ch = d.optString("channel_id")
-        val data = d.getJSONObject("data")
-        val cid = data.optString("custom_id")
-        val vals = data.optJSONArray("values") ?: return
-        val sel = vals.optString(0)
-
-        val firstColon = cid.indexOf(':')
-        val lastColon = cid.lastIndexOf(':')
-        if (firstColon <= 0 || lastColon <= firstColon) return
-
-        val kind = cid.substring(0, firstColon)
-        val mode = cid.substring(firstColon + 1, lastColon)
-        val targetCloud = cid.substring(lastColon + 1)
-        val myCloud = PilotCore.getCloud(ctx)
-        if (targetCloud != myCloud) return
-
-        if (user.optString("id") != ownerId) {
-            replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
-            return
-        }
-
-        if (kind == "pilot_cloud") {
-            if (mode.startsWith("r:")) {
-                val newName = mode.removePrefix("r:").trim()
-                PilotCore.setCloudName(ctx, newName)
-                PilotCore.log("[RENAME] $myCloud -> $newName")
-                replyInteraction(id, token, 4, JSONObject().put("content", "✅ Renamed **$myCloud** to **$newName**.").put("flags", 64))
-                return
-            }
-
-            val list = PilotCore.scanRbx(ctx)
-            if (list.isEmpty()) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No instances found.").put("flags", 64))
-                return
-            }
-            if (mode == "s") {
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud:**\n${PilotCore.fmtAll(list)}").put("flags", 64))
-            } else if (mode == "cs1") {
-                val activeList = list.filter { it.user != "Empty" }
-                if (activeList.isEmpty()) {
-                    replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No accounts available to move.").put("flags", 64))
-                    return
-                }
-                val opts = JSONArray()
-                activeList.take(25).forEach { a ->
-                    opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})").put("value", "${a.pkg}|${a.user}"))
-                }
-                val menu = JSONObject().put("type", 3).put("custom_id", "pilot_cs2:move:$myCloud")
-                    .put("placeholder", "Select account to move from $myCloud...").put("options", opts)
-                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — Select which account to move:\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
-            } else {
-                val opts = JSONArray().put(JSONObject().put("label", if (mode == "d") "DELETE ALL DATA & HISTORY" else "LOGOUT ALL ON THIS CLOUD").put("value", "ALL"))
-                list.take(24).forEach { a -> opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})").put("value", a.pkg)) }
-                val menu = JSONObject().put("type", 3).put("custom_id", "pilot_acc:$mode:$myCloud")
-                    .put("placeholder", "Select account on $myCloud...").put("options", opts)
-                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                val label = if (mode == "d") "Select account to **DELETE** (wipes session + history):" else "Select account to **LOGOUT**:"
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — $label\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
-            }
-        } else if (kind == "pilot_cs2") {
-            val srcPkg = sel.substringBefore("|")
-            val srcUser = sel.substringAfter("|", "")
-            val xferId = (1..6).map { ('a'..'z').random() }.joinToString("")
-            replyInteraction(id, token, 7, JSONObject().put("content", "📦 Preparing **$srcUser** (`$srcPkg`) on **$myCloud**... Pick destination slot below:").put("components", JSONArray()))
-            if (ch.isNotEmpty()) {
-                sendMsg(ch, "PILOT_DEST_REQ:$xferId:$myCloud:$srcPkg:$srcUser")
-            }
-        } else if (kind == "pilot_cs3") {
-            val p = sel.split("|", limit = 5)
-            if (p.size < 5) return
-            val srcCloud = p[0]
-            val srcPkg = p[1]
-            val srcUser = p[2]
-            val dstCloud = p[3]
-            val dstPkg = p[4]
-
-            replyInteraction(id, token, 7, JSONObject().put("content", "⏳ Moving **$srcUser** (`$srcCloud` `$srcPkg` → **$dstCloud** `$dstPkg`)...").put("components", JSONArray()))
-
-            ioExec.execute {
-                val (bundle, fileCount) = PilotCore.packAccountBundle(ctx, srcPkg, srcUser)
-                PilotCore.wipe(ctx, srcPkg, true)
-
-                if (bundle == null) {
-                    if (ch.isNotEmpty()) sendMsg(ch, "❌ Failed to package **$srcUser** from **$srcCloud**.")
-                    return@execute
-                }
-
-                if (srcCloud == dstCloud) {
-                    val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
-                    if (ch.isNotEmpty()) {
-                        if (ok) sendMsg(ch, "✅ Moved **$srcUser** locally on **$myCloud**: `$srcPkg` → `$dstPkg` (`$restoredFiles` script file(s)).")
-                        else sendMsg(ch, "❌ Target slot `$dstPkg` not found on **$myCloud**.")
-                    }
-                } else if (ch.isNotEmpty()) {
-                    PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
-                    sendFile(ch, "PILOT_XFER:go:$srcCloud:$srcPkg:$srcUser:$dstCloud:$dstPkg", bundle, "xfer_${srcUser}.tar.gz")
-                    bundle.delete()
-                }
-            }
-        } else if (kind == "pilot_acc") {
-            val isDel = mode == "d"
-            if (sel == "ALL") {
-                PilotCore.scanRbx(ctx).forEach { PilotCore.wipe(ctx, it.pkg, isDel) }
-                val msg = if (isDel) "**📱 $myCloud** — Deleted ALL accounts & history (now Empty)." else "**📱 $myCloud** — Logged out ALL."
-                replyInteraction(id, token, 7, JSONObject().put("content", msg).put("components", JSONArray()))
-            } else {
-                PilotCore.wipe(ctx, sel, isDel)
-                val msg = if (isDel) "**📱 $myCloud** — Deleted all data & history for `$sel` (now Empty)." else "**📱 $myCloud** — Logged out `$sel`."
-                replyInteraction(id, token, 7, JSONObject().put("content", msg).put("components", JSONArray()))
-            }
-        }
-    }
-
-    private fun sendCloudMenu(ch: String, cl: String, mode: String, title: String) {
-        val opt = JSONArray().put(JSONObject().put("label", "📱 $cl").put("value", cl).put("description", "Tap to select"))
-        val menu = JSONObject().put("type", 3).put("custom_id", "pilot_cloud:$mode:$cl")
-            .put("placeholder", "Select Cloud ($cl)...").put("options", opt)
-        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-        sendMsg(ch, title, row)
-    }
-
-    private fun sendMsg(ch: String, content: String, components: JSONArray? = null) {
-        val body = JSONObject().put("content", content)
-        if (components != null) body.put("components", components)
-        apiPost("https://discord.com/api/v10/channels/$ch/messages", body)
+    private fun sendMsg(ch: String, content: String) {
+        apiPost("[https://discord.com/api/v10/channels/$ch/messages](https://discord.com/api/v10/channels/$ch/messages)", JSONObject().put("content", content))
     }
 
     private fun sendFile(ch: String, caption: String, file: File, fileName: String) {
         runCatching {
+            val mime = when {
+                fileName.endsWith(".jpg", true) || fileName.endsWith(".jpeg", true) -> "image/jpeg"
+                fileName.endsWith(".png", true) -> "image/png"
+                else -> "application/gzip"
+            }
             val mp = MultipartBody.Builder().setType(MultipartBody.FORM)
                 .addFormDataPart("payload_json", JSONObject().put("content", caption).toString())
-                .addFormDataPart("files[0]", fileName, file.asRequestBody("application/gzip".toMediaType()))
+                .addFormDataPart("files[0]", fileName, file.asRequestBody(mime.toMediaType()))
                 .build()
             val req = Request.Builder()
-                .url("https://discord.com/api/v10/channels/$ch/messages")
+                .url("[https://discord.com/api/v10/channels/$ch/messages](https://discord.com/api/v10/channels/$ch/messages)")
                 .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
                 .post(mp)
                 .build()
             client.newCall(req).execute().close()
         }
-    }
-
-    private fun sendImage(ch: String, caption: String, file: File) {
-        runCatching {
-            val isJpg = file.name.endsWith(".jpg")
-            val mime = if (isJpg) "image/jpeg" else "image/png"
-            val fname = if (isJpg) "screen.jpg" else "screen.png"
-            val mp = MultipartBody.Builder().setType(MultipartBody.FORM)
-                .addFormDataPart("payload_json", JSONObject().put("content", caption).toString())
-                .addFormDataPart("files[0]", fname, file.asRequestBody(mime.toMediaType()))
-                .build()
-            val req = Request.Builder()
-                .url("https://discord.com/api/v10/channels/$ch/messages")
-                .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-                .post(mp)
-                .build()
-            client.newCall(req).execute().close()
-        }
-    }
-
-    private fun replyInteraction(id: String, token: String, type: Int, data: JSONObject) {
-        apiPost("https://discord.com/api/v10/interactions/$id/$token/callback", JSONObject().put("type", type).put("data", data), auth = false)
     }
 
     private fun apiDelete(url: String) {
@@ -1085,24 +869,18 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    private fun apiGet(url: String): String = runCatching {
+    private fun apiPost(url: String, json: JSONObject): String = runCatching {
+        val body = json.toString().toRequestBody("application/json".toMediaType())
         val req = Request.Builder().url(url)
             .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-            .get().build()
+            .post(body).build()
         client.newCall(req).execute().use { it.body?.string() ?: "" }
-    }.getOrDefault("")
-
-    private fun apiPost(url: String, json: JSONObject, auth: Boolean = true): String = runCatching {
-        val body = json.toString().toRequestBody("application/json".toMediaType())
-        val b = Request.Builder().url(url).post(body)
-        if (auth) b.header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-        client.newCall(b.build()).execute().use { it.body?.string() ?: "" }
     }.getOrDefault("")
 }
 
 class PilotService : Service() {
     companion object { var isRunning = false }
-    private var bot: DiscordBot? = null
+    private var agent: PilotBridgeAgent? = null
     private var wl: PowerManager.WakeLock? = null
     private val syncExec = Executors.newSingleThreadScheduledExecutor()
     private val bridgePool = Executors.newFixedThreadPool(2)
@@ -1118,17 +896,17 @@ class PilotService : Service() {
         val chId = "pilot_svc"
         if (Build.VERSION.SDK_INT >= 26) {
             val nm = getSystemService(NotificationManager::class.java)
-            nm?.createNotificationChannel(NotificationChannel(chId, "Pilot Bot", NotificationManager.IMPORTANCE_LOW))
+            nm?.createNotificationChannel(NotificationChannel(chId, "Pilot Agent", NotificationManager.IMPORTANCE_LOW))
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
-            .setContentTitle("Pilot Active (${PilotCore.getCloud(this)})")
-            .setContentText("GVIP Optimized • Auto-syncing Roblox")
+            .setContentTitle("Pilot Agent (${PilotCore.getCloud(this)})")
+            .setContentText("GVIP Optimized • Silent Bridge Active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)
 
         wl = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Pilot::Lock").apply { acquire() }
-        bot = DiscordBot(this).apply { start() }
+        agent = PilotBridgeAgent(this).apply { start() }
 
         bridgePool.execute { PilotCore.installAutoExec(this) }
 
@@ -1160,7 +938,7 @@ class PilotService : Service() {
                             if (!userParam.isNullOrEmpty() && ch.isNotEmpty()) {
                                 val user = URLDecoder.decode(userParam, "UTF-8")
                                 PilotCore.log("[LUA-SS] $user")
-                                bot?.sendAccountShot(ch, user)
+                                agent?.sendAccountShot(ch, user)
                             }
                         }
                     }
@@ -1174,7 +952,7 @@ class PilotService : Service() {
         runCatching { localServer?.close() }
         syncExec.shutdownNow()
         bridgePool.shutdownNow()
-        bot?.stop()
+        agent?.stop()
         runCatching { if (wl?.isHeld == true) wl?.release() }
         super.onDestroy()
     }
