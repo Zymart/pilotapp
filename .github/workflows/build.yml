@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,9 +27,15 @@ jobs:
       - name: Build Debug APK
         run: gradle assembleDebug
 
-      - name: Upload Pilot APK
+      - name: Upload Pilot APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: pilot-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-          
+
+      - name: Publish Latest Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: Pilot Latest Build
+          files: app/build/outputs/apk/debug/app-debug.apk

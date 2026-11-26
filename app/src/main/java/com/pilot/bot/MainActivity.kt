@@ -23,6 +23,7 @@ class MainActivity : Activity() {
     private lateinit var statusPill: TextView
     private lateinit var metaText: TextView
     private lateinit var etCloud: EditText
+    private lateinit var etUpdateUrl: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,7 +58,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#F8FAFC"))
         }
         metaText = TextView(this).apply {
-            text = "GVIP LITE • RAM ~${getAppRamMb()} MB • BOOT READY"
+            text = "GVIP LITE • RAM ~${getAppRamMb()} MB • AUTO-UPDATER"
             textSize = 11f
             setTextColor(Color.parseColor("#64748B"))
             setPadding(0, 4, 0, 0)
@@ -92,11 +93,19 @@ class MainActivity : Activity() {
                 etCloud.text.toString(),
                 etToken.text.toString(),
                 etUser.text.toString().toLongOrNull() ?: 0L,
-                etChan.text.toString()
+                etChan.text.toString(),
+                etUpdateUrl.text.toString()
             )
             val intent = Intent(this, PilotService::class.java)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
             refreshStatus()
+
+            // Return straight to UGPhone home screen
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(homeIntent)
         }
         val btnStop = makePillBtn("STOP", "#EF4444", "#B91C1C") {
             stopService(Intent(this, PilotService::class.java))
@@ -111,11 +120,11 @@ class MainActivity : Activity() {
         cfgCard.addView(etChan)
         cfgCard.addView(rowPower)
 
-        // Sync & System Card
+        // Sync & OTA Auto-Updater Card
         val syncCard = makeCard("#131822", "#1E293B", 24f).apply {
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 20 }
         }
-        syncCard.addView(makeSectionLabel("QUICK CLONE SYNC & PERMISSIONS"))
+        syncCard.addView(makeSectionLabel("CLONE SYNC & OTA AUTO-UPDATER"))
         val etSync = makeInput("Sync Code (XXXXXXX-...)", "")
 
         val rowSync = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -125,7 +134,8 @@ class MainActivity : Activity() {
                 etCloud.text.toString(),
                 etToken.text.toString(),
                 etUser.text.toString().toLongOrNull() ?: 0L,
-                etChan.text.toString()
+                etChan.text.toString(),
+                etUpdateUrl.text.toString()
             )
             val code = PilotCore.makeCode(this)
             etSync.setText(code)
@@ -138,6 +148,7 @@ class MainActivity : Activity() {
                 etToken.setText(PilotCore.getToken(this))
                 etUser.setText(PilotCore.getUserId(this).toString())
                 etChan.setText(PilotCore.getSsChannel(this))
+                etUpdateUrl.setText(PilotCore.getUpdateUrl(this))
                 Toast.makeText(this, "Config Applied!", Toast.LENGTH_SHORT).show()
             } else {
                 Toast.makeText(this, "Invalid Sync Code", Toast.LENGTH_SHORT).show()
@@ -145,6 +156,16 @@ class MainActivity : Activity() {
         }
         rowSync.addView(btnGen, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = 10 })
         rowSync.addView(btnRestore, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = 10 })
+
+        etUpdateUrl = makeInput("Google Drive APK Link (blank = GitHub Auto)", PilotCore.getUpdateUrl(this)).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 14; bottomMargin = 14 }
+        }
+
+        val btnUpdate = makePillBtn("CHECK & INSTALL UPDATE NOW", "#D97706", "#B45309") {
+            PilotCore.saveUpdateUrl(this, etUpdateUrl.text.toString())
+            Toast.makeText(this, "Checking for update...", Toast.LENGTH_SHORT).show()
+            Thread { AppUpdater.checkAndInstall(this, force = true) }.start()
+        }
 
         val rowPerms = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -166,6 +187,8 @@ class MainActivity : Activity() {
 
         syncCard.addView(etSync)
         syncCard.addView(rowSync)
+        syncCard.addView(etUpdateUrl)
+        syncCard.addView(btnUpdate)
         syncCard.addView(rowPerms)
 
         // Live Terminal Card
@@ -219,6 +242,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 logView.text = PilotCore.logs
                 etCloud.setText(PilotCore.getCloud(this))
+                etUpdateUrl.setText(PilotCore.getUpdateUrl(this))
                 refreshStatus()
                 logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
             }
@@ -234,7 +258,7 @@ class MainActivity : Activity() {
             setColor(Color.parseColor(if (running) "#064E3B" else "#450A0A"))
             setStroke(2, Color.parseColor(if (running) "#10B981" else "#EF4444"))
         }
-        metaText.text = "GVIP LITE • RAM ~${getAppRamMb()} MB • BOOT READY"
+        metaText.text = "GVIP LITE • RAM ~${getAppRamMb()} MB • AUTO-UPDATER"
     }
 
     private fun getAppRamMb(): Long {

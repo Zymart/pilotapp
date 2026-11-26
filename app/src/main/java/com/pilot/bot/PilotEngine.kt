@@ -67,6 +67,127 @@ object SuShell {
     }
 }
 
+object AppUpdater {
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    @Volatile private var updating = false
+
+    fun normalizeUrl(raw: String): String {
+        val u = raw.trim()
+        if (u.isEmpty()) return ""
+        val driveId = Regex("""drive\.google\.com/(?:file/d/|open\?id=|uc\?.*?\bid=)([a-zA-Z0-9_-]{15,})""").find(u)?.groupValues?.get(1)
+        return if (!driveId.isNullOrEmpty()) "https://drive.google.com/uc?export=download&id=$driveId" else u
+    }
+
+    @Synchronized
+    fun checkAndInstall(c: Context, force: Boolean = false): String {
+        if (updating) return "Update already in progress."
+        updating = true
+        try {
+            val prefs = c.getSharedPreferences("pilot_cfg", Context.MODE_PRIVATE)
+            val customRaw = PilotCore.getUpdateUrl(c)
+            val lastTag = prefs.getString("last_upd_tag", "") ?: ""
+
+            var downloadUrl = ""
+            var newTag = ""
+
+            if (customRaw.isNotEmpty()) {
+                downloadUrl = normalizeUrl(customRaw)
+                val headReq = Request.Builder().url(downloadUrl).head()
+                    .header("User-Agent", "Mozilla/5.0").build()
+                val sig = runCatching {
+                    http.newCall(headReq).execute().use { r ->
+                        val etag = r.header("ETag") ?: ""
+                        val len = r.header("Content-Length") ?: ""
+                        val mod = r.header("Last-Modified") ?: ""
+                        "$downloadUrl|$etag|$len|$mod"
+                    }
+                }.getOrDefault("$downloadUrl|${System.currentTimeMillis() / 3600000}")
+                newTag = sig
+            } else {
+                val apiUrl = "https://api.github.com/repos/Zymart/pilotapp/releases/tags/latest"
+                val req = Request.Builder().url(apiUrl)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("User-Agent", "PilotUpdater").build()
+                val body = runCatching {
+                    http.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() ?: "" else "" }
+                }.getOrDefault("")
+                if (body.isEmpty()) {
+                    PilotCore.log("[UPD] No GitHub release found (set Drive URL or make repo public).")
+                    return "No release found (paste a Google Drive APK link or make repo public)."
+                }
+                val json = JSONObject(body)
+                val assets = json.optJSONArray("assets")
+                if (assets != null && assets.length() > 0) {
+                    val a = assets.getJSONObject(0)
+                    downloadUrl = a.getString("browser_download_url")
+                    newTag = "gh:${a.optLong("id")}:${a.optString("updated_at")}"
+                }
+            }
+
+            if (downloadUrl.isEmpty()) return "Invalid update URL."
+            if (!force && newTag.isNotEmpty() && newTag == lastTag) {
+                return "Already up to date."
+            }
+
+            PilotCore.log("[UPD] Downloading APK...")
+            val apkFile = File(c.cacheDir, "pilot_update.apk")
+            if (!downloadBinary(downloadUrl, apkFile)) {
+                PilotCore.log("[UPD] Download failed or invalid APK.")
+                return "Download failed or link is not a public APK."
+            }
+
+            PilotCore.log("[UPD] Installing silently via root...")
+            val tmpPath = "/data/local/tmp/pilot_upd.apk"
+            val res = SuShell.exec("cp '${apkFile.absolutePath}' '$tmpPath' && chmod 644 '$tmpPath' && pm install -r -d '$tmpPath' && rm -f '$tmpPath'")
+            apkFile.delete()
+
+            return if (res.contains("Success", ignoreCase = true)) {
+                prefs.edit().putString("last_upd_tag", newTag).apply()
+                PilotCore.log("[UPD] Installed! Restarting service...")
+                "Update installed! Restarting bot..."
+            } else {
+                PilotCore.log("[UPD] Install error: $res")
+                "Install failed: $res"
+            }
+        } finally {
+            updating = false
+        }
+    }
+
+    private fun downloadBinary(url: String, dest: File): Boolean {
+        return runCatching {
+            val req = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return false
+                val ctype = resp.header("Content-Type") ?: ""
+                if (ctype.contains("text/html", ignoreCase = true)) {
+                    val html = resp.body?.string() ?: return false
+                    val confirm = Regex("""name="confirm"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
+                    val uuid = Regex("""name="uuid"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
+                    val id = Regex("""[?&]id=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1)
+                    if (!id.isNullOrEmpty() && !confirm.isNullOrEmpty()) {
+                        val bypass = "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=$confirm" +
+                                (if (!uuid.isNullOrEmpty()) "&uuid=$uuid" else "")
+                        return downloadBinary(bypass, dest)
+                    }
+                    return false
+                }
+                val bytes = resp.body?.bytes() ?: return false
+                if (bytes.size < 100_000) return false
+                if (bytes[0] != 0x50.toByte() || bytes[1] != 0x4B.toByte()) return false
+                FileOutputStream(dest).use { it.write(bytes) }
+                true
+            }
+        }.getOrDefault(false)
+    }
+}
+
 object PilotCore {
     var logs = "Engine initialized.\n"
     var onLog: (() -> Unit)? = null
@@ -120,14 +241,23 @@ object PilotCore {
     fun getToken(c: Context) = prefs(c).getString("token", "") ?: ""
     fun getUserId(c: Context) = prefs(c).getLong("user_id", 0L)
     fun getSsChannel(c: Context) = prefs(c).getString("ss_channel", "") ?: ""
+    fun getUpdateUrl(c: Context) = prefs(c).getString("upd_url", "") ?: ""
 
     fun saveSsChannel(c: Context, ch: String) {
         prefs(c).edit().putString("ss_channel", ch.trim()).apply()
     }
 
-    fun saveConfig(c: Context, cloud: String, token: String, uid: Long, ssChan: String = "") {
+    fun saveUpdateUrl(c: Context, url: String) {
+        prefs(c).edit().putString("upd_url", url.trim()).apply()
+    }
+
+    fun saveConfig(c: Context, cloud: String, token: String, uid: Long, ssChan: String = "", updUrl: String = "") {
         val cl = cloud.trim().ifEmpty { detectDeviceName(c) }
-        val edit = prefs(c).edit().putString("cloud", cl).putString("token", token.trim()).putLong("user_id", uid)
+        val edit = prefs(c).edit()
+            .putString("cloud", cl)
+            .putString("token", token.trim())
+            .putLong("user_id", uid)
+            .putString("upd_url", updUrl.trim())
         if (ssChan.trim().isNotEmpty()) edit.putString("ss_channel", ssChan.trim())
         edit.apply()
         runCatching { File("/sdcard/cloud_name.txt").writeText(cl) }
@@ -139,6 +269,7 @@ object PilotCore {
             .put("t", getToken(c))
             .put("u", getUserId(c))
             .put("c", getSsChannel(c))
+            .put("d", getUpdateUrl(c))
             .toString()
         val b64 = Base64.encodeToString(payload.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
         return "$letters-$b64"
@@ -147,9 +278,13 @@ object PilotCore {
     fun applyCode(c: Context, code: String): Boolean = runCatching {
         val raw = code.trim().substringAfter("-")
         val json = JSONObject(String(Base64.decode(raw, Base64.URL_SAFE)))
-        val edit = prefs(c).edit().putString("token", json.getString("t")).putLong("user_id", json.getLong("u"))
+        val edit = prefs(c).edit()
+            .putString("token", json.getString("t"))
+            .putLong("user_id", json.getLong("u"))
         val ch = json.optString("c", "")
         if (ch.isNotEmpty()) edit.putString("ss_channel", ch)
+        val upd = json.optString("d", "")
+        if (upd.isNotEmpty()) edit.putString("upd_url", upd)
         edit.apply()
         true
     }.getOrDefault(false)
@@ -309,6 +444,84 @@ object PilotCore {
         if (clearHist) histPrefs(c).edit().remove(pkg).apply()
     }
 
+    @Synchronized
+    fun packAccountBundle(c: Context, pkg: String, username: String): Pair<File?, Int> {
+        val safeUser = username.replace(Regex("[^a-zA-Z0-9_-]"), "")
+        val bundleFile = File(c.cacheDir, "xfer_${System.nanoTime()}.tar.gz")
+        val stageDir = "/data/local/tmp/pilot_stage_${System.nanoTime()}"
+
+        val sh = """
+            am force-stop $pkg
+            rm -rf '$stageDir' && mkdir -p '$stageDir/session' '$stageDir/ext'
+            for sub in app_webview/Default shared_prefs files/LocalStorage files/appData/LocalStorage; do
+              if [ -d "/data/data/$pkg/${'$'}sub" ]; then
+                mkdir -p "$stageDir/session/${'$'}sub"
+                cp -rf "/data/data/$pkg/${'$'}sub/." "$stageDir/session/${'$'}sub/" 2>/dev/null
+              fi
+            done
+            cnt=0
+            if [ -n "$safeUser" ]; then
+              cd /storage/emulated/0 2>/dev/null && find -L . -maxdepth 8 -iname "*${safeUser}*" ! -path "./Android/data/*" ! -path "./Android/obb/*" 2>/dev/null | while IFS= read -r rel; do
+                [ -z "${'$'}rel" ] && continue
+                clean=${'$'}{rel#./}
+                mkdir -p "$stageDir/ext/${'$'}(dirname "${'$'}clean")"
+                cp -rf "/storage/emulated/0/${'$'}clean" "$stageDir/ext/${'$'}clean" 2>/dev/null
+                rm -rf "/storage/emulated/0/${'$'}clean" 2>/dev/null
+              done
+              cnt=${'$'}(find "$stageDir/ext" -type f 2>/dev/null | wc -l)
+            fi
+            tar -czf '${bundleFile.absolutePath}' -C '$stageDir' . 2>/dev/null
+            chmod 666 '${bundleFile.absolutePath}' 2>/dev/null
+            rm -rf '$stageDir'
+            echo "FILES:${'$'}cnt"
+        """.trimIndent()
+
+        val out = SuShell.exec(sh)
+        val fileCount = Regex("""FILES:(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        return if (bundleFile.exists() && bundleFile.length() > 0L) bundleFile to fileCount else null to 0
+    }
+
+    @Synchronized
+    fun restoreAccountBundle(c: Context, dstPkg: String, username: String, bundleFile: File): Pair<Boolean, Int> {
+        val stageDir = "/data/local/tmp/pilot_restore_${System.nanoTime()}"
+        val sh = """
+            if [ ! -d "/data/data/$dstPkg" ]; then
+              echo "ERR:NO_PKG"
+              exit 1
+            fi
+            am force-stop $dstPkg
+            rm -rf '$stageDir' && mkdir -p '$stageDir'
+            tar -xzf '${bundleFile.absolutePath}' -C '$stageDir' 2>/dev/null
+            rm -rf /data/data/$dstPkg/app_webview/Default/Cookies* /data/data/$dstPkg/shared_prefs/* /data/data/$dstPkg/files/LocalStorage/* /data/data/$dstPkg/files/appData/LocalStorage/*
+            mkdir -p /data/data/$dstPkg/app_webview/Default /data/data/$dstPkg/shared_prefs /data/data/$dstPkg/files/LocalStorage /data/data/$dstPkg/files/appData/LocalStorage
+            if [ -d "$stageDir/session" ]; then
+              cp -rf "$stageDir/session/." "/data/data/$dstPkg/" 2>/dev/null
+            fi
+            uid=${'$'}(stat -c '%u:%g' /data/data/$dstPkg 2>/dev/null)
+            if [ -n "${'$'}uid" ]; then
+              chown -R ${'$'}uid /data/data/$dstPkg/app_webview /data/data/$dstPkg/shared_prefs /data/data/$dstPkg/files 2>/dev/null
+            fi
+            restorecon -RF /data/data/$dstPkg 2>/dev/null
+            cnt=0
+            if [ -d "$stageDir/ext" ]; then
+              cnt=${'$'}(find "$stageDir/ext" -type f 2>/dev/null | wc -l)
+              cp -rf "$stageDir/ext/." "/storage/emulated/0/" 2>/dev/null
+              chmod -R 777 /storage/emulated/0/Delta 2>/dev/null
+            fi
+            rm -rf '$stageDir'
+            echo "RESTORED:${'$'}cnt"
+        """.trimIndent()
+
+        val out = SuShell.exec(sh)
+        bundleFile.delete()
+        val ok = out.contains("RESTORED:")
+        val count = Regex("""RESTORED:(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        if (ok && username.isNotEmpty() && username != "Empty") {
+            histPrefs(c).edit().putString(dstPkg, username).apply()
+        }
+        return ok to count
+    }
+
     fun fmtLine(idx: Int, a: AccInfo): String {
         val tag = when (a.status) {
             "ACTIVE" -> "🟢 *(Running)*"
@@ -345,6 +558,7 @@ class DiscordBot(private val ctx: Context) {
     private var ws: WebSocket? = null
     private var hbTask: ScheduledFuture<*>? = null
     private var seq: Int? = null
+    @Volatile private var botId: String = ""
     @Volatile private var alive = true
 
     fun start() { connect() }
@@ -437,7 +651,9 @@ class DiscordBot(private val ctx: Context) {
                 val type = pkt.optString("t")
                 val d = pkt.optJSONObject("d") ?: return
                 if (type == "READY") {
-                    val u = d.getJSONObject("user").getString("username")
+                    val userObj = d.getJSONObject("user")
+                    botId = userObj.optString("id", "")
+                    val u = userObj.getString("username")
                     PilotCore.log("[ONLINE] $u | ${PilotCore.getCloud(ctx)}")
                 } else if (type == "MESSAGE_CREATE") onMessageCreate(d)
                 else if (type == "INTERACTION_CREATE") onInteraction(d)
@@ -448,22 +664,60 @@ class DiscordBot(private val ctx: Context) {
     private fun onMessageCreate(d: JSONObject) {
         val ownerId = PilotCore.getUserId(ctx).toString()
         val author = d.optJSONObject("author") ?: return
-        if (author.optString("id") != ownerId) return
+        val authorId = author.optString("id")
         val content = d.optString("content").trim()
-        if (!content.startsWith("!")) return
         val ch = d.getString("channel_id")
+
+        // Cross-cloud slot transfer relay & destination menu broadcast
+        if (authorId == botId) {
+            if (content.startsWith("PILOT_DEST_REQ:")) {
+                val p = content.split(":", limit = 5)
+                if (p.size == 5) {
+                    val msgIdToDel = d.optString("id")
+                    if (p[2] == PilotCore.getCloud(ctx) && msgIdToDel.isNotEmpty()) {
+                        apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgIdToDel")
+                    }
+                    postDestinationSlots(ch, p[2], p[3], p[4])
+                }
+            } else if (content.startsWith("PILOT_XFER:")) {
+                handleTransferPayload(d)
+            }
+            return
+        }
+
+        if (authorId != ownerId) return
+        if (!content.startsWith("!")) return
+        val msgId = d.optString("id", "")
         val cl = PilotCore.getCloud(ctx)
         val parts = content.split(" ", limit = 2)
         val cmd = parts[0].lowercase()
         val arg = parts.getOrNull(1)?.trim() ?: ""
 
         when (cmd) {
+            "!help", "!commands" -> sendHelp(ch, msgId)
             "!scan" -> sendCloudMenu(ch, cl, "s", "**Select Cloud to Scan:**")
             "!logout" -> sendCloudMenu(ch, cl, "l", "**Select Cloud to Logout:**")
             "!delete" -> sendCloudMenu(ch, cl, "d", "**Select Cloud to Delete Account & History:**")
+            "!changeslot" -> {
+                if (arg.isEmpty()) {
+                    sendCloudMenu(ch, cl, "cs1", "**Select Source Cloud (where the account is now):**")
+                } else {
+                    val list = PilotCore.scanRbx(ctx)
+                    val match = list.firstOrNull { it.user != "Empty" && it.user.equals(arg, ignoreCase = true) }
+                    if (match != null) {
+                        val xferId = (1..6).map { ('a'..'z').random() }.joinToString("")
+                        sendMsg(ch, "PILOT_DEST_REQ:$xferId:$cl:${match.pkg}:${match.user}")
+                    }
+                }
+            }
             "!rename" -> {
                 if (arg.isEmpty()) sendMsg(ch, "⚠️ **Missing name!** Usage: `!rename <New Cloud Name>`")
                 else sendCloudMenu(ch, cl, "r:$arg", "**Select Cloud to Rename to `$arg`:**")
+            }
+            "!update" -> {
+                if (arg.isNotEmpty()) PilotCore.saveUpdateUrl(ctx, arg)
+                val status = AppUpdater.checkAndInstall(ctx, force = true)
+                sendMsg(ch, "**📱 $cl** — $status")
             }
             "!sschannel" -> {
                 PilotCore.saveSsChannel(ctx, ch)
@@ -501,8 +755,129 @@ class DiscordBot(private val ctx: Context) {
                     sendMsg(ch, "Sent your new config code to your DMs!")
                 }
             }
-            else -> sendMsg(ch, "⚠️ **Invalid command!** Use: `!scan` | `!search <user>` | `!checkstatus <user>` | `!rename <name>` | `!ss` | `!sschannel` | `!logout` | `!delete` | `!config`")
+            else -> sendMsg(ch, "⚠️ **Invalid command!** Type `!help` to view all available commands.")
         }
+    }
+
+    private fun postDestinationSlots(ch: String, srcCloud: String, srcPkg: String, srcUser: String) {
+        val myCloud = PilotCore.getCloud(ctx)
+        val list = PilotCore.scanRbx(ctx)
+        if (list.isEmpty()) return
+        val opts = JSONArray()
+        list.forEachIndexed { i, a ->
+            if (!(myCloud == srcCloud && a.pkg == srcPkg)) {
+                opts.put(
+                    JSONObject()
+                        .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})")
+                        .put("value", "$srcCloud|$srcPkg|$srcUser|$myCloud|${a.pkg}")
+                        .put("description", "Move $srcUser into this slot on $myCloud")
+                )
+            }
+        }
+        if (opts.length() == 0) return
+        val menu = JSONObject()
+            .put("type", 3)
+            .put("custom_id", "pilot_cs3:go:$srcCloud")
+            .put("placeholder", "📱 $myCloud — Pick destination slot for $srcUser...")
+            .put("options", opts)
+        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+        sendMsg(ch, "**📱 $myCloud** — Select destination slot to receive **$srcUser** (from **$srcCloud**):", row)
+    }
+
+    private fun handleTransferPayload(d: JSONObject) {
+        val content = d.optString("content").trim()
+        val ch = d.optString("channel_id")
+        val msgId = d.optString("id")
+        // Format: PILOT_XFER:go:<srcCloud>:<srcPkg>:<srcUser>:<dstCloud>:<dstPkg>
+        val parts = content.split(":", limit = 7)
+        if (parts.size < 7) return
+        val srcCloud = parts[2]
+        val srcPkg = parts[3]
+        val srcUser = parts[4]
+        val dstCloud = parts[5]
+        val dstPkg = parts[6]
+        val myCloud = PilotCore.getCloud(ctx)
+        if (dstCloud != myCloud) return
+
+        val atts = d.optJSONArray("attachments") ?: return
+        if (atts.length() == 0) return
+        val fileUrl = atts.getJSONObject(0).optString("url")
+        if (fileUrl.isEmpty()) return
+
+        PilotCore.log("[XFER-IN] Receiving $srcUser from $srcCloud -> $dstPkg")
+        val tmpBundle = File(ctx.cacheDir, "recv_${System.nanoTime()}.tar.gz")
+        val downloaded = runCatching {
+            val req = Request.Builder().url(fileUrl).build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use false
+                val bytes = resp.body?.bytes() ?: return@use false
+                FileOutputStream(tmpBundle).use { it.write(bytes) }
+                true
+            }
+        }.getOrDefault(false)
+
+        if (!downloaded) {
+            sendMsg(ch, "❌ **📱 $myCloud** — Failed to download transfer bundle for **$srcUser**.")
+            return
+        }
+
+        val (ok, scriptCount) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, tmpBundle)
+        if (msgId.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgId")
+
+        if (ok) {
+            PilotCore.log("[XFER-OK] $srcUser restored to $dstPkg (+$scriptCount script files)")
+            sendMsg(
+                ch,
+                "✅ **Slot Transfer Complete!**\n" +
+                "• **Account:** `$srcUser`\n" +
+                "• **From:** **$srcCloud** (`$srcPkg` → now Empty)\n" +
+                "• **To:** **$myCloud** (`$dstPkg`)\n" +
+                "• **Script Data Restored:** `$scriptCount` file(s)"
+            )
+        } else {
+            sendMsg(ch, "❌ **📱 $myCloud** — Target package `$dstPkg` not found on this cloud phone.")
+        }
+    }
+
+    private fun sendHelp(ch: String, triggerMsgId: String) {
+        val delayMs = ((PilotCore.getCloud(ctx).hashCode() and 0x7fffffff) % 1400).toLong()
+        if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
+
+        if (botId.isNotEmpty() && triggerMsgId.isNotEmpty()) {
+            val afterRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$triggerMsgId&limit=5")
+            val alreadyReplied = runCatching {
+                val arr = JSONArray(afterRaw)
+                (0 until arr.length()).any { i ->
+                    arr.getJSONObject(i).optJSONObject("author")?.optString("id") == botId
+                }
+            }.getOrDefault(false)
+            if (alreadyReplied) return
+        }
+
+        val helpText = """
+            **📖 PILOT BOT COMMANDS**
+
+            **🔍 Monitoring & Search**
+            • `!scan` — Select a cloud phone to list all Roblox instances & statuses
+            • `!search <username>` — Find which cloud & slot has an account (exact or close match)
+            • `!checkstatus <username>` — Capture & crop **only** that player's Roblox window
+
+            **📸 Screenshots & Auto-Capture**
+            • `!ss` — Capture a full-screen screenshot of your cloud phone(s)
+            • `!sschannel` — Set this channel for hourly Delta auto-screenshots & Lua triggers
+            • *Lua Trigger:* Call `getgenv().PilotSnap()` inside any Delta script
+
+            **⚙️ Account & Cloud Management**
+            • `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
+            • `!logout` — Log out one or all accounts on a cloud (keeps last username history)
+            • `!delete` — Wipe session data **and** clear username history (resets to Empty)
+            • `!rename <new name>` — Remotely rename a cloud phone
+            • `!update [drive_url]` — Check & silently install the latest Pilot APK
+            • `!config` — DM yourself a `XXXXXXX-...` sync code to clone settings
+            • `!help` — Show this command guide
+        """.trimIndent()
+
+        sendMsg(ch, helpText)
     }
 
     private fun onInteraction(d: JSONObject) {
@@ -511,6 +886,7 @@ class DiscordBot(private val ctx: Context) {
         val token = d.getString("token")
         val user = d.optJSONObject("member")?.optJSONObject("user") ?: d.optJSONObject("user") ?: return
         val ownerId = PilotCore.getUserId(ctx).toString()
+        val ch = d.optString("channel_id")
         val data = d.getJSONObject("data")
         val cid = data.optString("custom_id")
         val vals = data.optJSONArray("values") ?: return
@@ -547,6 +923,20 @@ class DiscordBot(private val ctx: Context) {
             }
             if (mode == "s") {
                 replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud:**\n${PilotCore.fmtAll(list)}").put("flags", 64))
+            } else if (mode == "cs1") {
+                val activeList = list.filter { it.user != "Empty" }
+                if (activeList.isEmpty()) {
+                    replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No accounts available to move.").put("flags", 64))
+                    return
+                }
+                val opts = JSONArray()
+                activeList.take(25).forEach { a ->
+                    opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})").put("value", "${a.pkg}|${a.user}"))
+                }
+                val menu = JSONObject().put("type", 3).put("custom_id", "pilot_cs2:move:$myCloud")
+                    .put("placeholder", "Select account to move from $myCloud...").put("options", opts)
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — Select which account to move:\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
             } else {
                 val opts = JSONArray().put(JSONObject().put("label", if (mode == "d") "DELETE ALL DATA & HISTORY" else "LOGOUT ALL ON THIS CLOUD").put("value", "ALL"))
                 list.take(24).forEach { a -> opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})").put("value", a.pkg)) }
@@ -555,6 +945,44 @@ class DiscordBot(private val ctx: Context) {
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
                 val label = if (mode == "d") "Select account to **DELETE** (wipes session + history):" else "Select account to **LOGOUT**:"
                 replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — $label\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
+            }
+        } else if (kind == "pilot_cs2") {
+            val srcPkg = sel.substringBefore("|")
+            val srcUser = sel.substringAfter("|", "")
+            val xferId = (1..6).map { ('a'..'z').random() }.joinToString("")
+            replyInteraction(id, token, 7, JSONObject().put("content", "📦 Preparing **$srcUser** (`$srcPkg`) on **$myCloud**... Pick destination slot below:").put("components", JSONArray()))
+            if (ch.isNotEmpty()) {
+                sendMsg(ch, "PILOT_DEST_REQ:$xferId:$myCloud:$srcPkg:$srcUser")
+            }
+        } else if (kind == "pilot_cs3") {
+            val p = sel.split("|", limit = 5)
+            if (p.size < 5) return
+            val srcCloud = p[0]
+            val srcPkg = p[1]
+            val srcUser = p[2]
+            val dstCloud = p[3]
+            val dstPkg = p[4]
+
+            replyInteraction(id, token, 7, JSONObject().put("content", "⏳ Moving **$srcUser** (`$srcCloud` `$srcPkg` → **$dstCloud** `$dstPkg`)...").put("components", JSONArray()))
+
+            val (bundle, fileCount) = PilotCore.packAccountBundle(ctx, srcPkg, srcUser)
+            PilotCore.wipe(ctx, srcPkg, true)
+
+            if (bundle == null) {
+                if (ch.isNotEmpty()) sendMsg(ch, "❌ Failed to package **$srcUser** from **$srcCloud**.")
+                return
+            }
+
+            if (srcCloud == dstCloud) {
+                val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
+                if (ch.isNotEmpty()) {
+                    if (ok) sendMsg(ch, "✅ Moved **$srcUser** locally on **$myCloud**: `$srcPkg` → `$dstPkg` (`$restoredFiles` script file(s)).")
+                    else sendMsg(ch, "❌ Target slot `$dstPkg` not found on **$myCloud**.")
+                }
+            } else if (ch.isNotEmpty()) {
+                PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
+                sendFile(ch, "PILOT_XFER:go:$srcCloud:$srcPkg:$srcUser:$dstCloud:$dstPkg", bundle, "xfer_${srcUser}.tar.gz")
+                bundle.delete()
             }
         } else if (kind == "pilot_acc") {
             val isDel = mode == "d"
@@ -584,6 +1012,21 @@ class DiscordBot(private val ctx: Context) {
         apiPost("https://discord.com/api/v10/channels/$ch/messages", body)
     }
 
+    private fun sendFile(ch: String, caption: String, file: File, fileName: String) {
+        runCatching {
+            val mp = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("payload_json", JSONObject().put("content", caption).toString())
+                .addFormDataPart("files[0]", fileName, file.asRequestBody("application/gzip".toMediaType()))
+                .build()
+            val req = Request.Builder()
+                .url("https://discord.com/api/v10/channels/$ch/messages")
+                .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
+                .post(mp)
+                .build()
+            client.newCall(req).execute().close()
+        }
+    }
+
     private fun sendImage(ch: String, caption: String, file: File) {
         runCatching {
             val isJpg = file.name.endsWith(".jpg")
@@ -605,6 +1048,22 @@ class DiscordBot(private val ctx: Context) {
     private fun replyInteraction(id: String, token: String, type: Int, data: JSONObject) {
         apiPost("https://discord.com/api/v10/interactions/$id/$token/callback", JSONObject().put("type", type).put("data", data), auth = false)
     }
+
+    private fun apiDelete(url: String) {
+        runCatching {
+            val req = Request.Builder().url(url)
+                .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
+                .delete().build()
+            client.newCall(req).execute().close()
+        }
+    }
+
+    private fun apiGet(url: String): String = runCatching {
+        val req = Request.Builder().url(url)
+            .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
+            .get().build()
+        client.newCall(req).execute().use { it.body?.string() ?: "" }
+    }.getOrDefault("")
 
     private fun apiPost(url: String, json: JSONObject, auth: Boolean = true): String = runCatching {
         val body = json.toString().toRequestBody("application/json".toMediaType())
@@ -654,6 +1113,10 @@ class PilotService : Service() {
                 cur.forEach { PilotCore.log("[SYNC] ${it.pkg} -> ${it.user} (${it.status})") }
             }
         }, 2, 10, TimeUnit.SECONDS)
+
+        syncExec.scheduleAtFixedRate({
+            AppUpdater.checkAndInstall(this, force = false)
+        }, 5, 30, TimeUnit.MINUTES)
 
         Thread {
             runCatching {
