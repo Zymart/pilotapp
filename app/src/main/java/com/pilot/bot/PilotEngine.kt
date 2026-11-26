@@ -132,10 +132,10 @@ object AppUpdater {
 
             if (downloadUrl.isEmpty()) return "Invalid update URL."
             if (!force && newTag.isNotEmpty() && newTag == lastTag) {
-                return "Already up to date."
+                return "Already up to date (${PilotCore.APP_VERSION})."
             }
 
-            PilotCore.log("[UPD] Downloading APK...")
+            PilotCore.log("[UPD] Downloading APK (current ${PilotCore.APP_VERSION})...")
             val apkFile = File(c.cacheDir, "pilot_update.apk")
             if (!downloadBinary(downloadUrl, apkFile)) {
                 PilotCore.log("[UPD] Download failed or invalid APK.")
@@ -151,7 +151,7 @@ object AppUpdater {
                 SuShell.exec("rm -f '$tmpPath'")
                 prefs.edit().putString("last_upd_tag", newTag).apply()
                 PilotCore.log("[UPD] Installed! Restarting service...")
-                "Update installed! Restarting bot..."
+                "Update installed! Restarting bot (was ${PilotCore.APP_VERSION})..."
             } else if (res.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE", ignoreCase = true)) {
                 prefs.edit().putString("last_upd_tag", newTag).apply()
                 PilotCore.log("[UPD] Signature changed — migrating data & reinstalling...")
@@ -215,7 +215,10 @@ object AppUpdater {
 }
 
 object PilotCore {
-    var logs = "Engine initialized.\n"
+    // Bump this string (e.g., "v1.1.0" -> "v1.2.0") before building a new APK to verify OTA updates
+    const val APP_VERSION = "v1.1.0"
+
+    var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
     @Volatile var cachedScan: List<AccInfo> = emptyList()
 
@@ -316,6 +319,7 @@ object PilotCore {
         true
     }.getOrDefault(false)
 
+    @Synchronized
     fun installAutoExec(c: Context) {
         val lua = """
             repeat task.wait(0.5) until game:IsLoaded()
@@ -341,6 +345,8 @@ object PilotCore {
             getgenv().PilotSnap = snapMe
 
             task.spawn(function()
+                task.wait(5)
+                snapMe()
                 while task.wait(3600) do
                     snapMe()
                 end
@@ -350,13 +356,21 @@ object PilotCore {
         runCatching {
             val tmp = File(c.filesDir, "pilot_bridge.lua")
             tmp.writeText(lua)
-            val found = SuShell.exec("mkdir -p /storage/emulated/0/Delta/Autoexecute && find -L /storage/emulated/0 /data/data -maxdepth 6 -type d -iname 'autoexecute' 2>/dev/null")
-                .lines().map { it.trim() }.filter { it.isNotEmpty() }
-            val dirs = (listOf("/storage/emulated/0/Delta/Autoexecute") + found).toSet()
+
+            val sh = """
+                mkdir -p /storage/emulated/0/Delta/AutoExcecute /storage/emulated/0/Delta/Autoexecute 2>/dev/null
+                find -L /storage/emulated/0 /data/data -maxdepth 6 -type d \( -iname '*autoexecute*' -o -iname '*autoexcecute*' \) 2>/dev/null
+            """.trimIndent()
+            val found = SuShell.exec(sh).lines().map { it.trim() }.filter { it.isNotEmpty() }
+            val dirs = (listOf(
+                "/storage/emulated/0/Delta/AutoExcecute",
+                "/storage/emulated/0/Delta/Autoexecute"
+            ) + found).toSet()
+
             for (d in dirs) {
-                SuShell.exec("cp '${tmp.absolutePath}' '$d/pilot_bridge.lua' && chmod 666 '$d/pilot_bridge.lua'")
+                SuShell.exec("mkdir -p '$d' && cp '${tmp.absolutePath}' '$d/pilot_bridge.lua' && chmod 666 '$d/pilot_bridge.lua'")
             }
-            log("[AUTOEXEC] Ready in ${dirs.size} folder(s)")
+            log("[AUTOEXEC] Installed pilot_bridge.lua in ${dirs.size} folder(s)")
         }
     }
 
@@ -609,11 +623,12 @@ class DiscordBot(private val ctx: Context) {
         val summary = if (list.isNotEmpty()) "\n${PilotCore.fmtAll(list)}" else ""
         val (img, _) = PilotCore.captureScreen(ctx, null)
         if (img != null) {
-            sendImage(ch, "**📱 $cl** — Full Screen:$summary", img)
+            sendImage(ch, "**📱 $cl** (${PilotCore.APP_VERSION}) — Full Screen:$summary", img)
             img.delete()
         }
     }
 
+    // !checkstatus <username> — captures the WHOLE device screen for the matching account
     fun sendAccountShot(ch: String, query: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
@@ -630,16 +645,33 @@ class DiscordBot(private val ctx: Context) {
             sendMsg(ch, "⚠️ **📱 $cl** — No matching account found for `$query`.")
             return
         }
-        for ((idx, acc) in matches) {
-            val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
-            val note = if (!croppedOk) "\n*(Window hidden — showing full screen)*" else ""
-            val caption = "**📱 $cl** — Status for `${query}`:\n${PilotCore.fmtLine(idx, acc)}$note"
-            if (img != null) {
-                sendImage(ch, caption, img)
-                img.delete()
-            } else {
-                sendMsg(ch, caption)
-            }
+        val (idx, acc) = matches.first()
+        val (img, _) = PilotCore.captureScreen(ctx, null)
+        val caption = "**📱 $cl** — Full Screen Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}"
+        if (img != null) {
+            sendImage(ch, caption, img)
+            img.delete()
+        } else {
+            sendMsg(ch, caption)
+        }
+    }
+
+    // Triggered by Delta/AutoExcecute/pilot_bridge.lua — crops to that player's Roblox window
+    fun sendLuaWindowShot(ch: String, exactUser: String) {
+        val cl = PilotCore.getCloud(ctx)
+        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+        val q = exactUser.trim().lowercase()
+        val match = list.mapIndexedNotNull { i, a ->
+            if (a.user != "Empty" && a.user.lowercase() == q) i to a else null
+        }.firstOrNull() ?: return
+
+        val (idx, acc) = match
+        val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
+        val note = if (!croppedOk) "\n*(Window hidden — showing full screen)*" else ""
+        val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
+        if (img != null) {
+            sendImage(ch, caption, img)
+            img.delete()
         }
     }
 
@@ -687,7 +719,7 @@ class DiscordBot(private val ctx: Context) {
                     val userObj = d.getJSONObject("user")
                     botId = userObj.optString("id", "")
                     val u = userObj.getString("username")
-                    PilotCore.log("[ONLINE] $u | ${PilotCore.getCloud(ctx)}")
+                    PilotCore.log("[ONLINE] $u | ${PilotCore.getCloud(ctx)} (${PilotCore.APP_VERSION})")
                 } else if (type == "MESSAGE_CREATE") onMessageCreate(d)
                 else if (type == "INTERACTION_CREATE") onInteraction(d)
             }
@@ -701,8 +733,19 @@ class DiscordBot(private val ctx: Context) {
         val content = d.optString("content").trim()
         val ch = d.getString("channel_id")
 
-        if (authorId == botId && content.startsWith("PILOT_XFER:")) {
-            ioExec.execute { handleTransferPayload(d) }
+        if (authorId == botId) {
+            if (content.startsWith("PILOT_DEST_REQ:")) {
+                val p = content.split(":", limit = 5)
+                if (p.size == 5) {
+                    val msgIdToDel = d.optString("id")
+                    if (p[2] == PilotCore.getCloud(ctx) && msgIdToDel.isNotEmpty()) {
+                        apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgIdToDel")
+                    }
+                    postDestinationSlots(ch, p[2], p[3], p[4])
+                }
+            } else if (content.startsWith("PILOT_XFER:")) {
+                ioExec.execute { handleTransferPayload(d) }
+            }
             return
         }
 
@@ -716,6 +759,7 @@ class DiscordBot(private val ctx: Context) {
 
         when (cmd) {
             "!help", "!commands" -> ioExec.execute { sendHelp(ch, msgId) }
+            "!version", "!ver" -> sendMsg(ch, "📱 **$cl** — Pilot **${PilotCore.APP_VERSION}**")
             "!scan" -> sendCloudMenu(ch, cl, "s", "**Select Cloud to Scan:**")
             "!logout" -> sendCloudMenu(ch, cl, "l", "**Select Cloud to Logout:**")
             "!delete" -> sendCloudMenu(ch, cl, "d", "**Select Cloud to Delete Account & History:**")
@@ -739,7 +783,7 @@ class DiscordBot(private val ctx: Context) {
                 if (arg.isNotEmpty()) PilotCore.saveUpdateUrl(ctx, arg)
                 ioExec.execute {
                     val status = AppUpdater.checkAndInstall(ctx, force = true)
-                    sendMsg(ch, "**📱 $cl** — $status")
+                    sendMsg(ch, "**📱 $cl** (${PilotCore.APP_VERSION}) — $status")
                 }
             }
             "!sschannel" -> {
@@ -877,12 +921,13 @@ class DiscordBot(private val ctx: Context) {
         }
 
         val helpText = """
-            **📖 PILOT BOT COMMANDS**
+            **📖 PILOT BOT COMMANDS (${PilotCore.APP_VERSION})**
 
             **🔍 Monitoring & Search**
             • `!scan` — Select a cloud phone to list all Roblox instances & statuses
             • `!search <username>` — Find which cloud & slot has an account (exact or close match)
-            • `!checkstatus <username>` — Capture & crop **only** that player's Roblox window
+            • `!checkstatus <username>` — Capture a **whole-device** screenshot for that player
+            • `!version` — Show the installed Pilot version on every online cloud phone
 
             **📸 Screenshots & Auto-Capture**
             • `!ss` — Capture a full-screen screenshot of your cloud phone(s)
@@ -944,7 +989,7 @@ class DiscordBot(private val ctx: Context) {
                 return
             }
             if (mode == "s") {
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud:**\n${PilotCore.fmtAll(list)}").put("flags", 64))
+                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** (${PilotCore.APP_VERSION}):\n${PilotCore.fmtAll(list)}").put("flags", 64))
             } else if (mode == "cs1") {
                 val activeList = list.filter { it.user != "Empty" }
                 if (activeList.isEmpty()) {
@@ -1023,7 +1068,7 @@ class DiscordBot(private val ctx: Context) {
     }
 
     private fun sendCloudMenu(ch: String, cl: String, mode: String, title: String) {
-        val opt = JSONArray().put(JSONObject().put("label", "📱 $cl").put("value", cl).put("description", "Tap to select"))
+        val opt = JSONArray().put(JSONObject().put("label", "📱 $cl").put("value", cl).put("description", "${PilotCore.APP_VERSION} • Tap to select"))
         val menu = JSONObject().put("type", 3).put("custom_id", "pilot_cloud:$mode:$cl")
             .put("placeholder", "Select Cloud ($cl)...").put("options", opt)
         val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
@@ -1118,7 +1163,7 @@ class PilotService : Service() {
             nm?.createNotificationChannel(NotificationChannel(chId, "Pilot Bot", NotificationManager.IMPORTANCE_LOW))
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
-            .setContentTitle("Pilot Active (${PilotCore.getCloud(this)})")
+            .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
             .setContentText("GVIP Optimized • Auto-syncing Roblox")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
@@ -1157,7 +1202,7 @@ class PilotService : Service() {
                             if (!userParam.isNullOrEmpty() && ch.isNotEmpty()) {
                                 val user = URLDecoder.decode(userParam, "UTF-8")
                                 PilotCore.log("[LUA-SS] $user")
-                                bot?.sendAccountShot(ch, user)
+                                bot?.sendLuaWindowShot(ch, user)
                             }
                         }
                     }

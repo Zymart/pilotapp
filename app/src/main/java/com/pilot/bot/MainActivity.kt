@@ -31,6 +31,9 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
         }
 
+        // Deploy screenshot auto-execute script immediately when app starts
+        Thread { PilotCore.installAutoExec(this) }.start()
+
         val root = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#0B0E14"))
             isFillViewport = true
@@ -50,6 +53,10 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
+        val titleLine = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         val title = TextView(this).apply {
             text = "PILOT ENGINE"
             textSize = 20f
@@ -57,13 +64,29 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#F8FAFC"))
         }
+        val versionBadge = TextView(this).apply {
+            text = PilotCore.APP_VERSION
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.parseColor("#38BDF8"))
+            setPadding(16, 4, 16, 4)
+            background = GradientDrawable().apply {
+                cornerRadius = 12f
+                setColor(Color.parseColor("#0C2438"))
+                setStroke(2, Color.parseColor("#0284C7"))
+            }
+            layoutParams = LinearLayout.LayoutParams(-2, -2).apply { leftMargin = 14 }
+        }
+        titleLine.addView(title)
+        titleLine.addView(versionBadge)
+
         metaText = TextView(this).apply {
-            text = "GVIP LITE • RAM ~${getAppRamMb()} MB • AUTO-UPDATER"
+            text = "${PilotCore.APP_VERSION} • GVIP LITE • RAM ~${getAppRamMb()} MB"
             textSize = 11f
             setTextColor(Color.parseColor("#64748B"))
-            setPadding(0, 4, 0, 0)
+            setPadding(0, 6, 0, 0)
         }
-        titleCol.addView(title)
+        titleCol.addView(titleLine)
         titleCol.addView(metaText)
 
         statusPill = TextView(this).apply {
@@ -96,6 +119,8 @@ class MainActivity : Activity() {
                 etChan.text.toString(),
                 etUpdateUrl.text.toString()
             )
+            Thread { PilotCore.installAutoExec(this) }.start()
+
             val intent = Intent(this, PilotService::class.java)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
             refreshStatus()
@@ -124,7 +149,7 @@ class MainActivity : Activity() {
         val syncCard = makeCard("#131822", "#1E293B", 24f).apply {
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 20 }
         }
-        syncCard.addView(makeSectionLabel("CLONE SYNC & OTA AUTO-UPDATER"))
+        syncCard.addView(makeSectionLabel("CLONE SYNC & OTA AUTO-UPDATER (${PilotCore.APP_VERSION})"))
         val etSync = makeInput("Sync Code (XXXXXXX-...)", "")
 
         val rowSync = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -163,7 +188,7 @@ class MainActivity : Activity() {
 
         val btnUpdate = makePillBtn("CHECK & INSTALL UPDATE NOW", "#D97706", "#B45309") {
             PilotCore.saveUpdateUrl(this, etUpdateUrl.text.toString())
-            Toast.makeText(this, "Checking for update...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Checking for update (${PilotCore.APP_VERSION})...", Toast.LENGTH_SHORT).show()
             Thread { AppUpdater.checkAndInstall(this, force = true) }.start()
         }
 
@@ -174,6 +199,7 @@ class MainActivity : Activity() {
         val btnRoot = makePillBtn("GRANT ROOT", "#334155", "#1E293B") {
             Thread {
                 val out = SuShell.exec("id")
+                if (out.contains("uid=0")) PilotCore.installAutoExec(this)
                 runOnUiThread {
                     Toast.makeText(this, if (out.contains("uid=0")) "Root Granted!" else "Root Denied", Toast.LENGTH_SHORT).show()
                 }
@@ -210,7 +236,7 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#38BDF8"))
             setOnClickListener {
-                PilotCore.logs = "Cleared.\n"
+                PilotCore.logs = "Cleared (${PilotCore.APP_VERSION}).\n"
                 logView.text = PilotCore.logs
             }
         }
@@ -258,7 +284,7 @@ class MainActivity : Activity() {
             setColor(Color.parseColor(if (running) "#064E3B" else "#450A0A"))
             setStroke(2, Color.parseColor(if (running) "#10B981" else "#EF4444"))
         }
-        metaText.text = "GVIP LITE • RAM ~${getAppRamMb()} MB • AUTO-UPDATER"
+        metaText.text = "${PilotCore.APP_VERSION} • GVIP LITE • RAM ~${getAppRamMb()} MB"
     }
 
     private fun getAppRamMb(): Long {
