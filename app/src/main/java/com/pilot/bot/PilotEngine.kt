@@ -27,14 +27,6 @@ import kotlin.math.min
 import kotlin.random.Random
 
 data class AccInfo(val pkg: String, val user: String, val status: String)
-data class ShotRequest(
-    val ch: String,
-    val idx: Int,
-    val acc: AccInfo,
-    val markerPath: String,
-    val latch: CountDownLatch = CountDownLatch(1),
-    @Volatile var capturedFile: File? = null
-)
 
 object SuShell {
     private var proc: java.lang.Process? = null
@@ -223,16 +215,11 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.2.0"
+    const val APP_VERSION = "v1.2.1"
 
     var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
     @Volatile var cachedScan: List<AccInfo> = emptyList()
-
-    // Maps lowercase username -> pending ShotRequest waiting for Roblox CaptureService
-    val pendingShots = ConcurrentHashMap<String, ShotRequest>()
-    // Maps lowercase username -> timestamp marker path for hourly/auto captures
-    val autoMarkers = ConcurrentHashMap<String, String>()
 
     fun log(msg: String) {
         logs = (logs + msg + "\n").takeLast(2400)
@@ -336,7 +323,6 @@ object PilotCore {
         val lua = """
             repeat task.wait(0.5) until game:IsLoaded()
             local Players = game:GetService("Players")
-            local CaptureService = game:GetService("CaptureService")
             local HttpService = game:GetService("HttpService")
 
             local lp = Players.LocalPlayer
@@ -348,90 +334,22 @@ object PilotCore {
             local req = request or http_request or (syn and syn.request)
             if not req then return end
 
-            local capturing = false
-
-            local function notifyPilot(path)
+            local function snapMe()
                 pcall(function()
                     req({
-                        Url = "http://127.0.0.1:8765" .. path,
+                        Url = "http://127.0.0.1:8765/ss?user=" .. HttpService:UrlEncode(lp.Name),
                         Method = "GET"
                     })
                 end)
             end
 
-            local function handleCaptureResult(contentId, captureObj)
-                pcall(function()
-                    if captureObj and CaptureService.SaveCapturesToExternalStorageAsync then
-                        CaptureService:SaveCapturesToExternalStorageAsync({ captureObj })
-                    elseif contentId and CaptureService.SaveCaptureToExternalStorage then
-                        CaptureService:SaveCaptureToExternalStorage(contentId)
-                    end
-                end)
-                task.wait(0.3)
-                notifyPilot("/done?user=" .. HttpService:UrlEncode(lp.Name))
-                capturing = false
-            end
-
-            local function takeRobloxScreenshot(isAuto)
-                if capturing then return end
-                capturing = true
-                if isAuto then
-                    notifyPilot("/pre_auto?user=" .. HttpService:UrlEncode(lp.Name))
-                end
-
-                local ok = pcall(function()
-                    if CaptureService.TakeScreenshotCaptureAsync then
-                        CaptureService:TakeScreenshotCaptureAsync(function(result, screenshotCapture)
-                            if result == Enum.ScreenshotCaptureResult.Success and screenshotCapture then
-                                handleCaptureResult(screenshotCapture.ContentId, screenshotCapture)
-                            else
-                                capturing = false
-                                notifyPilot("/fail?user=" .. HttpService:UrlEncode(lp.Name))
-                            end
-                        end, {
-                            UICaptureMode = Enum.UICaptureMode.All
-                        })
-                    else
-                        CaptureService:CaptureScreenshot(function(contentId)
-                            if contentId and contentId ~= "" then
-                                handleCaptureResult(contentId, nil)
-                            else
-                                capturing = false
-                                notifyPilot("/fail?user=" .. HttpService:UrlEncode(lp.Name))
-                            end
-                        end)
-                    end
-                end)
-
-                if not ok then
-                    capturing = false
-                    notifyPilot("/fail?user=" .. HttpService:UrlEncode(lp.Name))
-                end
-            end
-
-            getgenv().PilotSnap = function()
-                takeRobloxScreenshot(true)
-            end
+            getgenv().PilotSnap = snapMe
 
             task.spawn(function()
-                while task.wait(1.5) do
-                    local ok, res = pcall(function()
-                        return req({
-                            Url = "http://127.0.0.1:8765/poll?user=" .. HttpService:UrlEncode(lp.Name),
-                            Method = "GET"
-                        })
-                    end)
-                    if ok and res and res.Body == "SNAP" then
-                        takeRobloxScreenshot(false)
-                    end
-                end
-            end)
-
-            task.spawn(function()
-                task.wait(6)
-                takeRobloxScreenshot(true)
+                task.wait(5)
+                snapMe()
                 while task.wait(3600) do
-                    takeRobloxScreenshot(true)
+                    snapMe()
                 end
             end)
         """.trimIndent()
@@ -453,51 +371,24 @@ object PilotCore {
             for (d in dirs) {
                 SuShell.exec("mkdir -p '$d' && cp '${tmp.absolutePath}' '$d/pilot_bridge.lua' && chmod 666 '$d/pilot_bridge.lua'")
             }
-            log("[AUTOEXEC] Installed CaptureService script in ${dirs.size} folder(s)")
+            log("[AUTOEXEC] Ready in ${dirs.size} folder(s)")
         }
     }
 
-    fun createMarker(): String {
-        val path = "/data/local/tmp/pilot_mark_${System.nanoTime()}"
-        SuShell.exec("touch '$path'")
-        return path
-    }
-
-    @Synchronized
-    fun grabLatestRobloxCapture(c: Context, pkg: String, markerPath: String): File? {
-        val destFile = File(c.cacheDir, "rbx_cap_${System.nanoTime()}.png")
-        val sh = """
-            found=""
-            for dir in /storage/emulated/0/Pictures/Roblox /storage/emulated/0/DCIM/Roblox /storage/emulated/0/Pictures /storage/emulated/0/DCIM; do
-              [ -d "${'$'}dir" ] || continue
-              f=${'$'}(find -L "${'$'}dir" -maxdepth 2 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) -newer '$markerPath' 2>/dev/null | head -n 1)
-              if [ -n "${'$'}f" ]; then
-                found="${'$'}f"
-                break
-              fi
-            done
-            if [ -z "${'$'}found" ] && [ -n "$pkg" ]; then
-              found=${'$'}(find "/data/data/$pkg/cache" "/data/data/$pkg/files" -maxdepth 4 -type f \( -iname '*.png' -o -iname '*.jpg' \) -newer '$markerPath' 2>/dev/null | head -n 1)
-            fi
-            rm -f '$markerPath'
-            if [ -n "${'$'}found" ] && [ -f "${'$'}found" ]; then
-              cp "${'$'}found" '${destFile.absolutePath}'
-              chmod 666 '${destFile.absolutePath}'
-              case "${'$'}found" in
-                /storage/emulated/0/*) rm -f "${'$'}found" ;;
-              esac
-              echo "FOUND"
-            fi
-        """.trimIndent()
-
-        val out = SuShell.exec(sh)
-        return if (out.contains("FOUND") && destFile.exists() && destFile.length() > 1000L) destFile else null
-    }
-
+    /**
+     * Parses Android 10–14 window dumps (including UGPhone freeform windows) to locate
+     * the exact in-game Roblox viewport (preferring content= / SurfaceView frames so the
+     * floating titlebar, other clones, and keyboard are cropped out).
+     */
     fun findWindowBounds(pkg: String): Rect? {
         val dump = SuShell.exec("dumpsys window windows 2>/dev/null")
         if (dump.isEmpty()) return null
-        val frameRx = Regex("""\b(?:mContentFrame|mFrame|mBounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+
+        val contentRx = Regex("""\b(?:content|mContentFrame)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        val frameRx = Regex("""\b(?:frame|mFrame|mBounds|Bounds|bounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+
+        var bestContentRect: Rect? = null
+        var bestContentArea = 0
         var bestSurfaceRect: Rect? = null
         var bestSurfaceArea = 0
         var bestWindowRect: Rect? = null
@@ -506,30 +397,53 @@ object PilotCore {
         for (block in dump.split("Window #")) {
             if (!block.contains("package=$pkg") && !block.contains("$pkg/")) continue
             if (block.contains("mHasSurface=false") || block.contains("mViewVisibility=0x8")) continue
+
             val isSurface = block.contains("SurfaceView")
+
+            val cm = contentRx.find(block)
+            if (cm != null) {
+                val l = cm.groupValues[1].toIntOrNull() ?: 0
+                val t = cm.groupValues[2].toIntOrNull() ?: 0
+                val r = cm.groupValues[3].toIntOrNull() ?: 0
+                val b = cm.groupValues[4].toIntOrNull() ?: 0
+                val w = r - l
+                val h = b - t
+                val area = w * h
+                if (w >= 150 && h >= 150 && area > bestContentArea) {
+                    bestContentArea = area
+                    bestContentRect = Rect(l, t, r, b)
+                }
+            }
+
             for (line in block.lines()) {
-                val m = frameRx.find(line)
-                if (m != null) {
-                    val l = m.groupValues[1].toIntOrNull() ?: 0
-                    val t = m.groupValues[2].toIntOrNull() ?: 0
-                    val r = m.groupValues[3].toIntOrNull() ?: 0
-                    val b = m.groupValues[4].toIntOrNull() ?: 0
-                    val w = r - l
-                    val h = b - t
-                    val area = w * h
-                    if (w >= 150 && h >= 150) {
-                        if (isSurface && area > bestSurfaceArea) {
-                            bestSurfaceArea = area
-                            bestSurfaceRect = Rect(l, t, r, b)
-                        } else if (area > bestWindowArea) {
-                            bestWindowArea = area
-                            bestWindowRect = Rect(l, t, r, b)
-                        }
+                val m = frameRx.find(line) ?: continue
+                val l = m.groupValues[1].toIntOrNull() ?: 0
+                val t = m.groupValues[2].toIntOrNull() ?: 0
+                val r = m.groupValues[3].toIntOrNull() ?: 0
+                val b = m.groupValues[4].toIntOrNull() ?: 0
+                val w = r - l
+                val h = b - t
+                val area = w * h
+                if (w >= 150 && h >= 150) {
+                    if (isSurface && area > bestSurfaceArea) {
+                        bestSurfaceArea = area
+                        bestSurfaceRect = Rect(l, t, r, b)
+                    } else if (area > bestWindowArea) {
+                        bestWindowArea = area
+                        bestWindowRect = Rect(l, t, r, b)
                     }
                 }
             }
         }
-        return bestSurfaceRect ?: bestWindowRect
+
+        if (bestSurfaceRect != null) return bestSurfaceRect
+        if (bestContentRect != null) return bestContentRect
+        if (bestWindowRect != null) {
+            // Trim floating window titlebar (~38px) when in freeform multi-window mode
+            val topTrim = if (bestWindowRect.top > 0 && bestWindowRect.height() > 240) 38 else 0
+            return Rect(bestWindowRect.left, bestWindowRect.top + topTrim, bestWindowRect.right, bestWindowRect.bottom)
+        }
+        return null
     }
 
     @Synchronized
@@ -560,7 +474,7 @@ object PilotCore {
             full.recycle()
 
             val outFile = File(outPath)
-            FileOutputStream(outFile).use { cropped.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+            FileOutputStream(outFile).use { cropped.compress(Bitmap.CompressFormat.JPEG, 90, it) }
             cropped.recycle()
             rawFile.delete()
             outFile to true
@@ -756,7 +670,7 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    // !checkstatus <username> — triggers Roblox built-in CaptureService inside that player's client
+    // !checkstatus <username> — captures & crops strictly inside that player's Roblox viewport
     fun sendAccountShot(ch: String, query: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
@@ -775,37 +689,19 @@ class DiscordBot(private val ctx: Context) {
         }
 
         for ((idx, acc) in matches) {
-            val key = acc.user.lowercase()
-            val marker = PilotCore.createMarker()
-            val req = ShotRequest(ch, idx, acc, marker)
-            PilotCore.pendingShots[key] = req
-
-            // Wait up to 6.5s for Roblox CaptureService inside pilot_bridge.lua to capture & save
-            val gotLua = runCatching { req.latch.await(6500, TimeUnit.MILLISECONDS) }.getOrDefault(false)
-            PilotCore.pendingShots.remove(key)
-
-            val capFile = req.capturedFile
-            if (gotLua && capFile != null && capFile.exists()) {
-                val caption = "**📱 $cl** — In-Game Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}"
-                sendImage(ch, caption, capFile)
-                capFile.delete()
+            val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
+            val note = if (!croppedOk) "\n*(Window minimized/hidden — showing full screen)*" else ""
+            val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
+            if (img != null) {
+                sendImage(ch, caption, img)
+                img.delete()
             } else {
-                // Fallback if player is on login screen or executor hasn't injected yet
-                SuShell.exec("rm -f '$marker'")
-                val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
-                val note = if (!croppedOk) "\n*(In-game capture unavailable — showing full screen)*" else "\n*(Window crop fallback)*"
-                val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
-                if (img != null) {
-                    sendImage(ch, caption, img)
-                    img.delete()
-                } else {
-                    sendMsg(ch, caption)
-                }
+                sendMsg(ch, caption)
             }
         }
     }
 
-    fun sendAutoCaptureToChannel(ch: String, exactUser: String, capFile: File?) {
+    fun sendLuaWindowShot(ch: String, exactUser: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
         val q = exactUser.trim().lowercase()
@@ -814,18 +710,12 @@ class DiscordBot(private val ctx: Context) {
         }.firstOrNull() ?: return
 
         val (idx, acc) = match
-        if (capFile != null && capFile.exists()) {
-            val caption = "**📱 $cl** — In-Game Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}"
-            sendImage(ch, caption, capFile)
-            capFile.delete()
-        } else {
-            val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
-            val note = if (!croppedOk) "\n*(Window hidden — showing full screen)*" else ""
-            val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
-            if (img != null) {
-                sendImage(ch, caption, img)
-                img.delete()
-            }
+        val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg)
+        val note = if (!croppedOk) "\n*(Window minimized/hidden — showing full screen)*" else ""
+        val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
+        if (img != null) {
+            sendImage(ch, caption, img)
+            img.delete()
         }
     }
 
@@ -1080,7 +970,7 @@ class DiscordBot(private val ctx: Context) {
             **🔍 Monitoring & Search**
             • `!scan` — Select a cloud phone to list all Roblox instances & statuses
             • `!search <username>` — Find which cloud & slot has an account (exact or close match)
-            • `!checkstatus <username>` — Capture an **in-game** screenshot via Roblox `CaptureService`
+            • `!checkstatus <username>` — Capture & crop **only** inside that player's Roblox window
             • `!version` — Show the installed Pilot version on every online cloud phone
 
             **📸 Screenshots & Auto-Capture**
@@ -1092,7 +982,7 @@ class DiscordBot(private val ctx: Context) {
             • `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
             • `!logout` — Log out one or all accounts on a cloud (keeps last username history)
             • `!delete` — Wipe session data **and** clear username history (resets to Empty)
-            • `!rename <new name>` — Remely rename a cloud phone
+            • `!rename <new name>` — Remotely rename a cloud phone
             • `!update [drive_url]` — Check & silently install the latest Pilot APK
             • `!config` — DM yourself a `XXXXXXX-...` sync code to clone settings
             • `!help` — Show this command guide
@@ -1301,7 +1191,7 @@ class PilotService : Service() {
     private var bot: DiscordBot? = null
     private var wl: PowerManager.WakeLock? = null
     private val syncExec = Executors.newSingleThreadScheduledExecutor()
-    private val bridgePool = Executors.newFixedThreadPool(3)
+    private val bridgePool = Executors.newFixedThreadPool(2)
     private var localServer: ServerSocket? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -1318,7 +1208,7 @@ class PilotService : Service() {
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
-            .setContentText("GVIP Optimized • CaptureService Bridge Active")
+            .setContentText("GVIP Optimized • Auto-syncing Roblox")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)
@@ -1343,74 +1233,20 @@ class PilotService : Service() {
 
         Thread {
             runCatching {
-                localServer = ServerSocket(8765, 30, InetAddress.getByName("127.0.0.1"))
+                localServer = ServerSocket(8765, 20, InetAddress.getByName("127.0.0.1"))
                 while (isRunning) {
                     val sock = localServer?.accept() ?: break
                     bridgePool.execute {
                         runCatching {
                             val reqLine = sock.getInputStream().bufferedReader().readLine() ?: ""
-                            val pathAndQuery = reqLine.substringAfter(" ", "").substringBefore(" ")
-                            val userParam = Regex("""[?&]user=([^&\s]+)""").find(pathAndQuery)?.groupValues?.get(1)
-                            val user = if (!userParam.isNullOrEmpty()) URLDecoder.decode(userParam, "UTF-8").trim() else ""
-                            val key = user.lowercase()
-
-                            when {
-                                pathAndQuery.startsWith("/poll") -> {
-                                    val reply = if (key.isNotEmpty() && PilotCore.pendingShots.containsKey(key)) "SNAP" else "IDLE"
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: ${reply.length}\r\n\r\n$reply".toByteArray())
-                                    sock.close()
-                                }
-
-                                pathAndQuery.startsWith("/pre_auto") -> {
-                                    if (key.isNotEmpty()) {
-                                        val old = PilotCore.autoMarkers.put(key, PilotCore.createMarker())
-                                        if (!old.isNullOrEmpty()) SuShell.exec("rm -f '$old'")
-                                    }
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                }
-
-                                pathAndQuery.startsWith("/done") || pathAndQuery.startsWith("/ss") -> {
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                    if (key.isNotEmpty()) {
-                                        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(this) }
-                                        val pkg = list.firstOrNull { it.user.equals(user, ignoreCase = true) }?.pkg ?: ""
-                                        val pending = PilotCore.pendingShots[key]
-                                        if (pending != null) {
-                                            pending.capturedFile = PilotCore.grabLatestRobloxCapture(this, pkg, pending.markerPath)
-                                            pending.latch.countDown()
-                                            PilotCore.log("[CAPTURE] In-game shot ready for $user")
-                                        } else {
-                                            val autoMark = PilotCore.autoMarkers.remove(key)
-                                            val capFile = if (!autoMark.isNullOrEmpty()) {
-                                                PilotCore.grabLatestRobloxCapture(this, pkg, autoMark)
-                                            } else null
-                                            val ch = PilotCore.getSsChannel(this)
-                                            if (ch.isNotEmpty()) {
-                                                PilotCore.log("[LUA-SS] $user")
-                                                bot?.sendAutoCaptureToChannel(ch, user, capFile)
-                                            } else {
-                                                capFile?.delete()
-                                            }
-                                        }
-                                    }
-                                }
-
-                                pathAndQuery.startsWith("/fail") -> {
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                    if (key.isNotEmpty()) {
-                                        PilotCore.pendingShots[key]?.latch?.countDown()
-                                        val old = PilotCore.autoMarkers.remove(key)
-                                        if (!old.isNullOrEmpty()) SuShell.exec("rm -f '$old'")
-                                    }
-                                }
-
-                                else -> {
-                                    sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                                    sock.close()
-                                }
+                            sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
+                            sock.close()
+                            val userParam = Regex("""[?&]user=([^&\s]+)""").find(reqLine)?.groupValues?.get(1)
+                            val ch = PilotCore.getSsChannel(this)
+                            if (!userParam.isNullOrEmpty() && ch.isNotEmpty()) {
+                                val user = URLDecoder.decode(userParam, "UTF-8")
+                                PilotCore.log("[LUA-SS] $user")
+                                bot?.sendLuaWindowShot(ch, user)
                             }
                         }
                     }
