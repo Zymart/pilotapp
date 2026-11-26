@@ -80,7 +80,7 @@ object AppUpdater {
         val u = raw.trim()
         if (u.isEmpty()) return ""
         val driveId = Regex("""drive\.google\.com/(?:file/d/|open\?id=|uc\?.*?\bid=)([a-zA-Z0-9_-]{15,})""").find(u)?.groupValues?.get(1)
-        return if (!driveId.isNullOrEmpty()) "[https://drive.google.com/uc?export=download&id=$driveId](https://drive.google.com/uc?export=download&id=$driveId)" else u
+        return if (!driveId.isNullOrEmpty()) "https://drive.google.com/uc?export=download&id=$driveId" else u
     }
 
     @Synchronized
@@ -109,7 +109,7 @@ object AppUpdater {
                 }.getOrDefault("$downloadUrl|${System.currentTimeMillis() / 3600000}")
                 newTag = sig
             } else {
-                val apiUrl = "[https://api.github.com/repos/Zymart/pilotapp/releases/tags/latest](https://api.github.com/repos/Zymart/pilotapp/releases/tags/latest)"
+                val apiUrl = "https://api.github.com/repos/Zymart/pilotapp/releases/tags/latest"
                 val req = Request.Builder().url(apiUrl)
                     .header("Accept", "application/vnd.github+json")
                     .header("User-Agent", "PilotUpdater").build()
@@ -197,7 +197,7 @@ object AppUpdater {
                     val uuid = Regex("""name="uuid"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
                     val id = Regex("""[?&]id=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1)
                     if (!id.isNullOrEmpty() && !confirm.isNullOrEmpty()) {
-                        val bypass = "[https://drive.usercontent.google.com/download?id=$id&export=download&confirm=$confirm](https://drive.usercontent.google.com/download?id=$id&export=download&confirm=$confirm)" +
+                        val bypass = "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=$confirm" +
                                 (if (!uuid.isNullOrEmpty()) "&uuid=$uuid" else "")
                         return downloadBinary(bypass, dest)
                     }
@@ -216,6 +216,7 @@ object AppUpdater {
 object PilotCore {
     var logs = "Agent initialized.\n"
     var onLog: (() -> Unit)? = null
+    @Volatile var cachedScan: List<AccInfo> = emptyList()
 
     fun log(msg: String) {
         logs = (logs + msg + "\n").takeLast(2400)
@@ -330,7 +331,7 @@ object PilotCore {
             local function snapMe()
                 pcall(function()
                     req({
-                        Url = "[http://127.0.0.1:8765/ss?user=](http://127.0.0.1:8765/ss?user=)" .. lp.Name,
+                        Url = "http://127.0.0.1:8765/ss?user=" .. lp.Name,
                         Method = "GET"
                     })
                 end)
@@ -461,12 +462,15 @@ object PilotCore {
             }
         }
         if (changed) edit.apply()
-        return res.sortedBy { it.pkg }
+        val sorted = res.sortedBy { it.pkg }
+        cachedScan = sorted
+        return sorted
     }
 
     fun wipe(c: Context, pkg: String, clearHist: Boolean) {
         SuShell.exec("am force-stop $pkg && rm -rf /data/data/$pkg/app_webview/Default/Cookies* /data/data/$pkg/shared_prefs/* /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/*")
         if (clearHist) histPrefs(c).edit().remove(pkg).apply()
+        scanRbx(c)
     }
 
     @Synchronized
@@ -544,6 +548,7 @@ object PilotCore {
         if (ok && username.isNotEmpty() && username != "Empty") {
             histPrefs(c).edit().putString(dstPkg, username).apply()
         }
+        scanRbx(c)
         return ok to count
     }
 
@@ -557,12 +562,6 @@ object PilotCore {
     }
 }
 
-/**
- * Silent background agent for UGPhone.
- * All user-facing commands live inside the central Python bot (main.py) so 43+ cloud phones
- * never produce duplicate responses. This agent only answers internal PILOT_PING, PILOT_CMD,
- * and PILOT_XFER bridge messages, plus local Lua screenshot triggers on 127.0.0.1:8765.
- */
 class PilotBridgeAgent(private val ctx: Context) {
     private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
     private val exec = Executors.newSingleThreadScheduledExecutor()
@@ -585,7 +584,7 @@ class PilotBridgeAgent(private val ctx: Context) {
 
     fun sendAccountShot(ch: String, query: String) {
         val cl = PilotCore.getCloud(ctx)
-        val list = PilotCore.scanRbx(ctx)
+        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
         val q = query.trim().lowercase()
         val matches = list.mapIndexedNotNull { i, a ->
             if (a.user != "Empty" && a.user.lowercase() == q) i to a else null
@@ -612,8 +611,14 @@ class PilotBridgeAgent(private val ctx: Context) {
             override fun onMessage(w: WebSocket, text: String) {
                 exec.execute { handlePacket(w, JSONObject(text)) }
             }
-            override fun onClosed(w: WebSocket, code: Int, reason: String) { scheduleReconnect() }
-            override fun onFailure(w: WebSocket, t: Throwable, response: Response?) { scheduleReconnect() }
+            override fun onClosed(w: WebSocket, code: Int, reason: String) {
+                PilotCore.log("[WS] Closed ($code), reconnecting...")
+                scheduleReconnect()
+            }
+            override fun onFailure(w: WebSocket, t: Throwable, response: Response?) {
+                PilotCore.log("[WS] Error: ${t.message ?: "disconnected"}")
+                scheduleReconnect()
+            }
         })
     }
 
@@ -634,7 +639,7 @@ class PilotBridgeAgent(private val ctx: Context) {
 
                 val idPayload = JSONObject().put("op", 2).put("d", JSONObject()
                     .put("token", PilotCore.getToken(ctx))
-                    .put("intents", 33281)
+                    .put("intents", 37377)
                     .put("properties", JSONObject().put("os", "android").put("browser", "pilot-agent").put("device", "pilot-agent")))
                 w.send(idPayload.toString())
             }
@@ -672,7 +677,7 @@ class PilotBridgeAgent(private val ctx: Context) {
                 if (reqId.isEmpty()) return
                 ioExec.execute {
                     val myCloud = PilotCore.getCloud(ctx)
-                    val list = PilotCore.scanRbx(ctx)
+                    val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
                     val arr = JSONArray()
                     for (a in list) {
                         arr.put(JSONObject().put("pkg", a.pkg).put("user", a.user).put("status", a.status))
@@ -683,7 +688,6 @@ class PilotBridgeAgent(private val ctx: Context) {
             }
 
             content.startsWith("PILOT_CMD:") -> {
-                // Format: PILOT_CMD:<reqId>:<targetCloud>:<action>:<arg>
                 val parts = content.split(":", limit = 5)
                 if (parts.size < 4) return
                 val reqId = parts[1]
@@ -752,7 +756,6 @@ class PilotBridgeAgent(private val ctx: Context) {
                 sendMsg(ch, "PILOT_ACK:$reqId:$myCloud:$status")
             }
             "PACK" -> {
-                // arg: <srcPkg>|<srcUser>|<dstCloud>|<dstPkg>
                 val p = arg.split("|", limit = 4)
                 if (p.size < 4) return
                 val srcPkg = p[0]
@@ -788,7 +791,6 @@ class PilotBridgeAgent(private val ctx: Context) {
         val content = d.optString("content").trim()
         val ch = d.optString("channel_id")
         val msgId = d.optString("id")
-        // Format: PILOT_XFER:<reqId>:<srcCloud>:<srcPkg>:<srcUser>:<dstCloud>:<dstPkg>
         val parts = content.split(":", limit = 7)
         if (parts.size < 7) return
         val reqId = parts[1]
@@ -823,7 +825,7 @@ class PilotBridgeAgent(private val ctx: Context) {
         }
 
         val (ok, scriptCount) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, tmpBundle)
-        if (msgId.isNotEmpty()) apiDelete("[https://discord.com/api/v10/channels/$ch/messages/$msgId](https://discord.com/api/v10/channels/$ch/messages/$msgId)")
+        if (msgId.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgId")
 
         if (ok) {
             PilotCore.log("[XFER-OK] $srcUser restored to $dstPkg (+$scriptCount script files)")
@@ -837,7 +839,7 @@ class PilotBridgeAgent(private val ctx: Context) {
     }
 
     private fun sendMsg(ch: String, content: String) {
-        apiPost("[https://discord.com/api/v10/channels/$ch/messages](https://discord.com/api/v10/channels/$ch/messages)", JSONObject().put("content", content))
+        apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", content))
     }
 
     private fun sendFile(ch: String, caption: String, file: File, fileName: String) {
@@ -852,7 +854,7 @@ class PilotBridgeAgent(private val ctx: Context) {
                 .addFormDataPart("files[0]", fileName, file.asRequestBody(mime.toMediaType()))
                 .build()
             val req = Request.Builder()
-                .url("[https://discord.com/api/v10/channels/$ch/messages](https://discord.com/api/v10/channels/$ch/messages)")
+                .url("https://discord.com/api/v10/channels/$ch/messages")
                 .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
                 .post(mp)
                 .build()
@@ -917,7 +919,7 @@ class PilotService : Service() {
                 last = cur
                 cur.forEach { PilotCore.log("[SYNC] ${it.pkg} -> ${it.user} (${it.status})") }
             }
-        }, 2, 10, TimeUnit.SECONDS)
+        }, 1, 10, TimeUnit.SECONDS)
 
         syncExec.scheduleAtFixedRate({
             AppUpdater.checkAndInstall(this, force = false)
