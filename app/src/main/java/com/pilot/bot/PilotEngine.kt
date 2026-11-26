@@ -22,6 +22,7 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.URLDecoder
 import java.util.concurrent.*
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
@@ -215,7 +216,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.2.1"
+    const val APP_VERSION = "v1.2.3"
 
     var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
@@ -228,6 +229,18 @@ object PilotCore {
 
     private fun prefs(c: Context) = c.getSharedPreferences("pilot_cfg", Context.MODE_PRIVATE)
     private fun histPrefs(c: Context) = c.getSharedPreferences("pilot_hist", Context.MODE_PRIVATE)
+
+    fun cleanBotToken(raw: String): String {
+        // Removes the single '@' anti-revocation character and whitespace
+        return raw.replace("@", "").replace(Regex("""\s+"""), "").trim()
+    }
+
+    fun parseAllowedIds(raw: String): List<String> {
+        return raw.split(",", ";", " ", "\n", "\t")
+            .map { it.replace(Regex("""[^0-9]"""), "") }
+            .filter { it.length >= 15 }
+            .distinct()
+    }
 
     fun getCloud(c: Context): String {
         val f = File("/sdcard/cloud_name.txt")
@@ -267,8 +280,37 @@ object PilotCore {
         runCatching { File("/sdcard/cloud_name.txt").writeText(clean) }
     }
 
-    fun getToken(c: Context) = prefs(c).getString("token", "") ?: ""
-    fun getUserId(c: Context) = prefs(c).getLong("user_id", 0L)
+    fun getToken(c: Context) = cleanBotToken(prefs(c).getString("token", "") ?: "")
+
+    fun getAllowedIdsRaw(c: Context): String {
+        val saved = prefs(c).getString("allowed_ids", "") ?: ""
+        if (saved.isNotEmpty()) return saved
+        val legacyUid = prefs(c).getLong("user_id", 0L)
+        return if (legacyUid != 0L) legacyUid.toString() else ""
+    }
+
+    fun getAllowedIds(c: Context): Set<String> {
+        return parseAllowedIds(getAllowedIdsRaw(c)).toSet()
+    }
+
+    fun getPrimaryUserId(c: Context): Long {
+        val ids = parseAllowedIds(getAllowedIdsRaw(c))
+        return ids.firstOrNull()?.toLongOrNull() ?: prefs(c).getLong("user_id", 0L)
+    }
+
+    fun isAuthorized(c: Context, userId: String, roles: JSONArray?): Boolean {
+        val allowed = getAllowedIds(c)
+        if (allowed.isEmpty()) return false
+        if (userId.isNotEmpty() && userId in allowed) return true
+        if (roles != null) {
+            for (i in 0 until roles.length()) {
+                val r = roles.optString(i)
+                if (r.isNotEmpty() && r in allowed) return true
+            }
+        }
+        return false
+    }
+
     fun getSsChannel(c: Context) = prefs(c).getString("ss_channel", "") ?: ""
     fun getUpdateUrl(c: Context) = prefs(c).getString("upd_url", "") ?: ""
 
@@ -280,43 +322,106 @@ object PilotCore {
         prefs(c).edit().putString("upd_url", url.trim()).apply()
     }
 
-    fun saveConfig(c: Context, cloud: String, token: String, uid: Long, ssChan: String = "", updUrl: String = "") {
+    fun saveConfig(c: Context, cloud: String, rawToken: String, rawIds: String, ssChan: String = "", updUrl: String = "") {
         val cl = cloud.trim().ifEmpty { detectDeviceName(c) }
+        val cleanTok = cleanBotToken(rawToken)
+        val idList = parseAllowedIds(rawIds)
+        val joinedIds = idList.joinToString(",")
+        val primaryUid = idList.firstOrNull()?.toLongOrNull() ?: 0L
+
         val edit = prefs(c).edit()
             .putString("cloud", cl)
-            .putString("token", token.trim())
-            .putLong("user_id", uid)
+            .putString("token", cleanTok)
+            .putString("allowed_ids", joinedIds)
+            .putLong("user_id", primaryUid)
             .putString("upd_url", updUrl.trim())
         if (ssChan.trim().isNotEmpty()) edit.putString("ss_channel", ssChan.trim())
         edit.apply()
         runCatching { File("/sdcard/cloud_name.txt").writeText(cl) }
     }
 
-    fun makeCode(c: Context): String {
+    fun makeCode(c: Context, autoRoot: Boolean = true): String {
         val letters = (1..7).map { ('A'..'Z').random() }.joinToString("")
         val payload = JSONObject()
             .put("t", getToken(c))
-            .put("u", getUserId(c))
+            .put("u", getPrimaryUserId(c))
+            .put("ids", getAllowedIdsRaw(c))
             .put("c", getSsChannel(c))
             .put("d", getUpdateUrl(c))
+            .put("ar", autoRoot)
             .toString()
         val b64 = Base64.encodeToString(payload.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
         return "$letters-$b64"
     }
 
-    fun applyCode(c: Context, code: String): Boolean = runCatching {
-        val raw = code.trim().substringAfter("-")
-        val json = JSONObject(String(Base64.decode(raw, Base64.URL_SAFE)))
+    /**
+     * Applies a XXXXXXX-... sync code, automatically grants root + disables battery limits +
+     * installs autoexec + starts PilotService when requested. Returns (success, autoStarted).
+     */
+    fun applyCode(c: Context, code: String): Pair<Boolean, Boolean> {
+        val parsed = runCatching {
+            val raw = code.trim().substringAfter("-")
+            JSONObject(String(Base64.decode(raw, Base64.URL_SAFE)))
+        }.getOrNull() ?: return false to false
+
+        val tok = cleanBotToken(parsed.optString("t", ""))
+        if (tok.isEmpty()) return false to false
+
+        val rawIds = parsed.optString("ids", "").ifEmpty {
+            val u = parsed.optLong("u", 0L)
+            if (u != 0L) u.toString() else ""
+        }
+        val idList = parseAllowedIds(rawIds)
+        val joinedIds = idList.joinToString(",")
+        val primaryUid = idList.firstOrNull()?.toLongOrNull() ?: parsed.optLong("u", 0L)
+
         val edit = prefs(c).edit()
-            .putString("token", json.getString("t"))
-            .putLong("user_id", json.getLong("u"))
-        val ch = json.optString("c", "")
+            .putString("token", tok)
+            .putString("allowed_ids", joinedIds)
+            .putLong("user_id", primaryUid)
+
+        val ch = parsed.optString("c", "")
         if (ch.isNotEmpty()) edit.putString("ss_channel", ch)
-        val upd = json.optString("d", "")
+        val upd = parsed.optString("d", "")
         if (upd.isNotEmpty()) edit.putString("upd_url", upd)
         edit.apply()
-        true
-    }.getOrDefault(false)
+
+        val autoRoot = parsed.optBoolean("ar", true)
+        var started = false
+        if (autoRoot) {
+            autoGrantRootAndPerms(c)
+            if (getToken(c).isNotEmpty() && getAllowedIds(c).isNotEmpty()) {
+                val svc = Intent(c, PilotService::class.java)
+                runCatching {
+                    if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(svc) else c.startService(svc)
+                    started = true
+                }
+            }
+        }
+        return true to started
+    }
+
+    @Synchronized
+    fun autoGrantRootAndPerms(c: Context): Boolean {
+        val idOut = SuShell.exec("id")
+        if (!idOut.contains("uid=0")) {
+            log("[ROOT] Root check failed")
+            return false
+        }
+        val pkg = c.packageName
+        val cmds = """
+            dumpsys deviceidle whitelist +$pkg >/dev/null 2>&1
+            cmd appops set $pkg RUN_IN_BACKGROUND allow >/dev/null 2>&1
+            cmd appops set $pkg RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1
+            pm grant $pkg android.permission.POST_NOTIFICATIONS >/dev/null 2>&1
+            pm grant $pkg android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1
+            pm grant $pkg android.permission.WRITE_EXTERNAL_STORAGE >/dev/null 2>&1
+        """.trimIndent()
+        SuShell.exec(cmds)
+        installAutoExec(c)
+        log("[ROOT] Auto-granted root, battery whitelist & autoexec")
+        return true
+    }
 
     @Synchronized
     fun installAutoExec(c: Context) {
@@ -376,59 +481,143 @@ object PilotCore {
     }
 
     /**
-     * Parses Android 10–14 window dumps (including UGPhone freeform windows) to locate
-     * the exact in-game Roblox viewport (preferring content= / SurfaceView frames so the
-     * floating titlebar, other clones, and keyboard are cropped out).
+     * Multi-method window bounds detector for UGPhone (Android 10-14 freeform & virtual windows):
+     * 1. Parses `dumpsys window windows` (matching rect=(x,y) w x h, content=, mFrame=, mBounds=)
+     * 2. Falls back to `dumpsys SurfaceFlinger` visible layer bounds
+     * 3. Falls back to `dumpsys activity activities` task bounds
+     * Trims the floating window titlebar so only the inside of the Roblox screen is captured.
      */
-    fun findWindowBounds(pkg: String): Rect? {
-        val dump = SuShell.exec("dumpsys window windows 2>/dev/null")
-        if (dump.isEmpty()) return null
+    fun findWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
+        val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
+        val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        val surfaceRectRx = Regex("""rect=\((-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)\)\s+(\d+)\s*x\s*(\d+)""")
 
-        val contentRx = Regex("""\b(?:content|mContentFrame)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
-        val frameRx = Regex("""\b(?:frame|mFrame|mBounds|Bounds|bounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
-
-        var bestContentRect: Rect? = null
-        var bestContentArea = 0
         var bestSurfaceRect: Rect? = null
         var bestSurfaceArea = 0
+        var bestContentRect: Rect? = null
+        var bestContentArea = 0
         var bestWindowRect: Rect? = null
         var bestWindowArea = 0
 
-        for (block in dump.split("Window #")) {
-            if (!block.contains("package=$pkg") && !block.contains("$pkg/")) continue
-            if (block.contains("mHasSurface=false") || block.contains("mViewVisibility=0x8")) continue
+        // Method 1: dumpsys window windows
+        val winDump = SuShell.exec("dumpsys window windows 2>/dev/null")
+        if (winDump.isNotEmpty()) {
+            for (block in winDump.split("Window #")) {
+                if (!pkgRx.containsMatchIn(block)) continue
+                if (block.contains("mHasSurface=false") || block.contains("mViewVisibility=0x8")) continue
 
-            val isSurface = block.contains("SurfaceView")
+                val isSurface = block.contains("SurfaceView")
+                for (line in block.lines()) {
+                    val trimmed = line.trim()
+                    if (trimmed.contains("mParentFrame=") || trimmed.contains("mDisplayFrame=") ||
+                        trimmed.contains("parent=[") || trimmed.contains("display=[") ||
+                        trimmed.contains("mStable=") || trimmed.contains("mOverscan=")) {
+                        continue
+                    }
 
-            val cm = contentRx.find(block)
-            if (cm != null) {
-                val l = cm.groupValues[1].toIntOrNull() ?: 0
-                val t = cm.groupValues[2].toIntOrNull() ?: 0
-                val r = cm.groupValues[3].toIntOrNull() ?: 0
-                val b = cm.groupValues[4].toIntOrNull() ?: 0
-                val w = r - l
-                val h = b - t
-                val area = w * h
-                if (w >= 150 && h >= 150 && area > bestContentArea) {
-                    bestContentArea = area
-                    bestContentRect = Rect(l, t, r, b)
+                    // Android 12+ Surface: shown=true ... rect=(580.0,45.0) 640 x 420
+                    val sm = surfaceRectRx.find(trimmed)
+                    if (sm != null) {
+                        val l = sm.groupValues[1].toFloatOrNull()?.toInt() ?: 0
+                        val t = sm.groupValues[2].toFloatOrNull()?.toInt() ?: 0
+                        val w = sm.groupValues[3].toIntOrNull() ?: 0
+                        val h = sm.groupValues[4].toIntOrNull() ?: 0
+                        val area = w * h
+                        if (w >= 150 && h >= 150) {
+                            val r = Rect(l, t, l + w, t + h)
+                            if (isSurface && area > bestSurfaceArea) {
+                                bestSurfaceArea = area
+                                bestSurfaceRect = r
+                            } else if (area > bestWindowArea) {
+                                bestWindowArea = area
+                                bestWindowRect = r
+                            }
+                        }
+                    }
+
+                    val bm = bracketRx.find(trimmed) ?: continue
+                    val l = bm.groupValues[1].toIntOrNull() ?: 0
+                    val t = bm.groupValues[2].toIntOrNull() ?: 0
+                    val r = bm.groupValues[3].toIntOrNull() ?: 0
+                    val b = bm.groupValues[4].toIntOrNull() ?: 0
+                    val w = r - l
+                    val h = b - t
+                    val area = w * h
+                    if (w < 150 || h < 150) continue
+
+                    val rect = Rect(l, t, r, b)
+                    when {
+                        isSurface && area > bestSurfaceArea -> {
+                            bestSurfaceArea = area
+                            bestSurfaceRect = rect
+                        }
+                        (trimmed.contains("content=") || trimmed.contains("mContentFrame=")) && area > bestContentArea -> {
+                            bestContentArea = area
+                            bestContentRect = rect
+                        }
+                        (trimmed.contains("frame=") || trimmed.contains("mFrame=") ||
+                         trimmed.contains("mBounds=") || trimmed.contains("bounds=") ||
+                         trimmed.contains("Bounds=")) && area > bestWindowArea -> {
+                            bestWindowArea = area
+                            bestWindowRect = rect
+                        }
+                    }
                 }
             }
+        }
 
-            for (line in block.lines()) {
-                val m = frameRx.find(line) ?: continue
-                val l = m.groupValues[1].toIntOrNull() ?: 0
-                val t = m.groupValues[2].toIntOrNull() ?: 0
-                val r = m.groupValues[3].toIntOrNull() ?: 0
-                val b = m.groupValues[4].toIntOrNull() ?: 0
-                val w = r - l
-                val h = b - t
-                val area = w * h
-                if (w >= 150 && h >= 150) {
-                    if (isSurface && area > bestSurfaceArea) {
-                        bestSurfaceArea = area
-                        bestSurfaceRect = Rect(l, t, r, b)
-                    } else if (area > bestWindowArea) {
+        // Method 2: dumpsys SurfaceFlinger layer bounds
+        if (bestSurfaceRect == null && bestContentRect == null && bestWindowRect == null) {
+            val sfDump = SuShell.exec("dumpsys SurfaceFlinger 2>/dev/null")
+            if (sfDump.isNotEmpty()) {
+                val sfBoundsRx = Regex("""bounds[:=\s]+\[(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\]""")
+                var activePkgBlock = false
+                var isSurfLayer = false
+                for (line in sfDump.lines()) {
+                    if (line.startsWith("+ ") || line.startsWith("Layer ") || line.startsWith("  Layer ")) {
+                        activePkgBlock = pkgRx.containsMatchIn(line)
+                        isSurfLayer = line.contains("SurfaceView")
+                    } else if (activePkgBlock) {
+                        val m = sfBoundsRx.find(line)
+                        if (m != null) {
+                            val l = m.groupValues[1].toIntOrNull() ?: 0
+                            val t = m.groupValues[2].toIntOrNull() ?: 0
+                            val r = m.groupValues[3].toIntOrNull() ?: 0
+                            val b = m.groupValues[4].toIntOrNull() ?: 0
+                            val w = r - l
+                            val h = b - t
+                            val area = w * h
+                            if (w >= 150 && h >= 150) {
+                                val rect = Rect(l, t, r, b)
+                                if (isSurfLayer && area > bestSurfaceArea) {
+                                    bestSurfaceArea = area
+                                    bestSurfaceRect = rect
+                                } else if (area > bestWindowArea) {
+                                    bestWindowArea = area
+                                    bestWindowRect = rect
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Method 3: dumpsys activity activities task bounds
+        if (bestSurfaceRect == null && bestContentRect == null && bestWindowRect == null) {
+            val actDump = SuShell.exec("dumpsys activity activities 2>/dev/null")
+            if (actDump.isNotEmpty()) {
+                for (block in actDump.split("Task{")) {
+                    if (!pkgRx.containsMatchIn(block)) continue
+                    val bm = Regex("""\b(?:mBounds|bounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""").find(block) ?: continue
+                    val l = bm.groupValues[1].toIntOrNull() ?: 0
+                    val t = bm.groupValues[2].toIntOrNull() ?: 0
+                    val r = bm.groupValues[3].toIntOrNull() ?: 0
+                    val b = bm.groupValues[4].toIntOrNull() ?: 0
+                    val w = r - l
+                    val h = b - t
+                    val area = w * h
+                    if (w >= 150 && h >= 150 && area > bestWindowArea) {
                         bestWindowArea = area
                         bestWindowRect = Rect(l, t, r, b)
                     }
@@ -436,14 +625,17 @@ object PilotCore {
             }
         }
 
-        if (bestSurfaceRect != null) return bestSurfaceRect
-        if (bestContentRect != null) return bestContentRect
-        if (bestWindowRect != null) {
-            // Trim floating window titlebar (~38px) when in freeform multi-window mode
-            val topTrim = if (bestWindowRect.top > 0 && bestWindowRect.height() > 240) 38 else 0
-            return Rect(bestWindowRect.left, bestWindowRect.top + topTrim, bestWindowRect.right, bestWindowRect.bottom)
+        val chosen = bestSurfaceRect ?: bestContentRect ?: bestWindowRect
+        if (chosen == null) {
+            log("[CROP-DBG] No window bounds found for $pkg")
+            return null
         }
-        return null
+
+        // If this is a floating window (not already the inner SurfaceView), trim its top titlebar (~38px)
+        if (bestSurfaceRect == null && (chosen.width() < fullW - 20 || chosen.height() < fullH - 20) && chosen.height() > 240) {
+            return Rect(chosen.left, chosen.top + 38, chosen.right, chosen.bottom)
+        }
+        return chosen
     }
 
     @Synchronized
@@ -456,8 +648,6 @@ object PilotCore {
 
         if (pkg.isNullOrEmpty()) return rawFile to true
 
-        val bounds = findWindowBounds(pkg) ?: return rawFile to false
-
         return runCatching {
             val opts = BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.RGB_565
@@ -465,6 +655,13 @@ object PilotCore {
             val full = BitmapFactory.decodeFile(rawPath, opts) ?: return rawFile to false
             val w = full.width
             val h = full.height
+
+            val bounds = findWindowBounds(pkg, w, h)
+            if (bounds == null) {
+                full.recycle()
+                return rawFile to false
+            }
+
             val l = bounds.left.coerceIn(0, w - 1)
             val t = bounds.top.coerceIn(0, h - 1)
             val r = bounds.right.coerceIn(l + 1, w)
@@ -642,7 +839,7 @@ object PilotCore {
 class DiscordBot(private val ctx: Context) {
     private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
     private val exec = Executors.newSingleThreadScheduledExecutor()
-    private val ioExec = Executors.newFixedThreadPool(2)
+    private val ioExec = Executors.newFixedThreadPool(3)
     private var ws: WebSocket? = null
     private var hbTask: ScheduledFuture<*>? = null
     private var seq: Int? = null
@@ -670,8 +867,7 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    // !checkstatus <username> — captures & crops strictly inside that player's Roblox viewport
-    fun sendAccountShot(ch: String, query: String) {
+    fun sendAccountShot(ch: String, triggerMsgId: String, query: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
         val q = query.trim().lowercase()
@@ -683,8 +879,12 @@ class DiscordBot(private val ctx: Context) {
                 if (a.user != "Empty" && PilotCore.similarity(q, a.user.lowercase()) >= 0.45) i to a else null
             }
         }
+
         if (matches.isEmpty()) {
-            sendMsg(ch, "⚠️ **📱 $cl** — No matching account found for `$query`.")
+            runCatching { Thread.sleep(2000L + (abs(cl.hashCode()) % 12) * 100L) }
+            if (!hasBotRepliedAfter(ch, triggerMsgId)) {
+                sendMsg(ch, "⚠️ No matching account found for `$query` on any online cloud phone.")
+            }
             return
         }
 
@@ -771,29 +971,22 @@ class DiscordBot(private val ctx: Context) {
     }
 
     private fun onMessageCreate(d: JSONObject) {
-        val ownerId = PilotCore.getUserId(ctx).toString()
         val author = d.optJSONObject("author") ?: return
         val authorId = author.optString("id")
+        val memberRoles = d.optJSONObject("member")?.optJSONArray("roles")
         val content = d.optString("content").trim()
         val ch = d.getString("channel_id")
 
         if (authorId == botId) {
-            if (content.startsWith("PILOT_DEST_REQ:")) {
-                val p = content.split(":", limit = 5)
-                if (p.size == 5) {
-                    val msgIdToDel = d.optString("id")
-                    if (p[2] == PilotCore.getCloud(ctx) && msgIdToDel.isNotEmpty()) {
-                        apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgIdToDel")
-                    }
-                    postDestinationSlots(ch, p[2], p[3], p[4])
-                }
+            if (content.startsWith("PILOT_PACK_REQ:")) {
+                ioExec.execute { handlePackRequest(d) }
             } else if (content.startsWith("PILOT_XFER:")) {
                 ioExec.execute { handleTransferPayload(d) }
             }
             return
         }
 
-        if (authorId != ownerId) return
+        if (!PilotCore.isAuthorized(ctx, authorId, memberRoles)) return
         if (!content.startsWith("!")) return
         val msgId = d.optString("id", "")
         val cl = PilotCore.getCloud(ctx)
@@ -803,96 +996,322 @@ class DiscordBot(private val ctx: Context) {
 
         when (cmd) {
             "!help", "!commands" -> ioExec.execute { sendHelp(ch, msgId) }
-            "!version", "!ver" -> sendMsg(ch, "📱 **$cl** — Pilot **${PilotCore.APP_VERSION}**")
-            "!scan" -> sendCloudMenu(ch, cl, "s", "**Select Cloud to Scan:**")
-            "!logout" -> sendCloudMenu(ch, cl, "l", "**Select Cloud to Logout:**")
-            "!delete" -> sendCloudMenu(ch, cl, "d", "**Select Cloud to Delete Account & History:**")
-            "!changeslot" -> {
+            "!version", "!ver" -> ioExec.execute {
+                upsertSharedTextLine(ch, msgId, "**📱 Online Pilot Instances:**", "• **$cl** — `${PilotCore.APP_VERSION}`")
+            }
+            "!createconfig", "!newconfig" -> ioExec.execute {
+                val delayMs = (abs(cl.hashCode()) % 14) * 110L
+                if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
+                if (hasBotRepliedAfter(ch, msgId)) return@execute
+                val btn = JSONObject()
+                    .put("type", 2)
+                    .put("style", 1)
+                    .put("label", "⚙️ Open Config Builder")
+                    .put("custom_id", "pilot_cfg_btn:open:$cl")
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(btn)))
+                sendMsg(
+                    ch,
+                    "**🛠️ Pilot Sync Config Builder**\nClick the button below to enter your **Bot Token** (include one `@` inside to bypass Discord's scanner) and **Allowed User/Role ID(s)** (comma-separated):",
+                    row
+                )
+            }
+            "!scan" -> ioExec.execute {
+                upsertSharedCloudMenu(ch, msgId, "s", "**Select Cloud to Scan:**")
+            }
+            "!logout" -> ioExec.execute {
+                upsertSharedCloudMenu(ch, msgId, "l", "**Select Cloud to Logout:**")
+            }
+            "!delete" -> ioExec.execute {
+                upsertSharedCloudMenu(ch, msgId, "d", "**Select Cloud to Delete Account & History:**")
+            }
+            "!changeslot" -> ioExec.execute {
                 if (arg.isEmpty()) {
-                    sendCloudMenu(ch, cl, "cs1", "**Select Source Cloud (where the account is now):**")
+                    upsertSharedCloudMenu(ch, msgId, "cs1", "**Select Source Cloud (where the account is now):**")
                 } else {
                     val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
                     val match = list.firstOrNull { it.user != "Empty" && it.user.equals(arg, ignoreCase = true) }
                     if (match != null) {
-                        val xferId = (1..6).map { ('a'..'z').random() }.joinToString("")
-                        sendMsg(ch, "PILOT_DEST_REQ:$xferId:$cl:${match.pkg}:${match.user}")
+                        val header = "**📦 Moving `${match.user}`** (from **$cl** `${match.pkg}`)\nSelect Destination Cloud Phone:"
+                        val sentRes = apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", header))
+                        val anchorId = runCatching { JSONObject(sentRes).getString("id") }.getOrDefault(msgId)
+                        upsertSharedCloudMenu(ch, anchorId, "cs_dst:$cl:${match.pkg}:${match.user}", header)
                     }
                 }
             }
             "!rename" -> {
-                if (arg.isEmpty()) sendMsg(ch, "⚠️ **Missing name!** Usage: `!rename <New Cloud Name>`")
-                else sendCloudMenu(ch, cl, "r:$arg", "**Select Cloud to Rename to `$arg`:**")
+                if (arg.isEmpty()) {
+                    ioExec.execute {
+                        if (!hasBotRepliedAfter(ch, msgId)) sendMsg(ch, "⚠️ **Missing name!** Usage: `!rename <New Cloud Name>`")
+                    }
+                } else {
+                    ioExec.execute {
+                        upsertSharedCloudMenu(ch, msgId, "r:$arg", "**Select Cloud to Rename to `$arg`:**")
+                    }
+                }
             }
             "!update" -> {
                 if (arg.isNotEmpty()) PilotCore.saveUpdateUrl(ctx, arg)
                 ioExec.execute {
                     val status = AppUpdater.checkAndInstall(ctx, force = true)
-                    sendMsg(ch, "**📱 $cl** (${PilotCore.APP_VERSION}) — $status")
+                    upsertSharedTextLine(ch, msgId, "**🔄 Pilot OTA Update:**", "• **$cl** — $status")
                 }
             }
             "!sschannel" -> {
                 PilotCore.saveSsChannel(ctx, ch)
-                sendMsg(ch, "✅ **📱 $cl** — Screenshots will now post to this channel.")
+                ioExec.execute {
+                    upsertSharedTextLine(ch, msgId, "✅ **Screenshot Channel Updated:**", "• **$cl** — synced")
+                }
             }
-            "!ss" -> ioExec.execute { captureAndSendAll(ch) }
+            "!ss" -> ioExec.execute {
+                if (arg.equals("all", ignoreCase = true)) {
+                    captureAndSendAll(ch)
+                } else {
+                    upsertSharedCloudMenu(ch, msgId, "ss", "**Select Cloud to Screenshot:**")
+                }
+            }
             "!checkstatus" -> {
-                if (arg.isEmpty()) sendMsg(ch, "⚠️ **Missing username!** Usage: `!checkstatus <username>`")
-                else ioExec.execute { sendAccountShot(ch, arg) }
+                if (arg.isEmpty()) {
+                    ioExec.execute {
+                        if (!hasBotRepliedAfter(ch, msgId)) sendMsg(ch, "⚠️ **Missing username!** Usage: `!checkstatus <username>`")
+                    }
+                } else {
+                    ioExec.execute { sendAccountShot(ch, msgId, arg) }
+                }
             }
             "!search" -> {
                 if (arg.isEmpty()) {
-                    sendMsg(ch, "⚠️ **Missing username!** Usage: `!search <username>`")
+                    ioExec.execute {
+                        if (!hasBotRepliedAfter(ch, msgId)) sendMsg(ch, "⚠️ **Missing username!** Usage: `!search <username>`")
+                    }
                     return
                 }
-                val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
-                val q = arg.lowercase()
-                val exact = list.mapIndexedNotNull { i, a -> if (a.user != "Empty" && a.user.lowercase().contains(q)) PilotCore.fmtLine(i, a) else null }
-                if (exact.isNotEmpty()) {
-                    sendMsg(ch, "**📱 $cl** — Match for `$arg`:\n${exact.joinToString("\n")}")
-                } else {
-                    val near = list.mapIndexedNotNull { i, a ->
-                        if (a.user != "Empty" && PilotCore.similarity(q, a.user.lowercase()) >= 0.45) PilotCore.fmtLine(i, a) else null
+                ioExec.execute {
+                    val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+                    val q = arg.lowercase()
+                    val hits = list.mapIndexedNotNull { i, a ->
+                        if (a.user != "Empty" && (a.user.lowercase().contains(q) || PilotCore.similarity(q, a.user.lowercase()) >= 0.45)) {
+                            "**📱 $cl** — ${PilotCore.fmtLine(i, a)}"
+                        } else null
                     }
-                    if (near.isNotEmpty()) sendMsg(ch, "**📱 $cl** — No exact match for `$arg`, near match:\n${near.joinToString("\n")}")
-                    else sendMsg(ch, "⚠️ **📱 $cl** — No matching account found for `$arg`.")
+                    if (hits.isNotEmpty()) {
+                        upsertSharedTextLine(ch, msgId, "🔍 **Search Results for `$arg`:**", hits.joinToString("\n"))
+                    } else {
+                        runCatching { Thread.sleep(2000L + (abs(cl.hashCode()) % 12) * 100L) }
+                        if (!hasBotRepliedAfter(ch, msgId)) {
+                            sendMsg(ch, "⚠️ No matching account found for `$arg` on any online cloud phone.")
+                        }
+                    }
                 }
             }
             "!config" -> {
-                val code = PilotCore.makeCode(ctx)
-                val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", ownerId))
-                val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
-                if (dmCh.isNotEmpty()) {
-                    sendMsg(dmCh, "**Your Pilot Sync Code:**\n`$code`\n```\n$code\n```")
-                    sendMsg(ch, "Sent your new config code to your DMs!")
+                ioExec.execute {
+                    val delayMs = (abs(cl.hashCode()) % 12) * 110L
+                    if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
+                    if (hasBotRepliedAfter(ch, msgId)) return@execute
+                    val code = PilotCore.makeCode(ctx, autoRoot = true)
+                    val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", authorId))
+                    val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
+                    if (dmCh.isNotEmpty()) {
+                        sendMsg(dmCh, "**Your Pilot Sync Code:**\n`$code`\n```\n$code\n```")
+                        sendMsg(ch, "Sent your new config code to your DMs!")
+                    }
                 }
             }
-            else -> sendMsg(ch, "⚠️ **Invalid command!** Type `!help` to view all available commands.")
+            else -> ioExec.execute {
+                val delayMs = (abs(cl.hashCode()) % 12) * 110L
+                if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
+                if (!hasBotRepliedAfter(ch, msgId)) {
+                    sendMsg(ch, "⚠️ **Invalid command!** Type `!help` to view all available commands.")
+                }
+            }
         }
     }
 
-    private fun postDestinationSlots(ch: String, srcCloud: String, srcPkg: String, srcUser: String) {
+    @Synchronized
+    private fun upsertSharedCloudMenu(ch: String, anchorMsgId: String, mode: String, title: String) {
         val myCloud = PilotCore.getCloud(ctx)
-        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
-        if (list.isEmpty()) return
-        val opts = JSONArray()
-        list.forEachIndexed { i, a ->
-            if (!(myCloud == srcCloud && a.pkg == srcPkg)) {
-                opts.put(
-                    JSONObject()
-                        .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})")
-                        .put("value", "$srcCloud|$srcPkg|$srcUser|$myCloud|${a.pkg}")
-                        .put("description", "Move $srcUser into this slot on $myCloud")
-                )
+        val jitterMs = (abs(myCloud.hashCode()) % 14) * 115L
+        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
+
+        val myOption = JSONObject()
+            .put("label", "📱 $myCloud")
+            .put("value", myCloud)
+            .put("description", "${PilotCore.APP_VERSION} • Tap to select")
+
+        var existing = findCanonicalBotMessage(ch, anchorMsgId, title)
+        if (existing == null) {
+            val menu = JSONObject()
+                .put("type", 3)
+                .put("custom_id", "pilot_cloud:$mode:row0")
+                .put("placeholder", "Select Cloud ($myCloud)...")
+                .put("options", JSONArray().put(myOption))
+            val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+            val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", title).put("components", row))
+            val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
+
+            runCatching { Thread.sleep(320) }
+            val canonical = findCanonicalBotMessage(ch, anchorMsgId, title)
+            if (canonical != null && postedId.isNotEmpty() && canonical.getString("id") != postedId) {
+                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
+                existing = canonical
+            } else {
+                return
             }
         }
-        if (opts.length() == 0) return
-        val menu = JSONObject()
-            .put("type", 3)
-            .put("custom_id", "pilot_cs3:go:$srcCloud")
-            .put("placeholder", "📱 $myCloud — Pick destination slot for $srcUser...")
-            .put("options", opts)
-        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-        sendMsg(ch, "**📱 $myCloud** — Select destination slot to receive **$srcUser** (from **$srcCloud**):", row)
+
+        repeat(2) { attempt ->
+            val target = if (attempt == 0) existing!! else (findCanonicalBotMessage(ch, anchorMsgId, title) ?: return)
+            val targetId = target.getString("id")
+            val optMap = LinkedHashMap<String, JSONObject>()
+
+            val oldRows = target.optJSONArray("components")
+            if (oldRows != null) {
+                for (r in 0 until oldRows.length()) {
+                    val comps = oldRows.getJSONObject(r).optJSONArray("components") ?: continue
+                    for (c in 0 until comps.length()) {
+                        val opts = comps.getJSONObject(c).optJSONArray("options") ?: continue
+                        for (o in 0 until opts.length()) {
+                            val obj = opts.getJSONObject(o)
+                            val v = obj.optString("value")
+                            if (v.isNotEmpty()) optMap[v] = obj
+                        }
+                    }
+                }
+            }
+            optMap[myCloud] = myOption
+
+            val sortedOpts = optMap.values.sortedWith { a, b ->
+                a.optString("value").compareTo(b.optString("value"), ignoreCase = true)
+            }
+
+            val rows = JSONArray()
+            val chunks = sortedOpts.chunked(25).take(5)
+            chunks.forEachIndexed { idx, chunk ->
+                val arr = JSONArray()
+                chunk.forEach { arr.put(it) }
+                val ph = if (chunks.size > 1) {
+                    "Select Cloud (${idx * 25 + 1}–${idx * 25 + chunk.size})..."
+                } else {
+                    "Select Cloud (${sortedOpts.size} online)..."
+                }
+                val menu = JSONObject()
+                    .put("type", 3)
+                    .put("custom_id", "pilot_cloud:$mode:row$idx")
+                    .put("placeholder", ph)
+                    .put("options", arr)
+                rows.put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+            }
+
+            apiPatch("https://discord.com/api/v10/channels/$ch/messages/$targetId", JSONObject().put("content", title).put("components", rows))
+            runCatching { Thread.sleep(280) }
+            val verify = findCanonicalBotMessage(ch, anchorMsgId, title)
+            if (verify != null && verify.toString().contains("\"value\":\"$myCloud\"")) return
+        }
+    }
+
+    @Synchronized
+    private fun upsertSharedTextLine(ch: String, anchorMsgId: String, header: String, myLine: String) {
+        val myCloud = PilotCore.getCloud(ctx)
+        val jitterMs = (abs(myCloud.hashCode()) % 14) * 115L
+        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
+
+        var existing = findCanonicalBotMessage(ch, anchorMsgId, header)
+        if (existing == null) {
+            val body = "$header\n$myLine"
+            val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", body))
+            val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
+
+            runCatching { Thread.sleep(320) }
+            val canonical = findCanonicalBotMessage(ch, anchorMsgId, header)
+            if (canonical != null && postedId.isNotEmpty() && canonical.getString("id") != postedId) {
+                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
+                existing = canonical
+            } else {
+                return
+            }
+        }
+
+        repeat(2) { attempt ->
+            val target = if (attempt == 0) existing!! else (findCanonicalBotMessage(ch, anchorMsgId, header) ?: return)
+            val targetId = target.getString("id")
+            val curLines = target.optString("content").lines()
+                .drop(1)
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .toMutableList()
+
+            curLines.removeAll { it.contains("**$myCloud**") }
+            curLines.add(myLine)
+            val sorted = curLines.sortedWith { a, b -> a.compareTo(b, ignoreCase = true) }
+            val newContent = "$header\n${sorted.joinToString("\n")}".take(1950)
+
+            apiPatch("https://discord.com/api/v10/channels/$ch/messages/$targetId", JSONObject().put("content", newContent))
+            runCatching { Thread.sleep(280) }
+            val verify = findCanonicalBotMessage(ch, anchorMsgId, header)
+            if (verify != null && verify.optString("content").contains("**$myCloud**")) return
+        }
+    }
+
+    private fun findCanonicalBotMessage(ch: String, anchorMsgId: String, prefix: String): JSONObject? {
+        if (botId.isEmpty() || anchorMsgId.isEmpty()) return null
+        val raw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$anchorMsgId&limit=15")
+        return runCatching {
+            val arr = JSONArray(raw)
+            val matches = mutableListOf<JSONObject>()
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                if (m.optJSONObject("author")?.optString("id") == botId && m.optString("content").startsWith(prefix)) {
+                    matches.add(m)
+                }
+            }
+            matches.minByOrNull { it.optString("id").toLongOrNull() ?: Long.MAX_VALUE }
+        }.getOrNull()
+    }
+
+    private fun hasBotRepliedAfter(ch: String, triggerMsgId: String): Boolean {
+        if (botId.isEmpty() || triggerMsgId.isEmpty()) return false
+        val afterRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$triggerMsgId&limit=8")
+        return runCatching {
+            val arr = JSONArray(afterRaw)
+            (0 until arr.length()).any { i ->
+                arr.getJSONObject(i).optJSONObject("author")?.optString("id") == botId
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun handlePackRequest(d: JSONObject) {
+        val content = d.optString("content").trim()
+        val ch = d.optString("channel_id")
+        val msgId = d.optString("id")
+        val parts = content.split(":", limit = 6)
+        if (parts.size < 6) return
+        val srcCloud = parts[1]
+        val srcPkg = parts[2]
+        val srcUser = parts[3]
+        val dstCloud = parts[4]
+        val dstPkg = parts[5]
+        val myCloud = PilotCore.getCloud(ctx)
+        if (!srcCloud.equals(myCloud, ignoreCase = true)) return
+
+        if (msgId.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgId")
+
+        val (bundle, fileCount) = PilotCore.packAccountBundle(ctx, srcPkg, srcUser)
+        PilotCore.wipe(ctx, srcPkg, true)
+
+        if (bundle == null) {
+            sendMsg(ch, "❌ Failed to package **$srcUser** from **$myCloud**.")
+            return
+        }
+
+        if (dstCloud.equals(myCloud, ignoreCase = true)) {
+            val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
+            if (ok) sendMsg(ch, "✅ Moved **$srcUser** locally on **$myCloud**: `$srcPkg` → `$dstPkg` (`$restoredFiles` script file(s)).")
+            else sendMsg(ch, "❌ Target slot `$dstPkg` not found on **$myCloud**.")
+        } else {
+            PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
+            sendFile(ch, "PILOT_XFER:go:$myCloud:$srcPkg:$srcUser:$dstCloud:$dstPkg", bundle, "xfer_${srcUser}.tar.gz")
+            bundle.delete()
+        }
     }
 
     private fun handleTransferPayload(d: JSONObject) {
@@ -907,7 +1326,7 @@ class DiscordBot(private val ctx: Context) {
         val dstCloud = parts[5]
         val dstPkg = parts[6]
         val myCloud = PilotCore.getCloud(ctx)
-        if (dstCloud != myCloud) return
+        if (!dstCloud.equals(myCloud, ignoreCase = true)) return
 
         val atts = d.optJSONArray("attachments") ?: return
         if (atts.length() == 0) return
@@ -950,19 +1369,9 @@ class DiscordBot(private val ctx: Context) {
     }
 
     private fun sendHelp(ch: String, triggerMsgId: String) {
-        val delayMs = ((PilotCore.getCloud(ctx).hashCode() and 0x7fffffff) % 1400).toLong()
+        val delayMs = (abs(PilotCore.getCloud(ctx).hashCode()) % 14) * 110L
         if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
-
-        if (botId.isNotEmpty() && triggerMsgId.isNotEmpty()) {
-            val afterRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$triggerMsgId&limit=5")
-            val alreadyReplied = runCatching {
-                val arr = JSONArray(afterRaw)
-                (0 until arr.length()).any { i ->
-                    arr.getJSONObject(i).optJSONObject("author")?.optString("id") == botId
-                }
-            }.getOrDefault(false)
-            if (alreadyReplied) return
-        }
+        if (hasBotRepliedAfter(ch, triggerMsgId)) return
 
         val helpText = """
             **📖 PILOT BOT COMMANDS (${PilotCore.APP_VERSION})**
@@ -974,32 +1383,168 @@ class DiscordBot(private val ctx: Context) {
             • `!version` — Show the installed Pilot version on every online cloud phone
 
             **📸 Screenshots & Auto-Capture**
-            • `!ss` — Capture a full-screen screenshot of your cloud phone(s)
+            • `!ss` — Select a cloud phone for a full-screen screenshot (or `!ss all`)
             • `!sschannel` — Set this channel for hourly Delta auto-screenshots & Lua triggers
             • *Lua Trigger:* Call `getgenv().PilotSnap()` inside any Delta script
 
             **⚙️ Account & Cloud Management**
+            • `!createconfig` — Build a new `XXXXXXX-...` Sync Code (supports `@` token bypass & multiple User/Role IDs)
             • `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
             • `!logout` — Log out one or all accounts on a cloud (keeps last username history)
             • `!delete` — Wipe session data **and** clear username history (resets to Empty)
             • `!rename <new name>` — Remotely rename a cloud phone
             • `!update [drive_url]` — Check & silently install the latest Pilot APK
-            • `!config` — DM yourself a `XXXXXXX-...` sync code to clone settings
+            • `!config` — DM yourself your current `XXXXXXX-...` sync code
             • `!help` — Show this command guide
         """.trimIndent()
 
         sendMsg(ch, helpText)
     }
 
+    private fun openCreateConfigModal(id: String, token: String, targetCloud: String) {
+        val fToken = JSONObject()
+            .put("type", 4)
+            .put("custom_id", "token")
+            .put("label", "Bot Token (put 1 @ inside to bypass)")
+            .put("style", 1)
+            .put("min_length", 20)
+            .put("max_length", 150)
+            .put("placeholder", "Paste token with one @ inside (e.g. MTIz...@abc.xyz)")
+            .put("required", true)
+
+        val fIds = JSONObject()
+            .put("type", 4)
+            .put("custom_id", "ids")
+            .put("label", "User ID(s) or Role ID(s) (comma-separated)")
+            .put("style", 1)
+            .put("min_length", 15)
+            .put("max_length", 300)
+            .put("placeholder", "730629579533844512, 1381256734403854436")
+            .put("required", true)
+
+        val fChan = JSONObject()
+            .put("type", 4)
+            .put("custom_id", "ss_ch")
+            .put("label", "Screenshot Channel ID (optional)")
+            .put("style", 1)
+            .put("required", false)
+            .put("placeholder", "Leave blank to keep existing")
+
+        val fUpd = JSONObject()
+            .put("type", 4)
+            .put("custom_id", "upd_url")
+            .put("label", "Google Drive APK Update Link (optional)")
+            .put("style", 1)
+            .put("required", false)
+            .put("placeholder", "https://drive.google.com/file/d/.../view")
+
+        val rows = JSONArray()
+            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fToken)))
+            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fIds)))
+            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fChan)))
+            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fUpd)))
+
+        val modalData = JSONObject()
+            .put("custom_id", "pilot_cfg_modal:$targetCloud")
+            .put("title", "Create Pilot Sync Config")
+            .put("components", rows)
+
+        replyInteraction(id, token, 9, modalData)
+    }
+
     private fun onInteraction(d: JSONObject) {
-        if (d.optInt("type") != 3) return
+        val intType = d.optInt("type")
+        if (intType != 3 && intType != 5) return
+
         val id = d.getString("id")
         val token = d.getString("token")
         val user = d.optJSONObject("member")?.optJSONObject("user") ?: d.optJSONObject("user") ?: return
-        val ownerId = PilotCore.getUserId(ctx).toString()
+        val userId = user.optString("id")
+        val memberRoles = d.optJSONObject("member")?.optJSONArray("roles")
         val ch = d.optString("channel_id")
+        val msgObj = d.optJSONObject("message")
+        val msgId = msgObj?.optString("id") ?: ""
         val data = d.getJSONObject("data")
         val cid = data.optString("custom_id")
+        val myCloud = PilotCore.getCloud(ctx)
+
+        // Handle Modal Submit (type == 5) for !createconfig
+        if (intType == 5) {
+            if (!cid.startsWith("pilot_cfg_modal:")) return
+            val targetCloud = cid.removePrefix("pilot_cfg_modal:")
+            if (!targetCloud.equals(myCloud, ignoreCase = true)) return
+
+            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                return
+            }
+
+            val fields = HashMap<String, String>()
+            val rows = data.optJSONArray("components")
+            if (rows != null) {
+                for (r in 0 until rows.length()) {
+                    val comps = rows.getJSONObject(r).optJSONArray("components") ?: continue
+                    for (c in 0 until comps.length()) {
+                        val item = comps.getJSONObject(c)
+                        fields[item.optString("custom_id")] = item.optString("value", "")
+                    }
+                }
+            }
+
+            val cleanToken = PilotCore.cleanBotToken(fields["token"] ?: "")
+            val idList = PilotCore.parseAllowedIds(fields["ids"] ?: "")
+            if (cleanToken.length < 30 || !cleanToken.contains(".")) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "❌ Invalid Bot Token format after removing `@`.").put("flags", 64))
+                return
+            }
+            if (idList.isEmpty()) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "❌ Enter at least one valid numeric User ID or Role ID.").put("flags", 64))
+                return
+            }
+
+            val ssChan = (fields["ss_ch"] ?: "").trim().ifEmpty { PilotCore.getSsChannel(ctx) }
+            val updUrl = (fields["upd_url"] ?: "").trim().ifEmpty { PilotCore.getUpdateUrl(ctx) }
+
+            PilotCore.saveConfig(ctx, myCloud, cleanToken, idList.joinToString(","), ssChan, updUrl)
+            val syncCode = PilotCore.makeCode(ctx, autoRoot = true)
+
+            replyInteraction(
+                id, token, 4,
+                JSONObject()
+                    .put(
+                        "content",
+                        "✅ **Pilot Sync Code Generated!**\n" +
+                        "• **Allowed User/Role IDs (${idList.size}):** `${idList.joinToString(", ")}`\n" +
+                        "• **Auto-Setup on Apply:** Root + Battery Whitelist + Autoexec + Auto-Start\n\n" +
+                        "**Copy & paste into Pilot → APPLY CODE:**\n```\n$syncCode\n```"
+                    )
+                    .put("flags", 64)
+            )
+
+            ioExec.execute {
+                PilotCore.autoGrantRootAndPerms(ctx)
+                val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", userId))
+                val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
+                if (dmCh.isNotEmpty()) {
+                    sendMsg(dmCh, "**Your Pilot Sync Code (Auto-Root Enabled):**\n`$syncCode`\n```\n$syncCode\n```")
+                }
+            }
+            return
+        }
+
+        // Button click: Open Config Builder modal
+        if (cid.startsWith("pilot_cfg_btn:open:")) {
+            val targetCloud = cid.removePrefix("pilot_cfg_btn:open:")
+            if (!targetCloud.equals(myCloud, ignoreCase = true)) return
+            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                return
+            }
+            openCreateConfigModal(id, token, myCloud)
+            return
+        }
+
+        // Select Menu interactions (type == 3)
         val vals = data.optJSONArray("values") ?: return
         val sel = vals.optString(0)
 
@@ -1009,35 +1554,81 @@ class DiscordBot(private val ctx: Context) {
 
         val kind = cid.substring(0, firstColon)
         val mode = cid.substring(firstColon + 1, lastColon)
-        val targetCloud = cid.substring(lastColon + 1)
-        val myCloud = PilotCore.getCloud(ctx)
-        if (targetCloud != myCloud) return
-
-        if (user.optString("id") != ownerId) {
-            replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
-            return
-        }
+        val suffix = cid.substring(lastColon + 1)
 
         if (kind == "pilot_cloud") {
+            if (!sel.equals(myCloud, ignoreCase = true)) return
+
+            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                return
+            }
+
             if (mode.startsWith("r:")) {
                 val newName = mode.removePrefix("r:").trim()
                 PilotCore.setCloudName(ctx, newName)
                 PilotCore.log("[RENAME] $myCloud -> $newName")
-                replyInteraction(id, token, 4, JSONObject().put("content", "✅ Renamed **$myCloud** to **$newName**.").put("flags", 64))
+                replyInteraction(id, token, 7, JSONObject().put("content", "✅ Renamed **$myCloud** to **$newName**.").put("components", JSONArray()))
+                return
+            }
+
+            if (mode == "ss") {
+                replyInteraction(id, token, 7, JSONObject().put("content", "📸 Capturing full screen of **$myCloud**...").put("components", JSONArray()))
+                ioExec.execute {
+                    if (ch.isNotEmpty()) captureAndSendAll(ch)
+                }
+                return
+            }
+
+            if (mode.startsWith("cs_dst:")) {
+                val srcParts = mode.removePrefix("cs_dst:").split(":", limit = 3)
+                if (srcParts.size < 3) return
+                val srcCloud = srcParts[0]
+                val srcPkg = srcParts[1]
+                val srcUser = srcParts[2]
+
+                val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+                val opts = JSONArray()
+                list.forEachIndexed { i, a ->
+                    if (!(myCloud.equals(srcCloud, ignoreCase = true) && a.pkg == srcPkg)) {
+                        opts.put(
+                            JSONObject()
+                                .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})")
+                                .put("value", a.pkg)
+                                .put("description", "Move $srcUser into this slot on $myCloud")
+                        )
+                    }
+                }
+                if (opts.length() == 0) {
+                    replyInteraction(id, token, 7, JSONObject().put("content", "⚠️ No available destination slots on **$myCloud**.").put("components", JSONArray()))
+                    return
+                }
+                val menu = JSONObject()
+                    .put("type", 3)
+                    .put("custom_id", "pilot_cs3:$srcCloud|$srcPkg|$srcUser:$myCloud")
+                    .put("placeholder", "Pick destination slot on $myCloud...")
+                    .put("options", opts)
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+                replyInteraction(
+                    id, token, 7,
+                    JSONObject()
+                        .put("content", "**📱 $myCloud** — Select destination slot to receive **$srcUser** (from **$srcCloud**):\n${PilotCore.fmtAll(list)}")
+                        .put("components", row)
+                )
                 return
             }
 
             val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
             if (list.isEmpty()) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No instances found.").put("flags", 64))
+                replyInteraction(id, token, 7, JSONObject().put("content", "**📱 $myCloud** — No instances found.").put("components", JSONArray()))
                 return
             }
             if (mode == "s") {
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** (${PilotCore.APP_VERSION}):\n${PilotCore.fmtAll(list)}").put("flags", 64))
+                replyInteraction(id, token, 7, JSONObject().put("content", "**📱 $myCloud** (${PilotCore.APP_VERSION}):\n${PilotCore.fmtAll(list)}").put("components", JSONArray()))
             } else if (mode == "cs1") {
                 val activeList = list.filter { it.user != "Empty" }
                 if (activeList.isEmpty()) {
-                    replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No accounts available to move.").put("flags", 64))
+                    replyInteraction(id, token, 7, JSONObject().put("content", "**📱 $myCloud** — No accounts available to move.").put("components", JSONArray()))
                     return
                 }
                 val opts = JSONArray()
@@ -1047,7 +1638,7 @@ class DiscordBot(private val ctx: Context) {
                 val menu = JSONObject().put("type", 3).put("custom_id", "pilot_cs2:move:$myCloud")
                     .put("placeholder", "Select account to move from $myCloud...").put("options", opts)
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — Select which account to move:\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
+                replyInteraction(id, token, 7, JSONObject().put("content", "**📱 $myCloud** — Select which account to move:\n${PilotCore.fmtAll(list)}").put("components", row))
             } else {
                 val opts = JSONArray().put(JSONObject().put("label", if (mode == "d") "DELETE ALL DATA & HISTORY" else "LOGOUT ALL ON THIS CLOUD").put("value", "ALL"))
                 list.take(24).forEach { a -> opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})").put("value", a.pkg)) }
@@ -1055,47 +1646,44 @@ class DiscordBot(private val ctx: Context) {
                     .put("placeholder", "Select account on $myCloud...").put("options", opts)
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
                 val label = if (mode == "d") "Select account to **DELETE** (wipes session + history):" else "Select account to **LOGOUT**:"
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — $label\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
+                replyInteraction(id, token, 7, JSONObject().put("content", "**📱 $myCloud** — $label\n${PilotCore.fmtAll(list)}").put("components", row))
             }
-        } else if (kind == "pilot_cs2") {
+            return
+        }
+
+        if (!suffix.equals(myCloud, ignoreCase = true)) return
+
+        if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+            replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+            return
+        }
+
+        if (kind == "pilot_cs2") {
             val srcPkg = sel.substringBefore("|")
             val srcUser = sel.substringAfter("|", "")
-            val xferId = (1..6).map { ('a'..'z').random() }.joinToString("")
-            replyInteraction(id, token, 7, JSONObject().put("content", "📦 Preparing **$srcUser** (`$srcPkg`) on **$myCloud**... Pick destination slot below:").put("components", JSONArray()))
-            if (ch.isNotEmpty()) {
-                sendMsg(ch, "PILOT_DEST_REQ:$xferId:$myCloud:$srcPkg:$srcUser")
+            val header = "**📦 Moving `$srcUser`** (from **$myCloud** `$srcPkg`)\nSelect Destination Cloud Phone:"
+            replyInteraction(id, token, 7, JSONObject().put("content", header).put("components", JSONArray()))
+            if (ch.isNotEmpty() && msgId.isNotEmpty()) {
+                ioExec.execute {
+                    upsertSharedCloudMenu(ch, msgId, "cs_dst:$myCloud:$srcPkg:$srcUser", header)
+                }
             }
         } else if (kind == "pilot_cs3") {
-            val p = sel.split("|", limit = 5)
-            if (p.size < 5) return
-            val srcCloud = p[0]
-            val srcPkg = p[1]
-            val srcUser = p[2]
-            val dstCloud = p[3]
-            val dstPkg = p[4]
+            val srcParts = mode.split("|", limit = 3)
+            if (srcParts.size < 3) return
+            val srcCloud = srcParts[0]
+            val srcPkg = srcParts[1]
+            val srcUser = srcParts[2]
+            val dstPkg = sel
 
-            replyInteraction(id, token, 7, JSONObject().put("content", "⏳ Moving **$srcUser** (`$srcCloud` `$srcPkg` → **$dstCloud** `$dstPkg`)...").put("components", JSONArray()))
-
-            ioExec.execute {
-                val (bundle, fileCount) = PilotCore.packAccountBundle(ctx, srcPkg, srcUser)
-                PilotCore.wipe(ctx, srcPkg, true)
-
-                if (bundle == null) {
-                    if (ch.isNotEmpty()) sendMsg(ch, "❌ Failed to package **$srcUser** from **$srcCloud**.")
-                    return@execute
-                }
-
-                if (srcCloud == dstCloud) {
-                    val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
-                    if (ch.isNotEmpty()) {
-                        if (ok) sendMsg(ch, "✅ Moved **$srcUser** locally on **$myCloud**: `$srcPkg` → `$dstPkg` (`$restoredFiles` script file(s)).")
-                        else sendMsg(ch, "❌ Target slot `$dstPkg` not found on **$myCloud**.")
-                    }
-                } else if (ch.isNotEmpty()) {
-                    PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
-                    sendFile(ch, "PILOT_XFER:go:$srcCloud:$srcPkg:$srcUser:$dstCloud:$dstPkg", bundle, "xfer_${srcUser}.tar.gz")
-                    bundle.delete()
-                }
+            replyInteraction(
+                id, token, 7,
+                JSONObject()
+                    .put("content", "⏳ Transferring **$srcUser** (`$srcCloud` `$srcPkg` → **$myCloud** `$dstPkg`)...")
+                    .put("components", JSONArray())
+            )
+            if (ch.isNotEmpty()) {
+                sendMsg(ch, "PILOT_PACK_REQ:$srcCloud:$srcPkg:$srcUser:$myCloud:$dstPkg")
             }
         } else if (kind == "pilot_acc") {
             val isDel = mode == "d"
@@ -1109,14 +1697,6 @@ class DiscordBot(private val ctx: Context) {
                 replyInteraction(id, token, 7, JSONObject().put("content", msg).put("components", JSONArray()))
             }
         }
-    }
-
-    private fun sendCloudMenu(ch: String, cl: String, mode: String, title: String) {
-        val opt = JSONArray().put(JSONObject().put("label", "📱 $cl").put("value", cl).put("description", "${PilotCore.APP_VERSION} • Tap to select"))
-        val menu = JSONObject().put("type", 3).put("custom_id", "pilot_cloud:$mode:$cl")
-            .put("placeholder", "Select Cloud ($cl)...").put("options", opt)
-        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-        sendMsg(ch, title, row)
     }
 
     private fun sendMsg(ch: String, content: String, components: JSONArray? = null) {
@@ -1175,6 +1755,14 @@ class DiscordBot(private val ctx: Context) {
         val req = Request.Builder().url(url)
             .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
             .get().build()
+        client.newCall(req).execute().use { it.body?.string() ?: "" }
+    }.getOrDefault("")
+
+    private fun apiPatch(url: String, json: JSONObject): String = runCatching {
+        val body = json.toString().toRequestBody("application/json".toMediaType())
+        val req = Request.Builder().url(url)
+            .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
+            .patch(body).build()
         client.newCall(req).execute().use { it.body?.string() ?: "" }
     }.getOrDefault("")
 
@@ -1268,7 +1856,7 @@ class PilotService : Service() {
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (PilotCore.getToken(context).isNotEmpty() && PilotCore.getUserId(context) != 0L) {
+        if (PilotCore.getToken(context).isNotEmpty() && PilotCore.getAllowedIds(context).isNotEmpty()) {
             val svc = Intent(context, PilotService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(svc) else context.startService(svc)
         }

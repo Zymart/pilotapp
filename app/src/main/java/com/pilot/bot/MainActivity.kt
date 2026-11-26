@@ -12,7 +12,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
-import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.widget.*
@@ -31,7 +30,6 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
         }
 
-        // Deploy screenshot auto-execute script immediately when app starts
         Thread { PilotCore.installAutoExec(this) }.start()
 
         val root = ScrollView(this).apply {
@@ -105,9 +103,9 @@ class MainActivity : Activity() {
         cfgCard.addView(makeSectionLabel("INSTANCE & DISCORD CONFIG"))
 
         etCloud = makeInput("Cloud Name (auto-detected)", PilotCore.getCloud(this))
-        val etToken = makeInput("Discord Bot Token", PilotCore.getToken(this))
-        val etUser = makeInput("Owner Discord User ID", PilotCore.getUserId(this).let { if (it == 0L) "" else it.toString() }, true)
-        val etChan = makeInput("Screenshot Channel ID (or use !sschannel)", PilotCore.getSsChannel(this), true)
+        val etToken = makeInput("Discord Bot Token (@ bypass supported)", PilotCore.getToken(this))
+        val etUser = makeInput("Allowed User/Role IDs (comma-separated)", PilotCore.getAllowedIdsRaw(this))
+        val etChan = makeInput("Screenshot Channel ID (or use !sschannel)", PilotCore.getSsChannel(this))
 
         val rowPower = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val btnStart = makePillBtn("START BOT", "#10B981", "#059669") {
@@ -115,17 +113,19 @@ class MainActivity : Activity() {
                 this,
                 etCloud.text.toString(),
                 etToken.text.toString(),
-                etUser.text.toString().toLongOrNull() ?: 0L,
+                etUser.text.toString(),
                 etChan.text.toString(),
                 etUpdateUrl.text.toString()
             )
-            Thread { PilotCore.installAutoExec(this) }.start()
+            etToken.setText(PilotCore.getToken(this))
+            etUser.setText(PilotCore.getAllowedIdsRaw(this))
+
+            Thread { PilotCore.autoGrantRootAndPerms(this) }.start()
 
             val intent = Intent(this, PilotService::class.java)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
             refreshStatus()
 
-            // Return straight to UGPhone home screen
             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
                 addCategory(Intent.CATEGORY_HOME)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
@@ -158,26 +158,37 @@ class MainActivity : Activity() {
                 this,
                 etCloud.text.toString(),
                 etToken.text.toString(),
-                etUser.text.toString().toLongOrNull() ?: 0L,
+                etUser.text.toString(),
                 etChan.text.toString(),
                 etUpdateUrl.text.toString()
             )
-            val code = PilotCore.makeCode(this)
+            val code = PilotCore.makeCode(this, autoRoot = true)
             etSync.setText(code)
             val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("PilotSync", code))
             Toast.makeText(this, "Sync Code Copied!", Toast.LENGTH_SHORT).show()
         }
         val btnRestore = makePillBtn("APPLY CODE", "#7C3AED", "#6D28D9") {
-            if (PilotCore.applyCode(this, etSync.text.toString())) {
-                etToken.setText(PilotCore.getToken(this))
-                etUser.setText(PilotCore.getUserId(this).toString())
-                etChan.setText(PilotCore.getSsChannel(this))
-                etUpdateUrl.setText(PilotCore.getUpdateUrl(this))
-                Toast.makeText(this, "Config Applied!", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "Invalid Sync Code", Toast.LENGTH_SHORT).show()
-            }
+            val rawCode = etSync.text.toString()
+            Thread {
+                val (ok, autoStarted) = PilotCore.applyCode(this, rawCode)
+                runOnUiThread {
+                    if (ok) {
+                        etToken.setText(PilotCore.getToken(this))
+                        etUser.setText(PilotCore.getAllowedIdsRaw(this))
+                        etChan.setText(PilotCore.getSsChannel(this))
+                        etUpdateUrl.setText(PilotCore.getUpdateUrl(this))
+                        refreshStatus()
+                        Toast.makeText(
+                            this,
+                            if (autoStarted) "Config Applied, Root Granted & Bot Started!" else "Config Applied!",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        Toast.makeText(this, "Invalid Sync Code", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }.start()
         }
         rowSync.addView(btnGen, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = 10 })
         rowSync.addView(btnRestore, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = 10 })
@@ -198,10 +209,9 @@ class MainActivity : Activity() {
         }
         val btnRoot = makePillBtn("GRANT ROOT", "#334155", "#1E293B") {
             Thread {
-                val out = SuShell.exec("id")
-                if (out.contains("uid=0")) PilotCore.installAutoExec(this)
+                val rootOk = PilotCore.autoGrantRootAndPerms(this)
                 runOnUiThread {
-                    Toast.makeText(this, if (out.contains("uid=0")) "Root Granted!" else "Root Denied", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, if (rootOk) "Root & Permissions Granted!" else "Root Denied", Toast.LENGTH_SHORT).show()
                 }
             }.start()
         }
@@ -327,7 +337,7 @@ class MainActivity : Activity() {
         setPadding(0, 0, 0, 14)
     }
 
-    private fun makeInput(hintTxt: String, value: String, num: Boolean = false) = EditText(this).apply {
+    private fun makeInput(hintTxt: String, value: String) = EditText(this).apply {
         hint = hintTxt
         setText(value)
         textSize = 13.5f
@@ -339,7 +349,6 @@ class MainActivity : Activity() {
             setColor(Color.parseColor("#0B0E14"))
             setStroke(2, Color.parseColor("#1E293B"))
         }
-        if (num) inputType = InputType.TYPE_CLASS_NUMBER
         layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 14 }
     }
 
