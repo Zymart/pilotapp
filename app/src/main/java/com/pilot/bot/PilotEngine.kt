@@ -4,7 +4,6 @@ import android.app.*
 import android.content.*
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.BitmapRegionDecoder
 import android.graphics.Rect
 import android.os.*
 import android.provider.Settings
@@ -18,7 +17,6 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -246,20 +244,16 @@ object PilotCore {
             val opts = BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
-            val cropped = FileInputStream(rawFile).use { fis ->
-                val decoder = BitmapRegionDecoder.newInstance(fis, false) ?: return@use null
-                try {
-                    val safeRect = Rect(
-                        bounds.left.coerceIn(0, decoder.width - 1),
-                        bounds.top.coerceIn(0, decoder.height - 1),
-                        bounds.right.coerceIn(1, decoder.width),
-                        bounds.bottom.coerceIn(1, decoder.height)
-                    )
-                    decoder.decodeRegion(safeRect, opts)
-                } finally {
-                    decoder.recycle()
-                }
-            } ?: return rawFile to false
+            val full = BitmapFactory.decodeFile(rawPath, opts) ?: return rawFile to false
+            val w = full.width
+            val h = full.height
+            val l = bounds.left.coerceIn(0, w - 1)
+            val t = bounds.top.coerceIn(0, h - 1)
+            val r = bounds.right.coerceIn(l + 1, w)
+            val b = bounds.bottom.coerceIn(t + 1, h)
+
+            val cropped = Bitmap.createBitmap(full, l, t, r - l, b - t)
+            full.recycle()
 
             val outFile = File(outPath)
             FileOutputStream(outFile).use { cropped.compress(Bitmap.CompressFormat.JPEG, 88, it) }
