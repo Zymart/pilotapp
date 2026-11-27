@@ -252,7 +252,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.6"
+    const val APP_VERSION = "v1.3.8"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -1105,8 +1105,16 @@ object PilotCore {
 }
 
 class DiscordBot(private val ctx: Context) {
-    private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+    private val wsClient = OkHttpClient.Builder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
+    private val restClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .build()
     private val exec = Executors.newSingleThreadScheduledExecutor()
+    private val interactionExec = Executors.newCachedThreadPool()
     private val ioExec = Executors.newFixedThreadPool(3)
     private var ws: WebSocket? = null
     private var hbTask: ScheduledFuture<*>? = null
@@ -1127,6 +1135,7 @@ class DiscordBot(private val ctx: Context) {
         hbTask?.cancel(true)
         ws?.close(1000, "Stopped")
         exec.shutdownNow()
+        interactionExec.shutdownNow()
         ioExec.shutdownNow()
     }
 
@@ -1199,7 +1208,7 @@ class DiscordBot(private val ctx: Context) {
         val token = PilotCore.getToken(ctx)
         if (token.isEmpty()) { PilotCore.log("[ERR] Missing Token"); return }
         val req = Request.Builder().url("wss://gateway.discord.gg/?v=10&encoding=json").build()
-        ws = client.newWebSocket(req, object : WebSocketListener() {
+        ws = wsClient.newWebSocket(req, object : WebSocketListener() {
             override fun onMessage(w: WebSocket, text: String) {
                 exec.execute { handlePacket(w, JSONObject(text)) }
             }
@@ -1240,7 +1249,7 @@ class DiscordBot(private val ctx: Context) {
                     val u = userObj.getString("username")
                     PilotCore.log("[ONLINE] $u | ${PilotCore.getCloud(ctx)} (${PilotCore.APP_VERSION})")
                 } else if (type == "MESSAGE_CREATE") onMessageCreate(d)
-                else if (type == "INTERACTION_CREATE") onInteraction(d)
+                else if (type == "INTERACTION_CREATE") interactionExec.execute { onInteraction(d) }
             }
         }
     }
@@ -1287,16 +1296,17 @@ class DiscordBot(private val ctx: Context) {
                     val sid = Regex("""\*\*Session:\*\*\s*`([^`]+)`""").find(content)?.groupValues?.get(1)
                     val accMatch = Regex("""\*\*Account:\*\*\s*`([^`]+)`\s*\(`(\d+)`\)""").find(content)
                     if (!sid.isNullOrEmpty() && accMatch != null) {
-                        AccountLaunchManager.sessions[sid]?.let { s ->
+                        AccountLaunchManager.getSession(ctx, sid)?.let { s ->
                             s.username = accMatch.groupValues[1]
                             s.userId = accMatch.groupValues[2].toLongOrNull() ?: 0L
                             s.stage = LaunchStage.AWAITING_JSON
+                            AccountLaunchManager.putSession(ctx, s)
                         }
                     }
                 }
                 content.startsWith("❌ **Account Launch Failed**") -> {
                     val sid = Regex("""\(`([^`]+)`\)""").find(content)?.groupValues?.get(1)
-                    if (!sid.isNullOrEmpty()) AccountLaunchManager.sessions.remove(sid)
+                    if (!sid.isNullOrEmpty()) AccountLaunchManager.removeSession(ctx, sid)
                 }
                 content.startsWith("PILOT_PACK_REQ:") -> {
                     ioExec.execute { handlePackRequest(d) }
@@ -1312,10 +1322,10 @@ class DiscordBot(private val ctx: Context) {
         val msgId = d.optString("id", "")
         val cl = PilotCore.getCloud(ctx)
 
-        val awaiting = AccountLaunchManager.findAwaitingSession(authorId, ch)
+        val awaiting = AccountLaunchManager.findAwaitingSession(ctx, authorId, ch)
         if (awaiting != null) {
             if (content.equals("!cancel", ignoreCase = true)) {
-                AccountLaunchManager.sessions.remove(awaiting.sessionId)
+                AccountLaunchManager.removeSession(ctx, awaiting.sessionId)
                 if (awaiting.coordinatorCloud.equals(cl, ignoreCase = true)) {
                     ioExec.execute { sendMsg(ch, "🛑 Cancelled **!accountlaunch** session (`${awaiting.sessionId}`).") }
                 }
@@ -1336,6 +1346,7 @@ class DiscordBot(private val ctx: Context) {
                     awaiting.inlineJson = content
                 }
                 awaiting.stage = LaunchStage.PICKING_CLOUD
+                AccountLaunchManager.putSession(ctx, awaiting)
                 ioExec.execute { collectAndPostAvailableCloudMenu(ch, msgId, awaiting) }
                 return
             }
@@ -1534,10 +1545,6 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    /**
-     * Posts a single message across all online phones using lowest-snowflake deduplication
-     * so commands like `!accountlaunch`, `!createconfig`, and `!config` never double-post.
-     */
     private fun postSingleCoordinatorMessage(ch: String, anchorMsgId: String, prefix: String, payload: JSONObject): Boolean {
         val myCloud = PilotCore.getCloud(ctx)
         val jitterMs = (abs(myCloud.hashCode()) % 14) * 100L
@@ -1590,7 +1597,7 @@ class DiscordBot(private val ctx: Context) {
             if (session.coordinatorCloud.equals(myCloud, ignoreCase = true)) {
                 runCatching { Thread.sleep(3200) }
                 if (!hasBotRepliedAfter(ch, anchorMsgId)) {
-                    AccountLaunchManager.sessions.remove(session.sessionId)
+                    AccountLaunchManager.removeSession(ctx, session.sessionId)
                     sendMsg(ch, "⚠️ No online cloud phones currently have an **Empty** or **Logged Out** slot available for `${session.username}`.")
                 }
             }
@@ -1607,9 +1614,9 @@ class DiscordBot(private val ctx: Context) {
         val targetId: String
         if (existing == null) {
             val opt = JSONObject()
-                .put("label", "📱 $myCloud")
-                .put("value", myCloud)
-                .put("description", "$freeCount free slot(s) • $myVer")
+                .put("label", "📱 $myCloud".take(100))
+                .put("value", myCloud.take(100))
+                .put("description", "$freeCount free slot(s) • $myVer".take(100))
             val menu = JSONObject()
                 .put("type", 3)
                 .put("custom_id", "pilot_al_cloud:${session.sessionId}:row0")
@@ -1669,9 +1676,9 @@ class DiscordBot(private val ctx: Context) {
         val allOpts = sortedClouds.map { cloud ->
             val (ver, cnt) = map[cloud] ?: (myVer to 1)
             JSONObject()
-                .put("label", "📱 $cloud")
-                .put("value", cloud)
-                .put("description", "$cnt free slot(s) • $ver")
+                .put("label", "📱 $cloud".take(100))
+                .put("value", cloud.take(100))
+                .put("description", "$cnt free slot(s) • $ver".take(100))
         }
         freeCheckIns.remove(anchorMsgId)
 
@@ -1773,9 +1780,9 @@ class DiscordBot(private val ctx: Context) {
     private fun collectAndPostSharedCloudMenu(ch: String, anchorMsgId: String, mode: String, title: String) {
         val result = electAndCollectClouds(ch, anchorMsgId, title) { myCloud, myVer ->
             val opt = JSONObject()
-                .put("label", "📱 $myCloud")
-                .put("value", myCloud)
-                .put("description", "$myVer • Tap to select")
+                .put("label", "📱 $myCloud".take(100))
+                .put("value", myCloud.take(100))
+                .put("description", "$myVer • Tap to select".take(100))
             val menu = JSONObject()
                 .put("type", 3)
                 .put("custom_id", "pilot_cloud:$mode:row0")
@@ -1788,9 +1795,9 @@ class DiscordBot(private val ctx: Context) {
         val (targetId, cloudsMap) = result
         val allOpts = cloudsMap.map { (cloud, ver) ->
             JSONObject()
-                .put("label", "📱 $cloud")
-                .put("value", cloud)
-                .put("description", "$ver • Tap to select")
+                .put("label", "📱 $cloud".take(100))
+                .put("value", cloud.take(100))
+                .put("description", "$ver • Tap to select".take(100))
         }
 
         val rows = JSONArray()
@@ -1914,7 +1921,7 @@ class DiscordBot(private val ctx: Context) {
         val tmpBundle = File(ctx.cacheDir, "recv_${System.nanoTime()}.tar.gz")
         val downloaded = runCatching {
             val req = Request.Builder().url(fileUrl).build()
-            client.newCall(req).execute().use { resp ->
+            restClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use false
                 val bytes = resp.body?.bytes() ?: return@use false
                 FileOutputStream(tmpBundle).use { it.write(bytes) }
@@ -2116,7 +2123,7 @@ class DiscordBot(private val ctx: Context) {
                 }
 
                 val gameSuffix = AccountLaunchManager.sanitizeGameSuffix(rawGame)
-                AccountLaunchManager.cleanupExpired()
+                AccountLaunchManager.cleanupExpired(ctx)
 
                 val session = LaunchSession(
                     sessionId = sid,
@@ -2126,7 +2133,7 @@ class DiscordBot(private val ctx: Context) {
                     rawCookie = rawCookie,
                     gameSuffix = gameSuffix
                 )
-                AccountLaunchManager.sessions[sid] = session
+                AccountLaunchManager.putSession(ctx, session)
 
                 if (!coordinatorCloud.equals(myCloud, ignoreCase = true)) return
 
@@ -2138,7 +2145,7 @@ class DiscordBot(private val ctx: Context) {
                 ioExec.execute {
                     val (ok, rbxUid, nameOrErr) = AccountLaunchManager.resolveCookieUser(rawCookie)
                     if (!ok) {
-                        AccountLaunchManager.sessions.remove(sid)
+                        AccountLaunchManager.removeSession(ctx, sid)
                         if (ch.isNotEmpty()) {
                             sendMsg(ch, "❌ **Account Launch Failed** (`$sid`): $nameOrErr")
                         }
@@ -2147,6 +2154,7 @@ class DiscordBot(private val ctx: Context) {
                     session.username = nameOrErr
                     session.userId = rbxUid
                     session.stage = LaunchStage.AWAITING_JSON
+                    AccountLaunchManager.putSession(ctx, session)
                     if (ch.isNotEmpty()) {
                         sendMsg(
                             ch,
@@ -2286,7 +2294,7 @@ class DiscordBot(private val ctx: Context) {
         }
 
         val vals = data.optJSONArray("values") ?: return
-        val sel = vals.optString(0)
+        val sel = vals.optString(0).trim()
 
         val firstColon = cid.indexOf(':')
         val lastColon = cid.lastIndexOf(':')
@@ -2302,13 +2310,13 @@ class DiscordBot(private val ctx: Context) {
                 replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
                 return
             }
-            val session = AccountLaunchManager.sessions[mode]
+            val session = AccountLaunchManager.getSession(ctx, mode)
             if (session == null) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "⚠️ Account Launch session expired or phone just restarted. Please run `!accountlaunch` again.").put("flags", 64))
+                replyInteraction(id, token, 4, JSONObject().put("content", "⚠️ Account Launch session expired. Please run `!accountlaunch` again.").put("flags", 64))
                 return
             }
 
-            val allSlots = PilotCore.scanRbx(ctx)
+            val allSlots = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
             val freeIndexed = allSlots.mapIndexedNotNull { idx, acc ->
                 if (acc.status == "EMPTY" || acc.status == "LOGGED OUT") idx to acc else null
             }
@@ -2321,15 +2329,15 @@ class DiscordBot(private val ctx: Context) {
             freeIndexed.take(25).forEach { (idx, acc) ->
                 opts.put(
                     JSONObject()
-                        .put("label", "[${idx + 1}] ${acc.user} [${acc.status}] (${acc.pkg})")
-                        .put("value", acc.pkg)
-                        .put("description", "Launch ${session.username} in ${acc.pkg}")
+                        .put("label", "[${idx + 1}] ${acc.user} [${acc.status}] (${acc.pkg})".take(100))
+                        .put("value", acc.pkg.take(100))
+                        .put("description", "Launch ${session.username.ifEmpty { "account" }} in ${acc.pkg}".take(100))
                 )
             }
             val menu = JSONObject()
                 .put("type", 3)
                 .put("custom_id", "pilot_al_slot:${session.sessionId}:$myCloud")
-                .put("placeholder", "Pick available slot on $myCloud...")
+                .put("placeholder", "Pick available slot on $myCloud...".take(150))
                 .put("options", opts)
             val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
             replyInteraction(
@@ -2337,7 +2345,7 @@ class DiscordBot(private val ctx: Context) {
                 JSONObject()
                     .put(
                         "content",
-                        "**🚀 $myCloud** — Select an available slot for **`${session.username}`**:\n${PilotCore.fmtAll(allSlots)}"
+                        "**🚀 $myCloud** — Select an available slot for **`${session.username.ifEmpty { "Account" }}`**:\n${PilotCore.fmtAll(allSlots)}".take(1950)
                     )
                     .put("components", row)
                     .put("flags", 64)
@@ -2359,7 +2367,7 @@ class DiscordBot(private val ctx: Context) {
                 val opts = JSONArray()
                     .put(JSONObject().put("label", "✅ Enable Auto-Rejoin (Auto Last Place)").put("value", "ON_AUTO").put("description", "Rejoin each account's last Place ID automatically"))
                     .put(JSONObject().put("label", "🔗 Enable Auto-Rejoin (Custom Place / VIP Link)").put("value", "ON_LINK").put("description", "Enter a specific Place ID or Private Server URL"))
-                    .put(JSONObject().put("label", "🛑 Disable Auto-Rejoin").put("value", "OFF").put("description", "Turn off automatic rejoin monitoring on $myCloud"))
+                    .put(JSONObject().put("label", "🛑 Disable Auto-Rejoin").put("value", "OFF").put("description", "Turn off automatic rejoin monitoring on $myCloud".take(100)))
                 val menu = JSONObject()
                     .put("type", 3)
                     .put("custom_id", "pilot_ar_act:cfg:$myCloud")
@@ -2405,9 +2413,9 @@ class DiscordBot(private val ctx: Context) {
                     if (!(myCloud.equals(srcCloud, ignoreCase = true) && a.pkg == srcPkg)) {
                         opts.put(
                             JSONObject()
-                                .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})")
-                                .put("value", a.pkg)
-                                .put("description", "Move $srcUser into this slot on $myCloud")
+                                .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})".take(100))
+                                .put("value", a.pkg.take(100))
+                                .put("description", "Move $srcUser into this slot on $myCloud".take(100))
                         )
                     }
                 }
@@ -2424,7 +2432,7 @@ class DiscordBot(private val ctx: Context) {
                 replyInteraction(
                     id, token, 4,
                     JSONObject()
-                        .put("content", "**📱 $myCloud** — Select destination slot to receive **$srcUser** (from **$srcCloud**):\n${PilotCore.fmtAll(list)}")
+                        .put("content", "**📱 $myCloud** — Select destination slot to receive **$srcUser** (from **$srcCloud**):\n${PilotCore.fmtAll(list)}".take(1950))
                         .put("components", row)
                         .put("flags", 64)
                 )
@@ -2437,7 +2445,7 @@ class DiscordBot(private val ctx: Context) {
                 return
             }
             if (mode == "s") {
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** (${PilotCore.APP_VERSION}):\n${PilotCore.fmtAll(list)}").put("flags", 64))
+                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** (${PilotCore.APP_VERSION}):\n${PilotCore.fmtAll(list)}".take(1950)).put("flags", 64))
             } else if (mode == "cs1") {
                 val activeList = list.filter { it.user != "Empty" }
                 if (activeList.isEmpty()) {
@@ -2446,20 +2454,20 @@ class DiscordBot(private val ctx: Context) {
                 }
                 val opts = JSONArray()
                 activeList.take(25).forEach { a ->
-                    opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})").put("value", "${a.pkg}|${a.user}"))
+                    opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})".take(100)).put("value", "${a.pkg}|${a.user}".take(100)))
                 }
                 val menu = JSONObject().put("type", 3).put("custom_id", "pilot_cs2:move:$myCloud")
                     .put("placeholder", "Select account to move from $myCloud...").put("options", opts)
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — Select which account to move:\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
+                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — Select which account to move:\n${PilotCore.fmtAll(list)}".take(1950)).put("components", row).put("flags", 64))
             } else {
                 val opts = JSONArray().put(JSONObject().put("label", if (mode == "d") "DELETE ALL DATA & HISTORY" else "LOGOUT ALL ON THIS CLOUD").put("value", "ALL"))
-                list.take(24).forEach { a -> opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})").put("value", a.pkg)) }
+                list.take(24).forEach { a -> opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg})".take(100)).put("value", a.pkg.take(100))) }
                 val menu = JSONObject().put("type", 3).put("custom_id", "pilot_acc:$mode:$myCloud")
                     .put("placeholder", "Select account on $myCloud...").put("options", opts)
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
                 val label = if (mode == "d") "Select account to **DELETE** (wipes session + history):" else "Select account to **LOGOUT**:"
-                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — $label\n${PilotCore.fmtAll(list)}").put("components", row).put("flags", 64))
+                replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — $label\n${PilotCore.fmtAll(list)}".take(1950)).put("components", row).put("flags", 64))
             }
             return
         }
@@ -2473,7 +2481,9 @@ class DiscordBot(private val ctx: Context) {
 
         if (kind == "pilot_al_slot") {
             val targetPkg = sel
-            val session = AccountLaunchManager.sessions.remove(mode)
+            val session = AccountLaunchManager.getSession(ctx, mode)?.also {
+                AccountLaunchManager.removeSession(ctx, mode)
+            }
             if (session == null) {
                 replyInteraction(id, token, 7, JSONObject().put("content", "⚠️ Session expired. Please run `!accountlaunch` again.").put("components", JSONArray()))
                 return
@@ -2548,13 +2558,15 @@ class DiscordBot(private val ctx: Context) {
         } else if (kind == "pilot_acc") {
             val isDel = mode == "d"
             if (sel == "ALL") {
-                PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }.forEach { PilotCore.wipe(ctx, it.pkg, isDel) }
-                val msg = if (isDel) "**📱 $myCloud** — Deleted ALL accounts & history (now Empty)." else "**📱 $myCloud** — Logged out ALL."
+                val msg = if (isDel) "**📱 $myCloud** — Deleting ALL accounts & history (now Empty)." else "**📱 $myCloud** — Logging out ALL."
                 replyInteraction(id, token, 7, JSONObject().put("content", msg).put("components", JSONArray()))
+                ioExec.execute {
+                    PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }.forEach { PilotCore.wipe(ctx, it.pkg, isDel) }
+                }
             } else {
-                PilotCore.wipe(ctx, sel, isDel)
                 val msg = if (isDel) "**📱 $myCloud** — Deleted all data & history for `$sel` (now Empty)." else "**📱 $myCloud** — Logged out `$sel`."
                 replyInteraction(id, token, 7, JSONObject().put("content", msg).put("components", JSONArray()))
+                ioExec.execute { PilotCore.wipe(ctx, sel, isDel) }
             }
         }
     }
@@ -2576,7 +2588,7 @@ class DiscordBot(private val ctx: Context) {
                 .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
                 .post(mp)
                 .build()
-            client.newCall(req).execute().close()
+            restClient.newCall(req).execute().close()
         }
     }
 
@@ -2594,12 +2606,27 @@ class DiscordBot(private val ctx: Context) {
                 .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
                 .post(mp)
                 .build()
-            client.newCall(req).execute().close()
+            restClient.newCall(req).execute().close()
         }
     }
 
     private fun replyInteraction(id: String, token: String, type: Int, data: JSONObject) {
-        apiPost("https://discord.com/api/v10/interactions/$id/$token/callback", JSONObject().put("type", type).put("data", data), auth = false)
+        runCatching {
+            val body = JSONObject().put("type", type).put("data", data).toString()
+                .toRequestBody("application/json".toMediaType())
+            val req = Request.Builder()
+                .url("https://discord.com/api/v10/interactions/$id/$token/callback")
+                .post(body)
+                .build()
+            restClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val err = resp.body?.string()?.take(180) ?: ""
+                    PilotCore.log("[INT-ERR] HTTP ${resp.code}: $err")
+                }
+            }
+        }.onFailure {
+            PilotCore.log("[INT-ERR] ${it.message ?: "callback failed"}")
+        }
     }
 
     private fun apiDelete(url: String) {
@@ -2607,7 +2634,7 @@ class DiscordBot(private val ctx: Context) {
             val req = Request.Builder().url(url)
                 .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
                 .delete().build()
-            client.newCall(req).execute().close()
+            restClient.newCall(req).execute().close()
         }
     }
 
@@ -2615,7 +2642,7 @@ class DiscordBot(private val ctx: Context) {
         val req = Request.Builder().url(url)
             .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
             .get().build()
-        client.newCall(req).execute().use { it.body?.string() ?: "" }
+        restClient.newCall(req).execute().use { it.body?.string() ?: "" }
     }.getOrDefault("")
 
     private fun apiPatch(url: String, json: JSONObject): String = runCatching {
@@ -2623,14 +2650,14 @@ class DiscordBot(private val ctx: Context) {
         val req = Request.Builder().url(url)
             .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
             .patch(body).build()
-        client.newCall(req).execute().use { it.body?.string() ?: "" }
+        restClient.newCall(req).execute().use { it.body?.string() ?: "" }
     }.getOrDefault("")
 
     private fun apiPost(url: String, json: JSONObject, auth: Boolean = true): String = runCatching {
         val body = json.toString().toRequestBody("application/json".toMediaType())
         val b = Request.Builder().url(url).post(body)
         if (auth) b.header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-        client.newCall(b.build()).execute().use { it.body?.string() ?: "" }
+        restClient.newCall(b.build()).execute().use { it.body?.string() ?: "" }
     }.getOrDefault("")
 }
 

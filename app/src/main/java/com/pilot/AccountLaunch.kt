@@ -44,13 +44,74 @@ object AccountLaunchManager {
         .followRedirects(true)
         .build()
 
-    fun cleanupExpired() {
+    fun putSession(c: Context, s: LaunchSession) {
+        sessions[s.sessionId] = s
+        runCatching {
+            val obj = JSONObject()
+                .put("sid", s.sessionId)
+                .put("coord", s.coordinatorCloud)
+                .put("author", s.authorId)
+                .put("ch", s.channelId)
+                .put("ck", s.rawCookie)
+                .put("game", s.gameSuffix)
+                .put("user", s.username)
+                .put("uid", s.userId)
+                .put("jurl", s.jsonUrl)
+                .put("ijson", s.inlineJson)
+                .put("skip", s.skipJson)
+                .put("stage", s.stage.name)
+                .put("ts", s.createdAtMs)
+            File(c.cacheDir, "alsess_${s.sessionId}.json").writeText(obj.toString())
+        }
+    }
+
+    fun getSession(c: Context, sid: String): LaunchSession? {
+        cleanupExpired(c)
+        sessions[sid]?.let { return it }
+        val f = File(c.cacheDir, "alsess_$sid.json")
+        if (!f.exists()) return null
+        return runCatching {
+            val o = JSONObject(f.readText())
+            val ts = o.optLong("ts", 0L)
+            if (System.currentTimeMillis() - ts > SESSION_TTL_MS) {
+                f.delete()
+                return null
+            }
+            val s = LaunchSession(
+                sessionId = o.getString("sid"),
+                coordinatorCloud = o.optString("coord"),
+                authorId = o.optString("author"),
+                channelId = o.optString("ch"),
+                rawCookie = o.optString("ck"),
+                gameSuffix = o.optString("game", "AnimeAdventures"),
+                username = o.optString("user"),
+                userId = o.optLong("uid", 0L),
+                jsonUrl = o.optString("jurl"),
+                inlineJson = o.optString("ijson"),
+                skipJson = o.optBoolean("skip", false),
+                stage = runCatching { LaunchStage.valueOf(o.optString("stage")) }.getOrDefault(LaunchStage.PICKING_CLOUD),
+                createdAtMs = ts
+            )
+            sessions[sid] = s
+            s
+        }.getOrNull()
+    }
+
+    fun removeSession(c: Context, sid: String) {
+        sessions.remove(sid)
+        runCatching { File(c.cacheDir, "alsess_$sid.json").delete() }
+    }
+
+    fun cleanupExpired(c: Context? = null) {
         val now = System.currentTimeMillis()
         val it = sessions.entries.iterator()
         while (it.hasNext()) {
             if (now - it.next().value.createdAtMs > SESSION_TTL_MS) {
                 it.remove()
             }
+        }
+        c?.cacheDir?.listFiles { f -> f.name.startsWith("alsess_") && f.name.endsWith(".json") }?.forEach { f ->
+            if (now - f.lastModified() > SESSION_TTL_MS) f.delete()
         }
     }
 
@@ -67,8 +128,12 @@ object AccountLaunchManager {
         return clean.ifEmpty { "AnimeAdventures" }
     }
 
-    fun findAwaitingSession(authorId: String, channelId: String): LaunchSession? {
-        cleanupExpired()
+    fun findAwaitingSession(c: Context, authorId: String, channelId: String): LaunchSession? {
+        cleanupExpired(c)
+        c.cacheDir.listFiles { f -> f.name.startsWith("alsess_") && f.name.endsWith(".json") }?.forEach { f ->
+            val sid = f.name.removePrefix("alsess_").removeSuffix(".json")
+            if (!sessions.containsKey(sid)) getSession(c, sid)
+        }
         return sessions.values
             .filter { it.authorId == authorId && it.channelId == channelId && it.stage == LaunchStage.AWAITING_JSON }
             .maxByOrNull { it.createdAtMs }
