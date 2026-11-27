@@ -161,7 +161,6 @@ object AppUpdater {
             }
 
             val tmpPath = "/data/local/tmp/pilot_upd.apk"
-            val scriptPath = "/data/local/tmp/pilot_do_install.sh"
             val copyRes = SuShell.exec("cp '${apkFile.absolutePath}' '$tmpPath' && chmod 644 '$tmpPath' && [ -s '$tmpPath' ] && echo READY")
             apkFile.delete()
             if (!copyRes.contains("READY")) {
@@ -169,23 +168,32 @@ object AppUpdater {
                 return "Root stage failed: $copyRes"
             }
 
-            prefs.edit().putString("last_upd_tag", newTag).apply()
+            prefs.edit().putString("last_upd_tag", newTag).commit()
 
-            val installScript = """
-                #!/system/bin/sh
-                echo ${'$'}$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null
-                echo ${'$'}$ > /acct/uid_0/tasks 2>/dev/null
-                sleep 3
-                OUT=${'$'}(pm install -r -d -g "$tmpPath" 2>&1)
-                case "${'$'}OUT" in
-                  *Success*)
-                    ;;
-                  *)
+            PilotCore.log("[UPD] Installing APK via pm install...")
+            val res = SuShell.exec("pm install -r -d -g '$tmpPath' 2>&1")
+
+            return if (res.contains("Success", ignoreCase = true)) {
+                SuShell.exec("rm -f '$tmpPath'")
+                PilotCore.log("[UPD] Installed! Restarting service...")
+                "Update installed! Restarting bot (was ${PilotCore.APP_VERSION})..."
+            } else if (res.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE", ignoreCase = true)) {
+                PilotCore.log("[UPD] Signature changed — launching detached reinstall...")
+                val scriptPath = "/data/local/tmp/pilot_do_install.sh"
+                val logPath = "/data/local/tmp/pilot_upd.log"
+                val swapScript = """
+                    #!/system/bin/sh
+                    trap '' HUP PIPE INT TERM
+                    exec >"$logPath" 2>&1
+                    echo ${'$'}$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null
+                    echo ${'$'}$ > /dev/cpuset/background/tasks 2>/dev/null
+                    sleep 2
                     rm -rf /data/local/tmp/pilot_prefs_bak
                     cp -rf /data/data/com.pilot.bot/shared_prefs /data/local/tmp/pilot_prefs_bak 2>/dev/null
-                    pm uninstall com.pilot.bot >/dev/null 2>&1
+                    pm uninstall com.pilot.bot
                     sleep 1
-                    pm install -g "$tmpPath" >/dev/null 2>&1
+                    pm install -g "$tmpPath"
+                    rm -f "$tmpPath" "$scriptPath"
                     if [ -d /data/local/tmp/pilot_prefs_bak ]; then
                       mkdir -p /data/data/com.pilot.bot/shared_prefs
                       cp -rf /data/local/tmp/pilot_prefs_bak/. /data/data/com.pilot.bot/shared_prefs/
@@ -194,20 +202,22 @@ object AppUpdater {
                       restorecon -RF /data/data/com.pilot.bot 2>/dev/null
                       rm -rf /data/local/tmp/pilot_prefs_bak
                     fi
-                    ;;
-                esac
-                rm -f "$tmpPath" "$scriptPath"
-                sleep 1
-                am start-foreground-service -n com.pilot.bot/.PilotService >/dev/null 2>&1 || am startservice -n com.pilot.bot/.PilotService >/dev/null 2>&1
-            """.trimIndent()
-
-            val localSh = File(c.cacheDir, "pilot_do_install.sh")
-            localSh.writeText(installScript)
-            SuShell.exec("cp '${localSh.absolutePath}' '$scriptPath' && chmod 755 '$scriptPath' && setsid sh '$scriptPath' </dev/null >/dev/null 2>&1 &")
-            localSh.delete()
-
-            PilotCore.log("[UPD] Detached installer launched; restarting in ~5s...")
-            return "Installing update & restarting agent in ~5s (was ${PilotCore.APP_VERSION})..."
+                    sleep 1
+                    am start-foreground-service -n com.pilot.bot/.PilotService || am startservice -n com.pilot.bot/.PilotService
+                """.trimIndent()
+                val localSh = File(c.cacheDir, "pilot_do_install.sh")
+                localSh.writeText(swapScript)
+                SuShell.exec("cp '${localSh.absolutePath}' '$scriptPath' && chmod 755 '$scriptPath'")
+                localSh.delete()
+                runCatching {
+                    ProcessBuilder("su", "-c", "nohup sh '$scriptPath' </dev/null >/dev/null 2>&1 &").start()
+                }
+                "Signature migrated! Reinstalling & restarting bot in ~5s..."
+            } else {
+                SuShell.exec("rm -f '$tmpPath'")
+                PilotCore.log("[UPD] Install failed: $res")
+                "Install failed: $res"
+            }
         } finally {
             updating = false
         }
@@ -242,7 +252,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.2"
+    const val APP_VERSION = "v1.3.4"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -529,16 +539,89 @@ object PilotCore {
         return null
     }
 
+    /**
+     * Finds the outer DecorView floating window frame (including title bar) for `pkg`.
+     * Used to locate the [□] maximize icon at (outer.right - 46, outer.top + 17) on UGPhone.
+     */
+    fun findOuterWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
+        val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
+        val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        var bestOuter: Rect? = null
+        var bestArea = 0
+
+        val winDump = SuShell.exec("dumpsys window windows 2>/dev/null")
+        if (winDump.isNotEmpty()) {
+            for (block in winDump.split("Window #")) {
+                if (!pkgRx.containsMatchIn(block)) continue
+                if (block.contains("SurfaceView")) continue
+                if (block.contains("mHasSurface=false") || block.contains("mViewVisibility=0x8")) continue
+
+                for (line in block.lines()) {
+                    val trimmed = line.trim()
+                    if (trimmed.contains("mParentFrame=") || trimmed.contains("mDisplayFrame=") ||
+                        trimmed.contains("parent=[") || trimmed.contains("display=[") ||
+                        trimmed.contains("mStable=") || trimmed.contains("mOverscan=")) {
+                        continue
+                    }
+                    if (!trimmed.contains("mFrame=") && !trimmed.contains("mBounds=") &&
+                        !trimmed.contains("frame=") && !trimmed.contains("bounds=")) continue
+
+                    val bm = bracketRx.find(trimmed) ?: continue
+                    val l = bm.groupValues[1].toIntOrNull() ?: 0
+                    val t = bm.groupValues[2].toIntOrNull() ?: 0
+                    val r = bm.groupValues[3].toIntOrNull() ?: 0
+                    val b = bm.groupValues[4].toIntOrNull() ?: 0
+                    val w = r - l
+                    val h = b - t
+                    if (w < 140 || h < 140) continue
+                    if (w >= fullW - 24 && h >= fullH - 96) continue
+
+                    val area = w * h
+                    if (area > bestArea) {
+                        bestArea = area
+                        bestOuter = Rect(l, t, r, b)
+                    }
+                }
+            }
+        }
+
+        if (bestOuter == null) {
+            val actDump = SuShell.exec("dumpsys activity activities 2>/dev/null")
+            if (actDump.isNotEmpty()) {
+                for (block in actDump.split("Task{")) {
+                    if (!pkgRx.containsMatchIn(block)) continue
+                    val bm = Regex("""\b(?:mBounds|bounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""").find(block) ?: continue
+                    val l = bm.groupValues[1].toIntOrNull() ?: 0
+                    val t = bm.groupValues[2].toIntOrNull() ?: 0
+                    val r = bm.groupValues[3].toIntOrNull() ?: 0
+                    val b = bm.groupValues[4].toIntOrNull() ?: 0
+                    val w = r - l
+                    val h = b - t
+                    if (w >= 140 && h >= 140 && !(w >= fullW - 24 && h >= fullH - 96)) {
+                        val area = w * h
+                        if (area > bestArea) {
+                            bestArea = area
+                            bestOuter = Rect(l, t, r, b)
+                        }
+                    }
+                }
+            }
+        }
+        return bestOuter
+    }
+
     @Synchronized
     fun expandRobloxFullTab(pkg: String): WindowSnapshot {
         val (fullW, fullH) = getDisplaySize()
-        val preBounds = findWindowBounds(pkg, fullW, fullH)
+        val preBounds = findOuterWindowBounds(pkg, fullW, fullH)
         val taskId = findTaskId(pkg)
 
         if (taskId != null) {
             SuShell.exec(
+                "am task resizeable $taskId 2 >/dev/null 2>&1; " +
                 "am task set-windowing-mode $taskId 1 >/dev/null 2>&1; " +
                 "am task resize $taskId 0 0 $fullW $fullH >/dev/null 2>&1; " +
+                "cmd activity task resize $taskId 0 0 $fullW $fullH >/dev/null 2>&1; " +
                 "am stack move-task $taskId 1 true >/dev/null 2>&1"
             )
         }
@@ -553,13 +636,14 @@ object PilotCore {
         runCatching { Thread.sleep(450) }
 
         var tappedMaxBtn: Pair<Int, Int>? = null
-        val afterBounds = findWindowBounds(pkg, fullW, fullH) ?: preBounds
+        val afterBounds = findOuterWindowBounds(pkg, fullW, fullH) ?: preBounds
         if (afterBounds != null && (afterBounds.width() < fullW - 60 || afterBounds.height() < fullH - 120)) {
+            // Tap the [□] maximize icon inside the floating window's top-right title bar (to the left of X)
             val maxBtnX = (afterBounds.right - 46).coerceIn(10, fullW - 10)
-            val maxBtnY = (afterBounds.top - 18).coerceAtLeast(12)
+            val maxBtnY = (afterBounds.top + 17).coerceIn(8, fullH - 10)
             SuShell.exec("input tap $maxBtnX $maxBtnY")
             tappedMaxBtn = maxBtnX to maxBtnY
-            runCatching { Thread.sleep(550) }
+            runCatching { Thread.sleep(650) }
         }
 
         log("[FULLTAB] Expanded $pkg (task=${taskId ?: -1}, ${fullW}x${fullH})")
@@ -570,25 +654,27 @@ object PilotCore {
     fun restoreRobloxWindow(pkg: String, snap: WindowSnapshot) {
         val b = snap.preBounds
         if (b != null) {
-            // Restore back to its original freeform floating window bounds
+            if (snap.tappedMaxBtn != null) {
+                val restoreX = (snap.fullW - 46).coerceIn(10, snap.fullW - 10)
+                val restoreY = 17
+                SuShell.exec("input tap $restoreX $restoreY")
+                runCatching { Thread.sleep(250) }
+            }
             if (snap.taskId != null) {
                 SuShell.exec(
                     "am task set-windowing-mode ${snap.taskId} 5 >/dev/null 2>&1; " +
-                    "am task resize ${snap.taskId} ${b.left} ${b.top} ${b.right} ${b.bottom} >/dev/null 2>&1"
+                    "am task resize ${snap.taskId} ${b.left} ${b.top} ${b.right} ${b.bottom} >/dev/null 2>&1; " +
+                    "cmd activity task resize ${snap.taskId} ${b.left} ${b.top} ${b.right} ${b.bottom} >/dev/null 2>&1"
                 )
-            }
-            if (snap.tappedMaxBtn != null) {
-                runCatching { Thread.sleep(200) }
-                val cur = findWindowBounds(pkg, snap.fullW, snap.fullH)
-                if (cur == null || cur.width() >= snap.fullW - 50) {
-                    val restoreX = (snap.fullW - 46).coerceIn(10, snap.fullW - 10)
-                    val restoreY = 18
-                    SuShell.exec("input tap $restoreX $restoreY")
-                }
             }
             log("[FULLTAB] Restored $pkg back to floating window")
         } else {
-            // Window was minimized/hidden before capture — minimize it back to background
+            if (snap.tappedMaxBtn != null) {
+                val restoreX = (snap.fullW - 46).coerceIn(10, snap.fullW - 10)
+                val restoreY = 17
+                SuShell.exec("input tap $restoreX $restoreY")
+                runCatching { Thread.sleep(200) }
+            }
             if (snap.taskId != null) {
                 SuShell.exec("am task set-windowing-mode ${snap.taskId} 5 >/dev/null 2>&1")
             }
