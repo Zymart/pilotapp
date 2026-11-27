@@ -3,6 +3,7 @@ package com.pilot.bot
 import android.content.Context
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -80,7 +81,7 @@ object AccountLaunchManager {
         }
         return runCatching {
             val req = Request.Builder()
-                .url("https://users.roblox.com/v1/users/authenticated")
+                .url("[https://users.roblox.com/v1/users/authenticated](https://users.roblox.com/v1/users/authenticated)")
                 .header("Cookie", ".ROBLOSECURITY=$clean")
                 .header("Accept", "application/json")
                 .header("User-Agent", "Mozilla/5.0")
@@ -109,6 +110,97 @@ object AccountLaunchManager {
         }
     }
 
+    private fun decodeTextBytes(bytes: ByteArray): String {
+        if (bytes.isEmpty()) return ""
+        if (bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16LE)
+        }
+        if (bytes.size >= 2 && bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16BE)
+        }
+        if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()) {
+            return String(bytes, 3, bytes.size - 3, Charsets.UTF_8)
+        }
+        val zeroCount = bytes.count { it == 0.toByte() }
+        if (zeroCount > bytes.size / 4) {
+            return if (bytes[0] == 0.toByte()) String(bytes, Charsets.UTF_16BE) else String(bytes, Charsets.UTF_16LE)
+        }
+        return String(bytes, Charsets.UTF_8)
+    }
+
+    private fun downloadAttachmentText(url: String): String {
+        val urlsToTry = linkedSetOf(url)
+        if (url.contains("cdn.discordapp.com")) {
+            urlsToTry.add(url.replace("cdn.discordapp.com", "media.discordapp.net"))
+        }
+        for (targetUrl in urlsToTry) {
+            val text = runCatching {
+                val req = Request.Builder()
+                    .url(targetUrl)
+                    .header("Accept", "*/*")
+                    .header("User-Agent", "DiscordBot ([https://discord.com](https://discord.com), 10)")
+                    .get()
+                    .build()
+                http.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) "" else decodeTextBytes(resp.body?.bytes() ?: ByteArray(0))
+                }
+            }.getOrDefault("")
+            if (text.isNotBlank() && !text.trimStart().startsWith("<!DOCTYPE", ignoreCase = true) && !text.trimStart().startsWith("<html", ignoreCase = true)) {
+                return text
+            }
+        }
+        return ""
+    }
+
+    /**
+     * Cleans BOMs, null bytes, markdown fences, or surrounding text from any uploaded file
+     * (such as message.txt) and extracts the valid JSON object/array for Nousigi Hub.
+     */
+    private fun extractJsonPayload(raw: String): String? {
+        var s = raw
+            .replace("\uFEFF", "")
+            .replace("\uFFFE", "")
+            .replace("\u0000", "")
+            .trim()
+
+        s = s.replace(Regex("""^```[a-zA-Z0-9_-]*\s*"""), "")
+            .replace(Regex("""\s*```$"""), "")
+            .trim()
+
+        val firstObj = s.indexOf('{')
+        val lastObj = s.lastIndexOf('}')
+        val firstArr = s.indexOf('[')
+        val lastArr = s.lastIndexOf(']')
+
+        val candidate = when {
+            firstObj >= 0 && lastObj > firstObj && (firstArr < 0 || firstObj < firstArr) ->
+                s.substring(firstObj, lastObj + 1)
+            firstArr >= 0 && lastArr > firstArr ->
+                s.substring(firstArr, lastArr + 1)
+            else -> s
+        }.trim()
+
+        val isValid = runCatching {
+            when {
+                candidate.startsWith("{") -> {
+                    JSONObject(candidate)
+                    true
+                }
+                candidate.startsWith("[") -> {
+                    JSONArray(candidate)
+                    true
+                }
+                else -> false
+            }
+        }.getOrDefault(false)
+
+        return if (isValid) candidate else null
+    }
+
+    /**
+     * Converts the uploaded message.txt / .json file (or inline JSON) and writes it to:
+     * /storage/emulated/0/Delta/Workspace/Nousigi Hub/<Username>_<GameSuffix>.json
+     */
     @Synchronized
     fun saveNousigiConfig(
         c: Context,
@@ -117,27 +209,20 @@ object AccountLaunchManager {
         jsonUrl: String,
         inlineJson: String
     ): Pair<Boolean, String> {
-        val content: String = if (jsonUrl.isNotEmpty()) {
-            val downloaded = runCatching {
-                val req = Request.Builder()
-                    .url(jsonUrl)
-                    .header("User-Agent", "Mozilla/5.0")
-                    .get()
-                    .build()
-                http.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) "" else resp.body?.string() ?: ""
-                }
-            }.getOrDefault("")
+        val rawText: String = if (jsonUrl.isNotEmpty()) {
+            val downloaded = downloadAttachmentText(jsonUrl)
             if (downloaded.isBlank()) {
-                return false to "Failed to download uploaded config attachment from Discord."
+                return false to "Failed to download uploaded file from Discord (attachment link expired or blocked)."
             }
-            downloaded.trim().removePrefix("\uFEFF")
+            downloaded
         } else {
-            inlineJson.trim().removePrefix("\uFEFF")
+            inlineJson
         }
 
-        if (!content.startsWith("{") && !content.startsWith("[")) {
-            return false to "Uploaded file does not appear to be valid JSON."
+        val cleanJson = extractJsonPayload(rawText)
+        if (cleanJson == null) {
+            val preview = rawText.replace(Regex("""\s+"""), " ").take(80)
+            return false to "Could not extract valid JSON from uploaded file (starts with: `$preview`)."
         }
 
         val safeUser = username.replace(Regex("""[^a-zA-Z0-9_-]"""), "")
@@ -147,7 +232,7 @@ object AccountLaunchManager {
 
         val tmpFile = File(c.cacheDir, "nousigi_${System.nanoTime()}.json")
         return try {
-            FileOutputStream(tmpFile).use { it.write(content.toByteArray(Charsets.UTF_8)) }
+            FileOutputStream(tmpFile).use { it.write(cleanJson.toByteArray(Charsets.UTF_8)) }
             val sh = """
                 mkdir -p '$NOUSIGI_DIR'
                 cp '${tmpFile.absolutePath}' '$destPath'
@@ -156,7 +241,7 @@ object AccountLaunchManager {
             """.trimIndent()
             val out = SuShell.exec(sh)
             if (out.contains("SAVED")) {
-                PilotCore.log("[LAUNCH] Saved Nousigi config -> $fileName (${content.length} bytes)")
+                PilotCore.log("[LAUNCH] Converted & saved Nousigi config -> $fileName (${cleanJson.length} bytes)")
                 true to destPath
             } else {
                 false to "Root write failed for `$destPath`."
