@@ -24,6 +24,20 @@ class MainActivity : Activity() {
     private lateinit var etCloud: EditText
     private lateinit var etUpdateUrl: EditText
 
+    // Navigation Tabs & Containers
+    private lateinit var tabConfigBtn: Button
+    private lateinit var tabRejoinBtn: Button
+    private lateinit var configSection: LinearLayout
+    private lateinit var rejoinSection: LinearLayout
+
+    // Rejoiner UI Controls
+    private lateinit var arStatusPill: TextView
+    private lateinit var swRejoinEnabled: Switch
+    private lateinit var etRejoinTarget: EditText
+    private lateinit var tvSlotWatchdogList: TextView
+
+    private var activeTab = 0 // 0 = Config Settings, 1 = Rejoiner Settings
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 33) {
@@ -96,9 +110,47 @@ class MainActivity : Activity() {
         headerRow.addView(statusPill)
         headerCard.addView(headerRow)
 
-        // Configuration Card
+        // Navigation Tab Switcher (Config Settings vs Rejoiner Settings)
+        val tabBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(8, 8, 8, 8)
+            background = GradientDrawable().apply {
+                cornerRadius = 20f
+                setColor(Color.parseColor("#131822"))
+                setStroke(2, Color.parseColor("#1E293B"))
+            }
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 18 }
+        }
+        tabConfigBtn = Button(this).apply {
+            text = "⚙ CONFIG SETTINGS"
+            textSize = 11.5f
+            letterSpacing = 0.05f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(12, 18, 12, 18)
+            setOnClickListener { switchTab(0) }
+        }
+        tabRejoinBtn = Button(this).apply {
+            text = "🔁 REJOINER SETTINGS"
+            textSize = 11.5f
+            letterSpacing = 0.05f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(12, 18, 12, 18)
+            setOnClickListener { switchTab(1) }
+        }
+        tabBar.addView(tabConfigBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = 6 })
+        tabBar.addView(tabRejoinBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = 6 })
+
+        // =====================================================================
+        // TAB 0: CONFIG SETTINGS SECTION
+        // =====================================================================
+        configSection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
         val cfgCard = makeCard("#131822", "#1E293B", 24f).apply {
-            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 20 }
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 18 }
         }
         cfgCard.addView(makeSectionLabel("INSTANCE & DISCORD CONFIG"))
 
@@ -145,7 +197,6 @@ class MainActivity : Activity() {
         cfgCard.addView(etChan)
         cfgCard.addView(rowPower)
 
-        // Sync & OTA Auto-Updater Card
         val syncCard = makeCard("#131822", "#1E293B", 24f).apply {
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 20 }
         }
@@ -227,7 +278,163 @@ class MainActivity : Activity() {
         syncCard.addView(btnUpdate)
         syncCard.addView(rowPerms)
 
-        // Live Terminal Card
+        configSection.addView(cfgCard)
+        configSection.addView(syncCard)
+
+        // =====================================================================
+        // TAB 1: REJOINER SETTINGS SECTION
+        // =====================================================================
+        rejoinSection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+
+        val arControlCard = makeCard("#131822", "#1E293B", 24f).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 18 }
+        }
+        val arHeaderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 14)
+        }
+        val arTitle = makeSectionLabel("ALL-IN-ONE AUTO-REJOINER").apply {
+            setPadding(0, 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        arStatusPill = TextView(this).apply {
+            textSize = 10.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(18, 6, 18, 6)
+        }
+        arHeaderRow.addView(arTitle)
+        arHeaderRow.addView(arStatusPill)
+
+        val toggleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(22, 18, 22, 18)
+            background = GradientDrawable().apply {
+                cornerRadius = 16f
+                setColor(Color.parseColor("#0B0E14"))
+                setStroke(2, Color.parseColor("#1E293B"))
+            }
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 14 }
+        }
+        val toggleLabelCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        val toggleTitle = TextView(this).apply {
+            text = "Enable Auto-Rejoin Watchdog"
+            textSize = 13.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#F1F5F9"))
+        }
+        val toggleSub = TextView(this).apply {
+            text = "Monitors Delta heartbeat, freezes, Presence API & teleports"
+            textSize = 11f
+            setTextColor(Color.parseColor("#64748B"))
+            setPadding(0, 4, 0, 0)
+        }
+        toggleLabelCol.addView(toggleTitle)
+        toggleLabelCol.addView(toggleSub)
+
+        swRejoinEnabled = Switch(this).apply {
+            isChecked = Rejoiner.isEnabled(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Rejoiner.setConfig(this@MainActivity, checked, etRejoinTarget.text.toString())
+                refreshRejoinUi()
+            }
+        }
+        toggleRow.addView(toggleLabelCol)
+        toggleRow.addView(swRejoinEnabled)
+
+        etRejoinTarget = makeInput(
+            "Target Place ID or Private Server Link (blank = Auto Last Place)",
+            Rejoiner.getTarget(this)
+        )
+
+        val arBtnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnSaveAr = makePillBtn("SAVE REJOINER", "#10B981", "#059669") {
+            Rejoiner.setConfig(this, swRejoinEnabled.isChecked, etRejoinTarget.text.toString())
+            refreshRejoinUi()
+            Toast.makeText(this, "Rejoiner Settings Saved!", Toast.LENGTH_SHORT).show()
+        }
+        val btnRejoinAll = makePillBtn("REJOIN ALL NOW", "#0284C7", "#0369A1") {
+            Toast.makeText(this, "Force-rejoining all active slots...", Toast.LENGTH_SHORT).show()
+            Thread {
+                val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(this) }
+                val active = list.filter { it.status == "ACTIVE" && it.user != "Empty" }
+                for (acc in active) {
+                    Rejoiner.relaunch(this, acc.pkg)
+                }
+                runOnUiThread {
+                    refreshRejoinUi()
+                    Toast.makeText(this, "Relaunched ${active.size} active slot(s)", Toast.LENGTH_SHORT).show()
+                }
+            }.start()
+        }
+        arBtnRow.addView(btnSaveAr, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = 10 })
+        arBtnRow.addView(btnRejoinAll, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = 10 })
+
+        val guardSummary = TextView(this).apply {
+            text = "• Delta Lua Heartbeat + 20s Render-Freeze Detector\n" +
+                   "• Roblox Presence API (verifies In-Game status)\n" +
+                   "• Place-to-Place Teleport Shield (45s pause on OnTeleport)"
+            textSize = 11f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, 16, 0, 0)
+        }
+
+        arControlCard.addView(arHeaderRow)
+        arControlCard.addView(toggleRow)
+        arControlCard.addView(etRejoinTarget)
+        arControlCard.addView(arBtnRow)
+        arControlCard.addView(guardSummary)
+
+        // Per-Slot Watchdog Status Card
+        val arSlotsCard = makeCard("#131822", "#1E293B", 24f).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 20 }
+        }
+        val arSlotsHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 12)
+        }
+        val arSlotsTitle = makeSectionLabel("INSTANCE WATCHDOG STATUS").apply {
+            setPadding(0, 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        val btnRefreshSlots = TextView(this).apply {
+            text = "REFRESH"
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#38BDF8"))
+            setOnClickListener {
+                Thread {
+                    PilotCore.scanRbx(this@MainActivity)
+                    runOnUiThread { refreshRejoinUi() }
+                }.start()
+            }
+        }
+        arSlotsHeader.addView(arSlotsTitle)
+        arSlotsHeader.addView(btnRefreshSlots)
+
+        tvSlotWatchdogList = TextView(this).apply {
+            textSize = 11.5f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.parseColor("#CBD5E1"))
+        }
+
+        arSlotsCard.addView(arSlotsHeader)
+        arSlotsCard.addView(tvSlotWatchdogList)
+
+        rejoinSection.addView(arControlCard)
+        rejoinSection.addView(arSlotsCard)
+
+        // =====================================================================
+        // SHARED LIVE TELEMETRY TERMINAL CARD
+        // =====================================================================
         val logCard = makeCard("#0F131A", "#1E293B", 24f).apply {
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 20 }
         }
@@ -254,7 +461,7 @@ class MainActivity : Activity() {
         logHeader.addView(btnClear)
 
         logScroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(-1, 340)
+            layoutParams = LinearLayout.LayoutParams(-1, 320)
         }
         logView = TextView(this).apply {
             text = PilotCore.logs
@@ -267,22 +474,85 @@ class MainActivity : Activity() {
         logCard.addView(logScroll)
 
         container.addView(headerCard)
-        container.addView(cfgCard)
-        container.addView(syncCard)
+        container.addView(tabBar)
+        container.addView(configSection)
+        container.addView(rejoinSection)
         container.addView(logCard)
         root.addView(container)
         setContentView(root)
 
+        switchTab(0)
         refreshStatus()
+        refreshRejoinUi()
+
         PilotCore.onLog = {
             runOnUiThread {
                 logView.text = PilotCore.logs
                 etCloud.setText(PilotCore.getCloud(this))
                 etUpdateUrl.setText(PilotCore.getUpdateUrl(this))
                 refreshStatus()
+                refreshRejoinUi()
                 logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
             }
         }
+    }
+
+    private fun switchTab(tabIndex: Int) {
+        activeTab = tabIndex
+        val isCfg = tabIndex == 0
+        configSection.visibility = if (isCfg) View.VISIBLE else View.GONE
+        rejoinSection.visibility = if (isCfg) View.GONE else View.VISIBLE
+
+        tabConfigBtn.setTextColor(Color.parseColor(if (isCfg) "#FFFFFF" else "#64748B"))
+        tabConfigBtn.background = GradientDrawable().apply {
+            cornerRadius = 14f
+            setColor(Color.parseColor(if (isCfg) "#0284C7" else "#0B0E14"))
+        }
+
+        tabRejoinBtn.setTextColor(Color.parseColor(if (!isCfg) "#FFFFFF" else "#64748B"))
+        tabRejoinBtn.background = GradientDrawable().apply {
+            cornerRadius = 14f
+            setColor(Color.parseColor(if (!isCfg) "#059669" else "#0B0E14"))
+        }
+
+        if (!isCfg) refreshRejoinUi()
+    }
+
+    private fun refreshRejoinUi() {
+        val enabled = Rejoiner.isEnabled(this)
+        if (swRejoinEnabled.isChecked != enabled) {
+            swRejoinEnabled.isChecked = enabled
+        }
+        arStatusPill.text = if (enabled) "● ACTIVE" else "● OFF"
+        arStatusPill.setTextColor(Color.parseColor(if (enabled) "#10B981" else "#F87171"))
+        arStatusPill.background = GradientDrawable().apply {
+            cornerRadius = 50f
+            setColor(Color.parseColor(if (enabled) "#064E3B" else "#450A0A"))
+            setStroke(2, Color.parseColor(if (enabled) "#10B981" else "#EF4444"))
+        }
+
+        val now = System.currentTimeMillis()
+        val list = PilotCore.cachedScan
+        if (list.isEmpty()) {
+            tvSlotWatchdogList.text = "No Roblox slots scanned yet. Start bot or tap REFRESH."
+            return
+        }
+
+        val sb = StringBuilder()
+        list.forEachIndexed { idx, acc ->
+            val st = Rejoiner.states[acc.pkg]
+            val place = st?.placeId?.takeIf { it > 0L } ?: Rejoiner.getSavedPlaceId(this, acc.pkg)
+            val placeTxt = if (place > 0L) "Place:$place" else "Place:Auto"
+            val stateTxt = when {
+                acc.status != "ACTIVE" -> acc.status
+                st != null && now < st.teleportingUntilMs -> "TELEPORTING (${(st.teleportingUntilMs - now) / 1000}s)"
+                st != null && st.lastHbMs > 0L -> "IN-GAME (HB ${(now - st.lastHbMs) / 1000}s ago)"
+                else -> "RUNNING (Waiting Lua HB)"
+            }
+            sb.append("[${idx + 1}] ${acc.user} (${acc.pkg})\n")
+            sb.append("    $stateTxt • $placeTxt\n")
+        }
+        tvSlotWatchdogList.text = sb.toString().trim()
     }
 
     private fun refreshStatus() {

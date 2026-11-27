@@ -38,6 +38,14 @@ data class ShotRequest(
     @Volatile var capturedFile: File? = null
 )
 
+data class WindowSnapshot(
+    val taskId: Int?,
+    val preBounds: Rect?,
+    val fullW: Int,
+    val fullH: Int,
+    val tappedMaxBtn: Pair<Int, Int>?
+)
+
 object SuShell {
     private var proc: java.lang.Process? = null
     private var writer: BufferedWriter? = null
@@ -234,7 +242,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.0"
+    const val APP_VERSION = "v1.3.2"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -494,6 +502,111 @@ object PilotCore {
         }
     }
 
+    fun getDisplaySize(): Pair<Int, Int> {
+        val wm = SuShell.exec("wm size 2>/dev/null")
+        val m = Regex("""(\d+)x(\d+)""").findAll(wm).lastOrNull()
+        val w = m?.groupValues?.get(1)?.toIntOrNull() ?: 1280
+        val h = m?.groupValues?.get(2)?.toIntOrNull() ?: 720
+        return w to h
+    }
+
+    fun findTaskId(pkg: String): Int? {
+        val dump = SuShell.exec("dumpsys activity activities 2>/dev/null")
+        if (dump.isEmpty()) return null
+        val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
+        val taskRx = Regex("""Task\{[a-f0-9]+\s+#(\d+)""")
+        for (line in dump.lines()) {
+            if (pkgRx.containsMatchIn(line) && line.contains("Task{")) {
+                val tm = taskRx.find(line)
+                if (tm != null) return tm.groupValues[1].toIntOrNull()
+            }
+        }
+        for (block in dump.split("Task{")) {
+            if (!pkgRx.containsMatchIn(block)) continue
+            val idMatch = Regex("""^[a-f0-9]+\s+#(\d+)""").find(block)
+            if (idMatch != null) return idMatch.groupValues[1].toIntOrNull()
+        }
+        return null
+    }
+
+    @Synchronized
+    fun expandRobloxFullTab(pkg: String): WindowSnapshot {
+        val (fullW, fullH) = getDisplaySize()
+        val preBounds = findWindowBounds(pkg, fullW, fullH)
+        val taskId = findTaskId(pkg)
+
+        if (taskId != null) {
+            SuShell.exec(
+                "am task set-windowing-mode $taskId 1 >/dev/null 2>&1; " +
+                "am task resize $taskId 0 0 $fullW $fullH >/dev/null 2>&1; " +
+                "am stack move-task $taskId 1 true >/dev/null 2>&1"
+            )
+        }
+
+        val resolvedAct = SuShell.exec("cmd package resolve-activity --brief $pkg 2>/dev/null | tail -n 1").trim()
+        if (resolvedAct.contains("/")) {
+            SuShell.exec("am start -n '$resolvedAct' --activity-reorder-to-front --windowingMode 1 >/dev/null 2>&1")
+        } else {
+            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+        }
+
+        runCatching { Thread.sleep(450) }
+
+        var tappedMaxBtn: Pair<Int, Int>? = null
+        val afterBounds = findWindowBounds(pkg, fullW, fullH) ?: preBounds
+        if (afterBounds != null && (afterBounds.width() < fullW - 60 || afterBounds.height() < fullH - 120)) {
+            val maxBtnX = (afterBounds.right - 46).coerceIn(10, fullW - 10)
+            val maxBtnY = (afterBounds.top - 18).coerceAtLeast(12)
+            SuShell.exec("input tap $maxBtnX $maxBtnY")
+            tappedMaxBtn = maxBtnX to maxBtnY
+            runCatching { Thread.sleep(550) }
+        }
+
+        log("[FULLTAB] Expanded $pkg (task=${taskId ?: -1}, ${fullW}x${fullH})")
+        return WindowSnapshot(taskId, preBounds, fullW, fullH, tappedMaxBtn)
+    }
+
+    @Synchronized
+    fun restoreRobloxWindow(pkg: String, snap: WindowSnapshot) {
+        val b = snap.preBounds
+        if (b != null) {
+            // Restore back to its original freeform floating window bounds
+            if (snap.taskId != null) {
+                SuShell.exec(
+                    "am task set-windowing-mode ${snap.taskId} 5 >/dev/null 2>&1; " +
+                    "am task resize ${snap.taskId} ${b.left} ${b.top} ${b.right} ${b.bottom} >/dev/null 2>&1"
+                )
+            }
+            if (snap.tappedMaxBtn != null) {
+                runCatching { Thread.sleep(200) }
+                val cur = findWindowBounds(pkg, snap.fullW, snap.fullH)
+                if (cur == null || cur.width() >= snap.fullW - 50) {
+                    val restoreX = (snap.fullW - 46).coerceIn(10, snap.fullW - 10)
+                    val restoreY = 18
+                    SuShell.exec("input tap $restoreX $restoreY")
+                }
+            }
+            log("[FULLTAB] Restored $pkg back to floating window")
+        } else {
+            // Window was minimized/hidden before capture — minimize it back to background
+            if (snap.taskId != null) {
+                SuShell.exec("am task set-windowing-mode ${snap.taskId} 5 >/dev/null 2>&1")
+            }
+            SuShell.exec("am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1")
+            log("[FULLTAB] Minimized $pkg back to background")
+        }
+    }
+
+    @Synchronized
+    fun captureFullTabScreen(c: Context, pkg: String): File? {
+        val snap = expandRobloxFullTab(pkg)
+        val rawPath = File(c.cacheDir, "fulltab_${System.nanoTime()}.png").absolutePath
+        SuShell.exec("screencap -p '$rawPath' && chmod 666 '$rawPath'")
+        restoreRobloxWindow(pkg, snap)
+        val rawFile = File(rawPath)
+        return if (rawFile.exists() && rawFile.length() > 0L) rawFile else null
+    }
+
     fun findWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
         val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
         val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
@@ -568,65 +681,6 @@ object PilotCore {
             }
         }
 
-        if (bestSurfaceRect == null && bestWindowRect == null) {
-            val sfDump = SuShell.exec("dumpsys SurfaceFlinger 2>/dev/null")
-            if (sfDump.isNotEmpty()) {
-                val sfBoundsRx = Regex("""bounds[:=\s]+\[(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\]""")
-                var activePkgBlock = false
-                var isSurfLayer = false
-                for (line in sfDump.lines()) {
-                    if (line.startsWith("+ ") || line.startsWith("Layer ") || line.startsWith("  Layer ")) {
-                        activePkgBlock = pkgRx.containsMatchIn(line)
-                        isSurfLayer = line.contains("SurfaceView")
-                    } else if (activePkgBlock) {
-                        val m = sfBoundsRx.find(line)
-                        if (m != null) {
-                            val l = m.groupValues[1].toIntOrNull() ?: 0
-                            val t = m.groupValues[2].toIntOrNull() ?: 0
-                            val r = m.groupValues[3].toIntOrNull() ?: 0
-                            val b = m.groupValues[4].toIntOrNull() ?: 0
-                            val w = r - l
-                            val h = b - t
-                            if (w >= 140 && h >= 140 && !isFullDisplayContainer(w, h)) {
-                                val area = w * h
-                                val rect = Rect(l, t, r, b)
-                                if (isSurfLayer && area > bestSurfaceArea) {
-                                    bestSurfaceArea = area
-                                    bestSurfaceRect = rect
-                                } else if (area > bestWindowArea) {
-                                    bestWindowArea = area
-                                    bestWindowRect = rect
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (bestSurfaceRect == null && bestWindowRect == null) {
-            val actDump = SuShell.exec("dumpsys activity activities 2>/dev/null")
-            if (actDump.isNotEmpty()) {
-                for (block in actDump.split("Task{")) {
-                    if (!pkgRx.containsMatchIn(block)) continue
-                    val bm = Regex("""\b(?:mBounds|bounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""").find(block) ?: continue
-                    val l = bm.groupValues[1].toIntOrNull() ?: 0
-                    val t = bm.groupValues[2].toIntOrNull() ?: 0
-                    val r = bm.groupValues[3].toIntOrNull() ?: 0
-                    val b = bm.groupValues[4].toIntOrNull() ?: 0
-                    val w = r - l
-                    val h = b - t
-                    if (w >= 140 && h >= 140 && !isFullDisplayContainer(w, h)) {
-                        val area = w * h
-                        if (area > bestWindowArea) {
-                            bestWindowArea = area
-                            bestWindowRect = Rect(l, t, r, b)
-                        }
-                    }
-                }
-            }
-        }
-
         if (bestSurfaceRect != null) return bestSurfaceRect
         if (bestWindowRect != null) {
             val topTrim = if (bestWindowRect.height() > 220) 38 else 0
@@ -647,7 +701,8 @@ object PilotCore {
         val outPath = File(c.cacheDir, "crop.jpg").absolutePath
 
         if (!pkg.isNullOrEmpty() && tapInsideFirst) {
-            val preBounds = findWindowBounds(pkg, 1280, 720)
+            val (fw, fh) = getDisplaySize()
+            val preBounds = findWindowBounds(pkg, fw, fh)
             if (preBounds != null) {
                 val tapX = preBounds.centerX().coerceAtLeast(10)
                 val tapY = (preBounds.top + 28).coerceAtMost(preBounds.bottom - 10)
@@ -991,10 +1046,8 @@ class DiscordBot(private val ctx: Context) {
     fun sendAccountShot(ch: String, triggerMsgId: String, rawQuery: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
-        val tokens = rawQuery.trim().split(Regex("""\s+"""))
-        val tapFirst = tokens.any { it.equals("click", true) || it.equals("tap", true) }
-        val query = tokens.filterNot { it.equals("click", true) || it.equals("tap", true) }.joinToString(" ")
-        val q = query.trim().lowercase()
+        val query = rawQuery.trim()
+        val q = query.lowercase()
 
         var matches = list.mapIndexedNotNull { i, a ->
             if (a.user != "Empty" && a.user.lowercase().contains(q)) i to a else null
@@ -1014,9 +1067,8 @@ class DiscordBot(private val ctx: Context) {
         }
 
         for ((idx, acc) in matches) {
-            val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg, tapInsideFirst = tapFirst)
-            val note = if (!croppedOk) "\n*(Window minimized/hidden — showing full screen)*" else ""
-            val caption = "**📱 $cl** — Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}$note"
+            val img = PilotCore.captureFullTabScreen(ctx, acc.pkg)
+            val caption = "**📱 $cl** — Full-Tab Status for `${acc.user}`:\n${PilotCore.fmtLine(idx, acc)}"
             if (img != null) {
                 sendImage(ch, caption, img)
                 img.delete()
@@ -1569,7 +1621,7 @@ class DiscordBot(private val ctx: Context) {
             **🔍 Monitoring & Search**
             • `!scan` — Select a cloud phone to list all Roblox instances & statuses
             • `!search <username>` — Find which cloud & slot has an account (exact or close match)
-            • `!checkstatus <username> [click]` — Capture **only** inside that player's Roblox screen (add `click` to tap/focus it first)
+            • `!checkstatus <username>` — Expand that player's Roblox to **full-tab**, capture screenshot, and restore/minimize it back
             • `!version` — Show the installed Pilot version on every online cloud phone
 
             **🔁 All-in-One Auto-Rejoiner**
@@ -2181,7 +2233,6 @@ class PilotService : Service() {
             }
         }, 1, 10, TimeUnit.SECONDS)
 
-        // Delegated to Rejoiner.kt
         syncExec.scheduleAtFixedRate({
             runCatching { Rejoiner.tick(this) }
         }, 15, 15, TimeUnit.SECONDS)
