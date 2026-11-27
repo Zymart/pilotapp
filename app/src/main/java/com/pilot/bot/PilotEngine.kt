@@ -152,45 +152,54 @@ object AppUpdater {
                 return "Download failed or link is not a public APK."
             }
 
-            PilotCore.log("[UPD] Installing silently via root...")
             val tmpPath = "/data/local/tmp/pilot_upd.apk"
-            val res = SuShell.exec("cp '${apkFile.absolutePath}' '$tmpPath' && chmod 644 '$tmpPath' && pm install -r -d '$tmpPath'")
+            val scriptPath = "/data/local/tmp/pilot_do_install.sh"
+            val copyRes = SuShell.exec("cp '${apkFile.absolutePath}' '$tmpPath' && chmod 644 '$tmpPath' && [ -s '$tmpPath' ] && echo READY")
             apkFile.delete()
-
-            return if (res.contains("Success", ignoreCase = true)) {
-                SuShell.exec("rm -f '$tmpPath'")
-                prefs.edit().putString("last_upd_tag", newTag).apply()
-                PilotCore.log("[UPD] Installed! Restarting service...")
-                "Update installed! Restarting bot (was ${PilotCore.APP_VERSION})..."
-            } else if (res.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE", ignoreCase = true)) {
-                prefs.edit().putString("last_upd_tag", newTag).apply()
-                PilotCore.log("[UPD] Signature changed — migrating data & reinstalling...")
-                val swapScript = """
-                    nohup sh -c '
-                      sleep 2
-                      rm -rf /data/local/tmp/pilot_prefs_bak
-                      cp -rf /data/data/com.pilot.bot/shared_prefs /data/local/tmp/pilot_prefs_bak 2>/dev/null
-                      pm uninstall com.pilot.bot >/dev/null 2>&1
-                      pm install -g "$tmpPath" >/dev/null 2>&1
-                      rm -f "$tmpPath"
-                      if [ -d /data/local/tmp/pilot_prefs_bak ]; then
-                        mkdir -p /data/data/com.pilot.bot/shared_prefs
-                        cp -rf /data/local/tmp/pilot_prefs_bak/. /data/data/com.pilot.bot/shared_prefs/
-                        uid=${'$'}(stat -c "%u:%g" /data/data/com.pilot.bot 2>/dev/null)
-                        [ -n "${'$'}uid" ] && chown -R ${'$'}uid /data/data/com.pilot.bot/shared_prefs
-                        restorecon -RF /data/data/com.pilot.bot 2>/dev/null
-                        rm -rf /data/local/tmp/pilot_prefs_bak
-                      fi
-                      am start-foreground-service -n com.pilot.bot/.PilotService >/dev/null 2>&1 || am startservice -n com.pilot.bot/.PilotService >/dev/null 2>&1
-                    ' >/dev/null 2>&1 &
-                """.trimIndent()
-                SuShell.exec(swapScript)
-                "Signature migrated! Reinstalling & restarting bot in 3s..."
-            } else {
-                SuShell.exec("rm -f '$tmpPath'")
-                PilotCore.log("[UPD] Install error: $res")
-                "Install failed: $res"
+            if (!copyRes.contains("READY")) {
+                PilotCore.log("[UPD] Root copy failed: $copyRes")
+                return "Root stage failed: $copyRes"
             }
+
+            prefs.edit().putString("last_upd_tag", newTag).apply()
+
+            val installScript = """
+                #!/system/bin/sh
+                echo ${'$'}$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null
+                echo ${'$'}$ > /acct/uid_0/tasks 2>/dev/null
+                sleep 3
+                OUT=${'$'}(pm install -r -d -g "$tmpPath" 2>&1)
+                case "${'$'}OUT" in
+                  *Success*)
+                    ;;
+                  *)
+                    rm -rf /data/local/tmp/pilot_prefs_bak
+                    cp -rf /data/data/com.pilot.bot/shared_prefs /data/local/tmp/pilot_prefs_bak 2>/dev/null
+                    pm uninstall com.pilot.bot >/dev/null 2>&1
+                    sleep 1
+                    pm install -g "$tmpPath" >/dev/null 2>&1
+                    if [ -d /data/local/tmp/pilot_prefs_bak ]; then
+                      mkdir -p /data/data/com.pilot.bot/shared_prefs
+                      cp -rf /data/local/tmp/pilot_prefs_bak/. /data/data/com.pilot.bot/shared_prefs/
+                      uid=${'$'}(stat -c "%u:%g" /data/data/com.pilot.bot 2>/dev/null)
+                      [ -n "${'$'}uid" ] && chown -R ${'$'}uid /data/data/com.pilot.bot/shared_prefs
+                      restorecon -RF /data/data/com.pilot.bot 2>/dev/null
+                      rm -rf /data/local/tmp/pilot_prefs_bak
+                    fi
+                    ;;
+                esac
+                rm -f "$tmpPath" "$scriptPath"
+                sleep 1
+                am start-foreground-service -n com.pilot.bot/.PilotService >/dev/null 2>&1 || am startservice -n com.pilot.bot/.PilotService >/dev/null 2>&1
+            """.trimIndent()
+
+            val localSh = File(c.cacheDir, "pilot_do_install.sh")
+            localSh.writeText(installScript)
+            SuShell.exec("cp '${localSh.absolutePath}' '$scriptPath' && chmod 755 '$scriptPath' && setsid sh '$scriptPath' </dev/null >/dev/null 2>&1 &")
+            localSh.delete()
+
+            PilotCore.log("[UPD] Detached installer launched; restarting in ~5s...")
+            return "Installing update & restarting agent in ~5s (was ${PilotCore.APP_VERSION})..."
         } finally {
             updating = false
         }
@@ -225,7 +234,8 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.2.6"
+    const val APP_VERSION = "v1.2.8"
+    private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
@@ -327,10 +337,12 @@ object PilotCore {
 
     fun saveSsChannel(c: Context, ch: String) {
         prefs(c).edit().putString("ss_channel", ch.trim()).apply()
+        writeSharedBackup(c)
     }
 
     fun saveUpdateUrl(c: Context, url: String) {
         prefs(c).edit().putString("upd_url", url.trim()).apply()
+        writeSharedBackup(c)
     }
 
     fun saveConfig(c: Context, cloud: String, rawToken: String, rawIds: String, ssChan: String = "", updUrl: String = "") {
@@ -349,6 +361,33 @@ object PilotCore {
         if (ssChan.trim().isNotEmpty()) edit.putString("ss_channel", ssChan.trim())
         edit.apply()
         runCatching { File("/sdcard/cloud_name.txt").writeText(cl) }
+        writeSharedBackup(c)
+    }
+
+    private fun writeSharedBackup(c: Context) {
+        if (getToken(c).isEmpty() || getAllowedIds(c).isEmpty()) return
+        val code = makeCode(c, autoRoot = true)
+        runCatching { File(SHARED_SYNC_PATH).writeText(code) }
+        SuShell.exec("printf '%s' '$code' > $SHARED_SYNC_PATH && chmod 666 $SHARED_SYNC_PATH")
+    }
+
+    fun tryAutoSeedFromDisk(c: Context): Boolean {
+        if (getToken(c).isNotEmpty() && getAllowedIds(c).isNotEmpty()) {
+            writeSharedBackup(c)
+            return true
+        }
+        val diskCode = runCatching {
+            val f = File(SHARED_SYNC_PATH)
+            if (f.exists()) f.readText().trim() else SuShell.exec("cat $SHARED_SYNC_PATH 2>/dev/null").trim()
+        }.getOrDefault("")
+        if (diskCode.contains("-")) {
+            val (ok, _) = applyCode(c, diskCode, startSvc = false)
+            if (ok) {
+                log("[SYNC] Auto-loaded config from $SHARED_SYNC_PATH")
+                return true
+            }
+        }
+        return false
     }
 
     fun makeCode(c: Context, autoRoot: Boolean = true): String {
@@ -365,7 +404,7 @@ object PilotCore {
         return "$letters-$b64"
     }
 
-    fun applyCode(c: Context, code: String): Pair<Boolean, Boolean> {
+    fun applyCode(c: Context, code: String, startSvc: Boolean = true): Pair<Boolean, Boolean> {
         val parsed = runCatching {
             val raw = code.trim().substringAfter("-")
             JSONObject(String(Base64.decode(raw, Base64.URL_SAFE)))
@@ -392,12 +431,13 @@ object PilotCore {
         val upd = parsed.optString("d", "")
         if (upd.isNotEmpty()) edit.putString("upd_url", upd)
         edit.apply()
+        writeSharedBackup(c)
 
         val autoRoot = parsed.optBoolean("ar", true)
         var started = false
         if (autoRoot) {
             autoGrantRootAndPerms(c)
-            if (getToken(c).isNotEmpty() && getAllowedIds(c).isNotEmpty()) {
+            if (startSvc && getToken(c).isNotEmpty() && getAllowedIds(c).isNotEmpty()) {
                 val svc = Intent(c, PilotService::class.java)
                 runCatching {
                     if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(svc) else c.startService(svc)
@@ -1252,11 +1292,11 @@ class DiscordBot(private val ctx: Context) {
                     if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
                     if (hasBotRepliedAfter(ch, msgId)) return@execute
                     val code = PilotCore.makeCode(ctx, autoRoot = true)
+                    sendMsg(ch, "**📋 Your Pilot Sync Code (Auto-Root Enabled):**\n```\n$code\n```")
                     val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", authorId))
                     val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
                     if (dmCh.isNotEmpty()) {
                         sendMsg(dmCh, "**Your Pilot Sync Code:**\n`$code`\n```\n$code\n```")
-                        sendMsg(ch, "Sent your new config code to your DMs!")
                     }
                 }
             }
@@ -1553,7 +1593,7 @@ class DiscordBot(private val ctx: Context) {
             • `!delete` — Wipe session data **and** clear username history (resets to Empty)
             • `!rename <new name>` — Remotely rename a cloud phone
             • `!update [drive_url]` — Check & silently install the latest Pilot APK
-            • `!config` — DM yourself your current `XXXXXXX-...` sync code
+            • `!config` — Post & DM your current `XXXXXXX-...` sync code
             • `!help` — Show this command guide
         """.trimIndent()
 
@@ -2030,6 +2070,8 @@ class PilotService : Service() {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        PilotCore.tryAutoSeedFromDisk(this)
+
         val chId = "pilot_svc"
         if (Build.VERSION.SDK_INT >= 26) {
             val nm = getSystemService(NotificationManager::class.java)
@@ -2097,6 +2139,7 @@ class PilotService : Service() {
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        PilotCore.tryAutoSeedFromDisk(context)
         if (PilotCore.getToken(context).isNotEmpty() && PilotCore.getAllowedIds(context).isNotEmpty()) {
             val svc = Intent(context, PilotService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(svc) else context.startService(svc)
