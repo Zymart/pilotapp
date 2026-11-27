@@ -252,7 +252,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.9"
+    const val APP_VERSION = "v1.3.10"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -974,104 +974,151 @@ object PilotCore {
             return false to "Package `$pkg` is not installed on this cloud phone."
         }
 
-        SuShell.exec("am force-stop $pkg && rm -rf /data/data/$pkg/shared_prefs/* /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/*")
+        // Stop clone and clear old local user cache so Roblox re-authenticates from WebView Cookies
+        SuShell.exec(
+            "am force-stop $pkg && " +
+            "rm -rf /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/* " +
+            "/data/data/$pkg/shared_prefs/com.roblox.*.xml /data/data/$pkg/shared_prefs/Rbx*.xml"
+        )
 
-        val cookieDir = "/data/data/$pkg/app_webview/Default"
-        val cookiePath = "$cookieDir/Cookies"
-        val hasDb = SuShell.exec("[ -f '$cookiePath' ] && echo YES").trim() == "YES"
-        if (!hasDb) {
-            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 && sleep 4 && am force-stop $pkg")
+        fun findCookieDbs(): List<String> = SuShell.exec(
+            "find /data/data/$pkg/app_webview -maxdepth 3 -type f -name 'Cookies' 2>/dev/null"
+        ).lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+        var cookiePaths = findCookieDbs()
+        if (cookiePaths.isEmpty()) {
+            // Launch once so Android WebView initializes its exact Cookies SQLite schema
+            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 && sleep 5 && am force-stop $pkg")
+            cookiePaths = findCookieDbs()
         }
 
-        val tmpDb = File(c.cacheDir, "ck_${System.nanoTime()}.db")
-        SuShell.exec("cp '$cookiePath' '${tmpDb.absolutePath}' 2>/dev/null && cp '${cookiePath}-wal' '${tmpDb.absolutePath}-wal' 2>/dev/null && cp '${cookiePath}-shm' '${tmpDb.absolutePath}-shm' 2>/dev/null && chmod 666 '${tmpDb.absolutePath}'*")
-
-        if (!tmpDb.exists() || tmpDb.length() == 0L) {
-            return false to "Could not read WebView Cookies database for `$pkg`."
+        if (cookiePaths.isEmpty()) {
+            return false to "Could not find WebView `Cookies` database under `/data/data/$pkg/app_webview/`."
         }
 
-        val writeOk = runCatching {
-            val db = SQLiteDatabase.openDatabase(tmpDb.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
-            val cols = HashSet<String>()
-            db.rawQuery("PRAGMA table_info(cookies)", null).use { cur ->
-                while (cur.moveToNext()) {
-                    cols.add(cur.getString(1).lowercase())
+        var patchedCount = 0
+        for ((idx, cookiePath) in cookiePaths.withIndex()) {
+            val cookieDir = cookiePath.substringBeforeLast("/")
+            val tmpDb = File(c.cacheDir, "ck_${System.nanoTime()}_$idx.db")
+
+            SuShell.exec(
+                "cp '$cookiePath' '${tmpDb.absolutePath}' 2>/dev/null; " +
+                "cp '${cookiePath}-wal' '${tmpDb.absolutePath}-wal' 2>/dev/null; " +
+                "cp '${cookiePath}-shm' '${tmpDb.absolutePath}-shm' 2>/dev/null; " +
+                "cp '${cookiePath}-journal' '${tmpDb.absolutePath}-journal' 2>/dev/null; " +
+                "chmod 666 '${tmpDb.absolutePath}'* 2>/dev/null"
+            )
+
+            if (!tmpDb.exists() || tmpDb.length() == 0L) continue
+
+            val writeOk = runCatching {
+                val db = SQLiteDatabase.openDatabase(tmpDb.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
+                val cols = HashSet<String>()
+                db.rawQuery("PRAGMA table_info(cookies)", null).use { cur ->
+                    while (cur.moveToNext()) {
+                        cols.add(cur.getString(1).lowercase())
+                    }
+                }
+                if (cols.isEmpty()) {
+                    db.close()
+                    return@runCatching false
+                }
+
+                db.delete("cookies", "name = ? AND host_key LIKE ?", arrayOf(".ROBLOSECURITY", "%roblox.com"))
+
+                val nowMicros = (System.currentTimeMillis() / 1000L + 11644473600L) * 1_000_000L
+                val expMicros = nowMicros + (365L * 86400L * 1_000_000L)
+
+                val cv = ContentValues().apply {
+                    if ("creation_utc" in cols) put("creation_utc", nowMicros)
+                    if ("host_key" in cols) put("host_key", ".roblox.com")
+                    if ("top_frame_site_key" in cols) put("top_frame_site_key", "")
+                    if ("name" in cols) put("name", ".ROBLOSECURITY")
+                    if ("value" in cols) put("value", clean)
+                    if ("encrypted_value" in cols) put("encrypted_value", ByteArray(0))
+                    if ("path" in cols) put("path", "/")
+                    if ("expires_utc" in cols) put("expires_utc", expMicros)
+                    if ("is_secure" in cols) put("is_secure", 1)
+                    if ("is_httponly" in cols) put("is_httponly", 1)
+                    if ("last_access_utc" in cols) put("last_access_utc", nowMicros)
+                    if ("has_expires" in cols) put("has_expires", 1)
+                    if ("is_persistent" in cols) put("is_persistent", 1)
+                    if ("priority" in cols) put("priority", 1)
+                    if ("samesite" in cols) put("samesite", 1)
+                    if ("source_scheme" in cols) put("source_scheme", 2)
+                    if ("source_port" in cols) put("source_port", 443)
+                    if ("last_update_utc" in cols) put("last_update_utc", nowMicros)
+                    if ("source_type" in cols) put("source_type", 0)
+                    if ("has_cross_site_ancestor" in cols) put("has_cross_site_ancestor", 0)
+                }
+
+                db.insertOrThrow("cookies", null, cv)
+
+                // Flush WAL pages directly into the main Cookies file before copying back
+                db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { it.moveToFirst() }
+                db.rawQuery("PRAGMA journal_mode=DELETE", null).use { it.moveToFirst() }
+
+                var verifiedRows = 0
+                db.rawQuery(
+                    "SELECT COUNT(*) FROM cookies WHERE name = ? AND value = ?",
+                    arrayOf(".ROBLOSECURITY", clean)
+                ).use { cur ->
+                    if (cur.moveToFirst()) verifiedRows = cur.getInt(0)
+                }
+                db.close()
+                verifiedRows > 0
+            }.getOrDefault(false)
+
+            if (writeOk) {
+                val restoreSh = """
+                    mkdir -p '$cookieDir'
+                    rm -f '${cookiePath}-wal' '${cookiePath}-shm' '${cookiePath}-journal'
+                    cp '${tmpDb.absolutePath}' '$cookiePath'
+                    chmod 600 '$cookiePath'
+                    uid=${'$'}(stat -c '%u:%g' /data/data/$pkg 2>/dev/null)
+                    if [ -n "${'$'}uid" ]; then
+                      chown -R ${'$'}uid /data/data/$pkg/app_webview 2>/dev/null
+                    fi
+                    restorecon -RF /data/data/$pkg/app_webview 2>/dev/null
+                    [ -s '$cookiePath' ] && echo OK
+                """.trimIndent()
+                if (SuShell.exec(restoreSh).contains("OK")) {
+                    patchedCount++
+                    log("[LAUNCH] Patched cookie DB: $cookiePath")
                 }
             }
-            if (cols.isEmpty()) {
-                db.close()
-                return@runCatching false
-            }
 
-            db.delete("cookies", "name = ? AND host_key LIKE ?", arrayOf(".ROBLOSECURITY", "%roblox.com"))
-
-            val nowMicros = (System.currentTimeMillis() / 1000L + 11644473600L) * 1_000_000L
-            val expMicros = nowMicros + (365L * 86400L * 1_000_000L)
-
-            val cv = ContentValues().apply {
-                if ("creation_utc" in cols) put("creation_utc", nowMicros)
-                if ("host_key" in cols) put("host_key", ".roblox.com")
-                if ("top_frame_site_key" in cols) put("top_frame_site_key", "")
-                if ("name" in cols) put("name", ".ROBLOSECURITY")
-                if ("value" in cols) put("value", clean)
-                if ("encrypted_value" in cols) put("encrypted_value", ByteArray(0))
-                if ("path" in cols) put("path", "/")
-                if ("expires_utc" in cols) put("expires_utc", expMicros)
-                if ("is_secure" in cols) put("is_secure", 1)
-                if ("is_httponly" in cols) put("is_httponly", 1)
-                if ("last_access_utc" in cols) put("last_access_utc", nowMicros)
-                if ("has_expires" in cols) put("has_expires", 1)
-                if ("is_persistent" in cols) put("is_persistent", 1)
-                if ("priority" in cols) put("priority", 1)
-                if ("samesite" in cols) put("samesite", -1)
-                if ("source_scheme" in cols) put("source_scheme", 2)
-                if ("source_port" in cols) put("source_port", 443)
-                if ("last_update_utc" in cols) put("last_update_utc", nowMicros)
-                if ("source_type" in cols) put("source_type", 0)
-                if ("has_cross_site_ancestor" in cols) put("has_cross_site_ancestor", 0)
-            }
-
-            db.insertOrThrow("cookies", null, cv)
-            db.close()
-            true
-        }.getOrDefault(false)
-
-        if (!writeOk) {
             c.cacheDir.listFiles { f -> f.name.startsWith(tmpDb.name) }?.forEach { it.delete() }
-            return false to "Failed to write `.ROBLOSECURITY` into SQLite database."
         }
 
-        val launchUri = if (Rejoiner.isEnabled(c)) Rejoiner.buildLaunchUri(c, pkg, null) else ""
-        val launchCmd = if (launchUri.isNotEmpty()) {
-            "am start -a android.intent.action.VIEW -d '$launchUri' -p $pkg >/dev/null 2>&1"
-        } else {
-            "monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"
+        if (patchedCount == 0) {
+            return false to "Failed to write `.ROBLOSECURITY` into WebView SQLite database(s)."
         }
 
-        val restoreSh = """
-            mkdir -p '$cookieDir'
-            rm -f '${cookiePath}-wal' '${cookiePath}-shm'
-            cp '${tmpDb.absolutePath}' '$cookiePath'
-            uid=${'$'}(stat -c '%u:%g' /data/data/$pkg 2>/dev/null)
-            if [ -n "${'$'}uid" ]; then
-              chown -R ${'$'}uid '$cookieDir' 2>/dev/null
-            fi
-            restorecon -RF /data/data/$pkg 2>/dev/null
-            $launchCmd
-        """.trimIndent()
-        SuShell.exec(restoreSh)
-        c.cacheDir.listFiles { f -> f.name.startsWith(tmpDb.name) }?.forEach { it.delete() }
+        // Launch via normal Launcher first so Roblox loads the WebView cookie cleanly
+        SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
 
-        if (knownUser.isNotEmpty()) {
-            histPrefs(c).edit().putString(pkg, knownUser).apply()
-            if (knownUserId > 0L) Rejoiner.saveUserId(c, knownUser, knownUserId)
+        // Poll up to 12 seconds to confirm Roblox actually established an ACTIVE session
+        var verifiedActive: AccInfo? = null
+        for (attempt in 1..6) {
+            runCatching { Thread.sleep(2000) }
+            val hit = scanRbx(c).firstOrNull { it.pkg == pkg && it.status == "ACTIVE" }
+            if (hit != null) {
+                verifiedActive = hit
+                break
+            }
         }
 
-        runCatching { Thread.sleep(3500) }
-        val updated = scanRbx(c).firstOrNull { it.pkg == pkg }
-        val loggedUser = knownUser.ifEmpty { updated?.user?.takeIf { it != "Empty" } ?: "Session Loaded" }
-        log("[LAUNCH] Cookie injected into $pkg -> $loggedUser")
-        return true to loggedUser
+        if (verifiedActive != null) {
+            histPrefs(c).edit().putString(pkg, verifiedActive.user).apply()
+            if (knownUserId > 0L) Rejoiner.saveUserId(c, verifiedActive.user, knownUserId)
+            log("[LAUNCH] Verified logged in on $pkg -> ${verifiedActive.user}")
+            return true to verifiedActive.user
+        }
+
+        val hintUser = knownUser.ifEmpty { "account" }
+        log("[LAUNCH-WARN] Cookie written ($patchedCount DBs), but $pkg did not become ACTIVE for $hintUser")
+        return false to "Cookie was written to `$pkg` ($patchedCount DB), but Roblox stayed on the login screen. Either **Account Session Protection** (IP/region lock) is enabled on this account or Roblox cleared the cookie on launch."
     }
 
     fun fmtLine(idx: Int, a: AccInfo): String {
