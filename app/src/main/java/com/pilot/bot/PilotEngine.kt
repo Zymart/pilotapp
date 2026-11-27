@@ -252,7 +252,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.5"
+    const val APP_VERSION = "v1.3.6"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -974,7 +974,6 @@ object PilotCore {
             return false to "Package `$pkg` is not installed on this cloud phone."
         }
 
-        // Force-stop and clear stale cached session metadata so the new cookie loads cleanly
         SuShell.exec("am force-stop $pkg && rm -rf /data/data/$pkg/shared_prefs/* /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/*")
 
         val cookieDir = "/data/data/$pkg/app_webview/Default"
@@ -1118,7 +1117,6 @@ class DiscordBot(private val ctx: Context) {
     private val checkIns = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
     private val checkInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
 
-    // Dedicated check-in tracking for !accountlaunch (only phones with Empty/Logged Out slots)
     private val freeCheckIns = ConcurrentHashMap<String, ConcurrentHashMap<String, Pair<String, Int>>>()
     private val freeCheckInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
 
@@ -1270,7 +1268,6 @@ class DiscordBot(private val ctx: Context) {
                     }
                 }
                 content.startsWith("PILOT_FREE:") -> {
-                    // PILOT_FREE:<anchorMsgId>:<cloud>:<ver>:<freeCount>
                     val p = content.split(":", limit = 5)
                     if (p.size >= 5) {
                         val anchor = p[1]
@@ -1287,7 +1284,6 @@ class DiscordBot(private val ctx: Context) {
                     }
                 }
                 content.startsWith("✅ **Cookie Verified!**") -> {
-                    // Sync verified username/userId & AWAITING_JSON stage across all online phones
                     val sid = Regex("""\*\*Session:\*\*\s*`([^`]+)`""").find(content)?.groupValues?.get(1)
                     val accMatch = Regex("""\*\*Account:\*\*\s*`([^`]+)`\s*\(`(\d+)`\)""").find(content)
                     if (!sid.isNullOrEmpty() && accMatch != null) {
@@ -1316,7 +1312,6 @@ class DiscordBot(private val ctx: Context) {
         val msgId = d.optString("id", "")
         val cl = PilotCore.getCloud(ctx)
 
-        // Intercept JSON attachment / inline JSON / "skip" / "!cancel" for an active !accountlaunch session
         val awaiting = AccountLaunchManager.findAwaitingSession(authorId, ch)
         if (awaiting != null) {
             if (content.equals("!cancel", ignoreCase = true)) {
@@ -1359,25 +1354,23 @@ class DiscordBot(private val ctx: Context) {
                 }
             }
             "!createconfig", "!newconfig" -> ioExec.execute {
-                val delayMs = (abs(cl.hashCode()) % 14) * 110L
-                if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
-                if (hasBotRepliedAfter(ch, msgId)) return@execute
                 val btn = JSONObject()
                     .put("type", 2)
                     .put("style", 1)
                     .put("label", "⚙️ Open Config Builder")
                     .put("custom_id", "pilot_cfg_btn:open:$cl")
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(btn)))
-                sendMsg(
+                val header = "**🛠️ Pilot Sync Config Builder**"
+                postSingleCoordinatorMessage(
                     ch,
-                    "**🛠️ Pilot Sync Config Builder**\nClick the button below to enter your **Bot Token** (include one `@` inside to bypass Discord's scanner) and **Allowed User/Role ID(s)** (comma-separated):",
-                    row
+                    msgId,
+                    header,
+                    JSONObject()
+                        .put("content", "$header\nClick the button below to enter your **Bot Token** (include one `@` inside to bypass Discord's scanner) and **Allowed User/Role ID(s)** (comma-separated):")
+                        .put("components", row)
                 )
             }
             "!accountlaunch", "!al" -> ioExec.execute {
-                val delayMs = (abs(cl.hashCode()) % 14) * 110L
-                if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
-                if (hasBotRepliedAfter(ch, msgId)) return@execute
                 val sid = msgId.takeLast(8).ifEmpty { (100000..999999).random().toString() }
                 val btn = JSONObject()
                     .put("type", 2)
@@ -1385,10 +1378,14 @@ class DiscordBot(private val ctx: Context) {
                     .put("label", "🚀 Enter Roblox Cookie")
                     .put("custom_id", "pilot_al_btn:open:$cl:$sid")
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(btn)))
-                sendMsg(
+                val header = "**🚀 Pilot Account Launch**"
+                postSingleCoordinatorMessage(
                     ch,
-                    "**🚀 Pilot Account Launch**\nClick the button below to submit the `.ROBLOSECURITY` cookie. Pilot will resolve the username, prompt for your Nousigi Hub JSON (`message.txt`), and let you pick an available UGPhone slot:",
-                    row
+                    msgId,
+                    header,
+                    JSONObject()
+                        .put("content", "$header\nClick the button below to submit the `.ROBLOSECURITY` cookie. Pilot will resolve the username, prompt for your Nousigi Hub JSON (`message.txt`), and let you pick an available UGPhone slot:")
+                        .put("components", row)
                 )
             }
             "!autorejoin", "!ar" -> ioExec.execute {
@@ -1510,15 +1507,20 @@ class DiscordBot(private val ctx: Context) {
             }
             "!config" -> {
                 ioExec.execute {
-                    val delayMs = (abs(cl.hashCode()) % 12) * 110L
-                    if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
-                    if (hasBotRepliedAfter(ch, msgId)) return@execute
                     val code = PilotCore.makeCode(ctx, autoRoot = true)
-                    sendMsg(ch, "**📋 Your Pilot Sync Code (Auto-Root Enabled):**\n```\n$code\n```")
-                    val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", authorId))
-                    val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
-                    if (dmCh.isNotEmpty()) {
-                        sendMsg(dmCh, "**Your Pilot Sync Code:**\n`$code`\n```\n$code\n```")
+                    val header = "**📋 Your Pilot Sync Code (Auto-Root Enabled):**"
+                    val won = postSingleCoordinatorMessage(
+                        ch,
+                        msgId,
+                        header,
+                        JSONObject().put("content", "$header\n```\n$code\n```")
+                    )
+                    if (won) {
+                        val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", authorId))
+                        val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
+                        if (dmCh.isNotEmpty()) {
+                            sendMsg(dmCh, "**Your Pilot Sync Code:**\n`$code`\n```\n$code\n```")
+                        }
                     }
                 }
             }
@@ -1529,6 +1531,38 @@ class DiscordBot(private val ctx: Context) {
                     sendMsg(ch, "⚠️ **Invalid command!** Type `!help` to view all available commands.")
                 }
             }
+        }
+    }
+
+    /**
+     * Posts a single message across all online phones using lowest-snowflake deduplication
+     * so commands like `!accountlaunch`, `!createconfig`, and `!config` never double-post.
+     */
+    private fun postSingleCoordinatorMessage(ch: String, anchorMsgId: String, prefix: String, payload: JSONObject): Boolean {
+        val myCloud = PilotCore.getCloud(ctx)
+        val jitterMs = (abs(myCloud.hashCode()) % 14) * 100L
+        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
+
+        if (findCanonicalBotMessage(ch, anchorMsgId, prefix) != null) return false
+
+        val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", payload)
+        val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
+        if (postedId.isEmpty()) return false
+
+        runCatching { Thread.sleep(450) }
+        val canonical = findCanonicalBotMessage(ch, anchorMsgId, prefix)
+        if (canonical != null && canonical.optString("id") != postedId) {
+            apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
+            return false
+        }
+        return true
+    }
+
+    private fun postSelfCleaningCheckIn(ch: String, text: String) {
+        val raw = apiPost("https://discord.com/api/v10/channels/$ch/messages", JSONObject().put("content", text))
+        val mid = runCatching { JSONObject(raw).getString("id") }.getOrDefault("")
+        if (mid.isNotEmpty()) {
+            exec.schedule({ apiDelete("https://discord.com/api/v10/channels/$ch/messages/$mid") }, 3500, TimeUnit.MILLISECONDS)
         }
     }
 
@@ -1545,15 +1579,11 @@ class DiscordBot(private val ctx: Context) {
         return pa.size.compareTo(pb.size)
     }
 
-    /**
-     * Collects ONLY online cloud phones that have at least one EMPTY or LOGGED OUT Roblox slot
-     * and posts a single shared dropdown for `!accountlaunch`.
-     */
     private fun collectAndPostAvailableCloudMenu(ch: String, anchorMsgId: String, session: LaunchSession) {
         val myCloud = PilotCore.getCloud(ctx)
         val myVer = PilotCore.APP_VERSION
-        val freeSlots = PilotCore.scanRbx(ctx).filter { it.status == "EMPTY" || it.status == "LOGGED OUT" }
-        val freeCount = freeSlots.size
+        val slots = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+        val freeCount = slots.count { it.status == "EMPTY" || it.status == "LOGGED OUT" }
         val title = "**🚀 Account Launch (`${session.username}`)** — Select a Cloud Phone with an available slot:"
 
         if (freeCount == 0) {
@@ -1592,16 +1622,16 @@ class DiscordBot(private val ctx: Context) {
             )
             val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
 
-            runCatching { Thread.sleep(300) }
+            runCatching { Thread.sleep(350) }
             val canonical = findCanonicalBotMessage(ch, anchorMsgId, title)
             if (canonical != null && postedId.isNotEmpty() && canonical.optString("id") != postedId) {
                 apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
-                sendMsg(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
+                postSelfCleaningCheckIn(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
                 return
             }
             targetId = canonical?.optString("id")?.takeIf { it.isNotEmpty() } ?: postedId
         } else {
-            sendMsg(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
+            postSelfCleaningCheckIn(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
             return
         }
 
@@ -1690,16 +1720,16 @@ class DiscordBot(private val ctx: Context) {
             val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", initBody)
             val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
 
-            runCatching { Thread.sleep(300) }
+            runCatching { Thread.sleep(350) }
             val canonical = findCanonicalBotMessage(ch, anchorMsgId, title)
             if (canonical != null && postedId.isNotEmpty() && canonical.optString("id") != postedId) {
                 apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
-                sendMsg(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
+                postSelfCleaningCheckIn(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
                 return null
             }
             targetId = canonical?.optString("id")?.takeIf { it.isNotEmpty() } ?: postedId
         } else {
-            sendMsg(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
+            postSelfCleaningCheckIn(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
             return null
         }
 
@@ -2088,7 +2118,6 @@ class DiscordBot(private val ctx: Context) {
                 val gameSuffix = AccountLaunchManager.sanitizeGameSuffix(rawGame)
                 AccountLaunchManager.cleanupExpired()
 
-                // Passively cache cookie in RAM on ALL online phones so the cookie never touches Discord chat
                 val session = LaunchSession(
                     sessionId = sid,
                     coordinatorCloud = coordinatorCloud,
@@ -2099,7 +2128,6 @@ class DiscordBot(private val ctx: Context) {
                 )
                 AccountLaunchManager.sessions[sid] = session
 
-                // Only the coordinator phone verifies the cookie and replies to Discord
                 if (!coordinatorCloud.equals(myCloud, ignoreCase = true)) return
 
                 replyInteraction(

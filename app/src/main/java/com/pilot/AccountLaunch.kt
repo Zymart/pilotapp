@@ -79,9 +79,10 @@ object AccountLaunchManager {
         if (clean.length < 50) {
             return Triple(false, 0L, "Cookie is too short or invalid.")
         }
+        val authEndpoint = "https://" + "users.roblox.com/v1/users/authenticated"
         return runCatching {
             val req = Request.Builder()
-                .url("[https://users.roblox.com/v1/users/authenticated](https://users.roblox.com/v1/users/authenticated)")
+                .url(authEndpoint)
                 .header("Cookie", ".ROBLOSECURITY=$clean")
                 .header("Accept", "application/json")
                 .header("User-Agent", "Mozilla/5.0")
@@ -129,33 +130,32 @@ object AccountLaunchManager {
     }
 
     private fun downloadAttachmentText(url: String): String {
-        val urlsToTry = linkedSetOf(url)
+        val urlsToTry = linkedSetOf(url.trim())
         if (url.contains("cdn.discordapp.com")) {
-            urlsToTry.add(url.replace("cdn.discordapp.com", "media.discordapp.net"))
+            urlsToTry.add(url.trim().replace("cdn.discordapp.com", "media.discordapp.net"))
         }
         for (targetUrl in urlsToTry) {
             val text = runCatching {
                 val req = Request.Builder()
                     .url(targetUrl)
                     .header("Accept", "*/*")
-                    .header("User-Agent", "DiscordBot ([https://discord.com](https://discord.com), 10)")
+                    .header("User-Agent", "DiscordBot (https://discord.com, 10)")
                     .get()
                     .build()
                 http.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) "" else decodeTextBytes(resp.body?.bytes() ?: ByteArray(0))
                 }
             }.getOrDefault("")
-            if (text.isNotBlank() && !text.trimStart().startsWith("<!DOCTYPE", ignoreCase = true) && !text.trimStart().startsWith("<html", ignoreCase = true)) {
+            if (text.isNotBlank() &&
+                !text.trimStart().startsWith("<!DOCTYPE", ignoreCase = true) &&
+                !text.trimStart().startsWith("<html", ignoreCase = true)
+            ) {
                 return text
             }
         }
         return ""
     }
 
-    /**
-     * Cleans BOMs, null bytes, markdown fences, or surrounding text from any uploaded file
-     * (such as message.txt) and extracts the valid JSON object/array for Nousigi Hub.
-     */
     private fun extractJsonPayload(raw: String): String? {
         var s = raw
             .replace("\uFEFF", "")
@@ -197,10 +197,6 @@ object AccountLaunchManager {
         return if (isValid) candidate else null
     }
 
-    /**
-     * Converts the uploaded message.txt / .json file (or inline JSON) and writes it to:
-     * /storage/emulated/0/Delta/Workspace/Nousigi Hub/<Username>_<GameSuffix>.json
-     */
     @Synchronized
     fun saveNousigiConfig(
         c: Context,
