@@ -2,6 +2,7 @@ package com.pilot.bot
 
 import android.app.*
 import android.content.*
+import android.database.sqlite.SQLiteDatabase
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Rect
@@ -224,7 +225,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.2.5"
+    const val APP_VERSION = "v1.2.6"
 
     var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
@@ -486,12 +487,6 @@ object PilotCore {
         }
     }
 
-    /**
-     * Locates the exact in-game Roblox viewport for `pkg` (e.g. com.roblox.clienw) while
-     * explicitly ignoring full-display containers (`w >= fullW - 24 && h >= fullH - 96`)
-     * and trimming the floating window titlebar (`~38px`) so only the inside of that
-     * player's Roblox screen is captured.
-     */
     fun findWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
         val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
         val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
@@ -506,7 +501,6 @@ object PilotCore {
         var bestWindowRect: Rect? = null
         var bestWindowArea = 0
 
-        // 1. Parse `dumpsys window windows` for the exact package window / SurfaceView
         val winDump = SuShell.exec("dumpsys window windows 2>/dev/null")
         if (winDump.isNotEmpty()) {
             for (block in winDump.split("Window #")) {
@@ -567,7 +561,6 @@ object PilotCore {
             }
         }
 
-        // 2. Parse `dumpsys SurfaceFlinger` BLAST SurfaceView layers
         if (bestSurfaceRect == null && bestWindowRect == null) {
             val sfDump = SuShell.exec("dumpsys SurfaceFlinger 2>/dev/null")
             if (sfDump.isNotEmpty()) {
@@ -604,7 +597,6 @@ object PilotCore {
             }
         }
 
-        // 3. Parse `dumpsys activity activities` Task bounds for `pkg`
         if (bestSurfaceRect == null && bestWindowRect == null) {
             val actDump = SuShell.exec("dumpsys activity activities 2>/dev/null")
             if (actDump.isNotEmpty()) {
@@ -630,7 +622,6 @@ object PilotCore {
 
         if (bestSurfaceRect != null) return bestSurfaceRect
         if (bestWindowRect != null) {
-            // Trim the floating window's blue titlebar (~38px) & 2px border so only the inner Roblox screen remains
             val topTrim = if (bestWindowRect.height() > 220) 38 else 0
             val sideTrim = if (bestWindowRect.width() > 220) 2 else 0
             return Rect(
@@ -651,7 +642,6 @@ object PilotCore {
         if (!pkg.isNullOrEmpty() && tapInsideFirst) {
             val preBounds = findWindowBounds(pkg, 1280, 720)
             if (preBounds != null) {
-                // Tap safe top-center inside the Roblox game viewport to wake/focus the window
                 val tapX = preBounds.centerX().coerceAtLeast(10)
                 val tapY = (preBounds.top + 28).coerceAtMost(preBounds.bottom - 10)
                 SuShell.exec("input tap $tapX $tapY")
@@ -823,6 +813,110 @@ object PilotCore {
         return ok to count
     }
 
+    @Synchronized
+    fun injectCookie(c: Context, pkg: String, rawCookie: String): Pair<Boolean, String> {
+        var clean = rawCookie.trim().trim('"', '\'', '`')
+        if (clean.startsWith(".ROBLOSECURITY=", ignoreCase = true)) {
+            clean = clean.substringAfter("=")
+        }
+        clean = clean.replace(Regex("""[\r\n\t]"""), "").trim()
+        if (clean.length < 50) {
+            return false to "Cookie is too short or invalid."
+        }
+
+        val pkgCheck = SuShell.exec("[ -d '/data/data/$pkg' ] && echo OK").trim()
+        if (pkgCheck != "OK") {
+            return false to "Package `$pkg` is not installed on this cloud phone."
+        }
+
+        SuShell.exec("am force-stop $pkg")
+
+        val cookieDir = "/data/data/$pkg/app_webview/Default"
+        val cookiePath = "$cookieDir/Cookies"
+        val hasDb = SuShell.exec("[ -f '$cookiePath' ] && echo YES").trim() == "YES"
+        if (!hasDb) {
+            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 && sleep 4 && am force-stop $pkg")
+        }
+
+        val tmpDb = File(c.cacheDir, "ck_${System.nanoTime()}.db")
+        SuShell.exec("cp '$cookiePath' '${tmpDb.absolutePath}' 2>/dev/null && cp '${cookiePath}-wal' '${tmpDb.absolutePath}-wal' 2>/dev/null && cp '${cookiePath}-shm' '${tmpDb.absolutePath}-shm' 2>/dev/null && chmod 666 '${tmpDb.absolutePath}'*")
+
+        if (!tmpDb.exists() || tmpDb.length() == 0L) {
+            return false to "Could not read WebView Cookies database for `$pkg`."
+        }
+
+        val writeOk = runCatching {
+            val db = SQLiteDatabase.openDatabase(tmpDb.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
+            val cols = HashSet<String>()
+            db.rawQuery("PRAGMA table_info(cookies)", null).use { cur ->
+                while (cur.moveToNext()) {
+                    cols.add(cur.getString(1).lowercase())
+                }
+            }
+            if (cols.isEmpty()) {
+                db.close()
+                return@runCatching false
+            }
+
+            db.delete("cookies", "name = ? AND host_key LIKE ?", arrayOf(".ROBLOSECURITY", "%roblox.com"))
+
+            val nowMicros = (System.currentTimeMillis() / 1000L + 11644473600L) * 1_000_000L
+            val expMicros = nowMicros + (365L * 86400L * 1_000_000L)
+
+            val cv = ContentValues().apply {
+                if ("creation_utc" in cols) put("creation_utc", nowMicros)
+                if ("host_key" in cols) put("host_key", ".roblox.com")
+                if ("top_frame_site_key" in cols) put("top_frame_site_key", "")
+                if ("name" in cols) put("name", ".ROBLOSECURITY")
+                if ("value" in cols) put("value", clean)
+                if ("encrypted_value" in cols) put("encrypted_value", ByteArray(0))
+                if ("path" in cols) put("path", "/")
+                if ("expires_utc" in cols) put("expires_utc", expMicros)
+                if ("is_secure" in cols) put("is_secure", 1)
+                if ("is_httponly" in cols) put("is_httponly", 1)
+                if ("last_access_utc" in cols) put("last_access_utc", nowMicros)
+                if ("has_expires" in cols) put("has_expires", 1)
+                if ("is_persistent" in cols) put("is_persistent", 1)
+                if ("priority" in cols) put("priority", 1)
+                if ("samesite" in cols) put("samesite", -1)
+                if ("source_scheme" in cols) put("source_scheme", 2)
+                if ("source_port" in cols) put("source_port", 443)
+                if ("last_update_utc" in cols) put("last_update_utc", nowMicros)
+                if ("source_type" in cols) put("source_type", 0)
+                if ("has_cross_site_ancestor" in cols) put("has_cross_site_ancestor", 0)
+            }
+
+            db.insertOrThrow("cookies", null, cv)
+            db.close()
+            true
+        }.getOrDefault(false)
+
+        if (!writeOk) {
+            c.cacheDir.listFiles { f -> f.name.startsWith(tmpDb.name) }?.forEach { it.delete() }
+            return false to "Failed to write `.ROBLOSECURITY` into SQLite database."
+        }
+
+        val restoreSh = """
+            mkdir -p '$cookieDir'
+            rm -f '${cookiePath}-wal' '${cookiePath}-shm'
+            cp '${tmpDb.absolutePath}' '$cookiePath'
+            uid=${'$'}(stat -c '%u:%g' /data/data/$pkg 2>/dev/null)
+            if [ -n "${'$'}uid" ]; then
+              chown -R ${'$'}uid '$cookieDir' 2>/dev/null
+            fi
+            restorecon -RF /data/data/$pkg 2>/dev/null
+            monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+        """.trimIndent()
+        SuShell.exec(restoreSh)
+        c.cacheDir.listFiles { f -> f.name.startsWith(tmpDb.name) }?.forEach { it.delete() }
+
+        runCatching { Thread.sleep(3500) }
+        val updated = scanRbx(c).firstOrNull { it.pkg == pkg }
+        val loggedUser = updated?.user?.takeIf { it != "Empty" } ?: "Session Loaded"
+        log("[COOKIE] Injected into $pkg -> $loggedUser")
+        return true to loggedUser
+    }
+
     fun fmtLine(idx: Int, a: AccInfo): String {
         val tag = when (a.status) {
             "ACTIVE" -> "🟢 *(Running)*"
@@ -863,7 +957,6 @@ class DiscordBot(private val ctx: Context) {
     @Volatile private var botId: String = ""
     @Volatile private var alive = true
 
-    // Coordinator state for multi-phone check-ins (PILOT_HERE:<anchorMsgId>:<cloud>:<ver>)
     private val checkIns = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
     private val checkInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
 
@@ -888,7 +981,6 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    // !checkstatus <username> [click] — taps/focuses the player's Roblox window and crops strictly inside it
     fun sendAccountShot(ch: String, triggerMsgId: String, rawQuery: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
@@ -1006,7 +1098,6 @@ class DiscordBot(private val ctx: Context) {
         if (authorId == botId) {
             when {
                 content.startsWith("PILOT_HERE:") -> {
-                    // PILOT_HERE:<anchorMsgId>:<cloud>:<ver>
                     val p = content.split(":", limit = 4)
                     if (p.size >= 4) {
                         val anchor = p[1]
@@ -1059,6 +1150,9 @@ class DiscordBot(private val ctx: Context) {
                     "**🛠️ Pilot Sync Config Builder**\nClick the button below to enter your **Bot Token** (include one `@` inside to bypass Discord's scanner) and **Allowed User/Role ID(s)** (comma-separated):",
                     row
                 )
+            }
+            "!cookielogin", "!login" -> ioExec.execute {
+                collectAndPostSharedCloudMenu(ch, msgId, "ck", "**🍪 Select Cloud Phone to Login via Cookie:**")
             }
             "!scan" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "s", "**Select Cloud to Scan:**")
@@ -1189,14 +1283,12 @@ class DiscordBot(private val ctx: Context) {
         return pa.size.compareTo(pb.size)
     }
 
-    /**
-     * Single-Coordinator Collector:
-     * - One phone becomes the Coordinator (the lowest-ID canonical message).
-     * - All other online phones post a tiny `PILOT_HERE` check-in and do NOT `PATCH` the message.
-     * - The Coordinator collects all check-ins over 2.2s, deletes the `PILOT_HERE` messages, and
-     *   performs ONE clean `PATCH` so no cloud phone is ever overwritten or dropped.
-     */
-    private fun electAndCollectClouds(ch: String, anchorMsgId: String, title: String, initialBuilder: (String, String) -> JSONObject): Pair<String, Map<String, String>>? {
+    private fun electAndCollectClouds(
+        ch: String,
+        anchorMsgId: String,
+        title: String,
+        initialBuilder: (String, String) -> JSONObject
+    ): Pair<String, Map<String, String>>? {
         val myCloud = PilotCore.getCloud(ctx)
         val myVer = PilotCore.APP_VERSION
         val map = checkIns.computeIfAbsent(anchorMsgId) { ConcurrentHashMap() }
@@ -1205,7 +1297,8 @@ class DiscordBot(private val ctx: Context) {
         val jitterMs = (abs(myCloud.hashCode()) % 14) * 95L
         if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
 
-        var existing = findCanonicalBotMessage(ch, anchorMsgId, title)
+        val existing = findCanonicalBotMessage(ch, anchorMsgId, title)
+        val targetId: String
         if (existing == null) {
             val initBody = initialBuilder(myCloud, myVer)
             val postedRaw = apiPost("https://discord.com/api/v10/channels/$ch/messages", initBody)
@@ -1213,26 +1306,21 @@ class DiscordBot(private val ctx: Context) {
 
             runCatching { Thread.sleep(300) }
             val canonical = findCanonicalBotMessage(ch, anchorMsgId, title)
-            if (canonical != null && postedId.isNotEmpty() && canonical.getString("id") != postedId) {
-                // Another phone won coordinator election; remove duplicate and send check-in
+            if (canonical != null && postedId.isNotEmpty() && canonical.optString("id") != postedId) {
                 apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
                 sendMsg(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
                 return null
             }
-            existing = canonical ?: JSONObject().put("id", postedId)
+            targetId = canonical?.optString("id")?.takeIf { it.isNotEmpty() } ?: postedId
         } else {
-            // Another phone is already the Coordinator; send check-in and exit
             sendMsg(ch, "PILOT_HERE:$anchorMsgId:$myCloud:$myVer")
             return null
         }
 
-        val targetId = existing.optString("id")
         if (targetId.isEmpty()) return null
 
-        // Coordinator waits 2.2 seconds to gather all online cloud phones
         runCatching { Thread.sleep(2200) }
 
-        // Also scan recent messages in case a PILOT_HERE arrived just before WebSocket listener indexed it
         val recentRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$anchorMsgId&limit=50")
         runCatching {
             val arr = JSONArray(recentRaw)
@@ -1250,7 +1338,6 @@ class DiscordBot(private val ctx: Context) {
             }
         }
 
-        // Clean up any queued check-in messages
         val q = checkInMsgIds.remove(anchorMsgId)
         if (q != null) {
             while (true) {
@@ -1459,6 +1546,7 @@ class DiscordBot(private val ctx: Context) {
             • *Lua Trigger:* Call `getgenv().PilotSnap()` inside any Delta script
 
             **⚙️ Account & Cloud Management**
+            • `!cookielogin` — Inject a `.ROBLOSECURITY` cookie into any Roblox slot via modal form and launch it
             • `!createconfig` — Build a new `XXXXXXX-...` Sync Code (supports `@` token bypass & multiple User/Role IDs)
             • `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
             • `!logout` — Log out one or all accounts on a cloud (keeps last username history)
@@ -1540,6 +1628,41 @@ class DiscordBot(private val ctx: Context) {
         val myCloud = PilotCore.getCloud(ctx)
 
         if (intType == 5) {
+            if (cid.startsWith("pilot_ck_modal:")) {
+                val p = cid.removePrefix("pilot_ck_modal:").split(":", limit = 2)
+                if (p.size < 2 || !p[1].equals(myCloud, ignoreCase = true)) return
+                if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                    replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                    return
+                }
+                val targetPkg = p[0]
+                var rawCookie = ""
+                val rows = data.optJSONArray("components")
+                if (rows != null) {
+                    for (r in 0 until rows.length()) {
+                        val comps = rows.getJSONObject(r).optJSONArray("components") ?: continue
+                        for (c in 0 until comps.length()) {
+                            val item = comps.getJSONObject(c)
+                            if (item.optString("custom_id") == "cookie") {
+                                rawCookie = item.optString("value", "")
+                            }
+                        }
+                    }
+                }
+                replyInteraction(id, token, 4, JSONObject().put("content", "⏳ Injecting cookie into **$myCloud** (`$targetPkg`) and launching Roblox...").put("flags", 64))
+                ioExec.execute {
+                    val (ok, info) = PilotCore.injectCookie(ctx, targetPkg, rawCookie)
+                    if (ch.isNotEmpty()) {
+                        if (ok) {
+                            sendMsg(ch, "✅ **Cookie Login Complete!**\n• **Cloud:** **$myCloud**\n• **Slot:** `$targetPkg`\n• **Account:** **$info**")
+                        } else {
+                            sendMsg(ch, "❌ **Cookie Login Failed** on **$myCloud** (`$targetPkg`): $info")
+                        }
+                    }
+                }
+                return
+            }
+
             if (!cid.startsWith("pilot_cfg_modal:")) return
             val targetCloud = cid.removePrefix("pilot_cfg_modal:")
             if (!targetCloud.equals(myCloud, ignoreCase = true)) return
@@ -1629,6 +1752,37 @@ class DiscordBot(private val ctx: Context) {
 
             if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
                 replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                return
+            }
+
+            if (mode == "ck") {
+                val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+                if (list.isEmpty()) {
+                    replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No Roblox clones found.").put("flags", 64))
+                    return
+                }
+                val opts = JSONArray()
+                list.take(25).forEachIndexed { i, a ->
+                    opts.put(
+                        JSONObject()
+                            .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})")
+                            .put("value", a.pkg)
+                            .put("description", "Inject .ROBLOSECURITY cookie into ${a.pkg}")
+                    )
+                }
+                val menu = JSONObject()
+                    .put("type", 3)
+                    .put("custom_id", "pilot_ck_slot:pick:$myCloud")
+                    .put("placeholder", "Pick Roblox slot on $myCloud...")
+                    .put("options", opts)
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+                replyInteraction(
+                    id, token, 4,
+                    JSONObject()
+                        .put("content", "**🍪 $myCloud** — Select which Roblox slot to log into:\n${PilotCore.fmtAll(list)}")
+                        .put("components", row)
+                        .put("flags", 64)
+                )
                 return
             }
 
@@ -1727,7 +1881,25 @@ class DiscordBot(private val ctx: Context) {
             return
         }
 
-        if (kind == "pilot_cs2") {
+        if (kind == "pilot_ck_slot") {
+            val targetPkg = sel
+            val fCookie = JSONObject()
+                .put("type", 4)
+                .put("custom_id", "cookie")
+                .put("label", ".ROBLOSECURITY Cookie")
+                .put("style", 2)
+                .put("min_length", 50)
+                .put("max_length", 2500)
+                .put("placeholder", "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in...")
+                .put("required", true)
+
+            val modalData = JSONObject()
+                .put("custom_id", "pilot_ck_modal:$targetPkg:$myCloud")
+                .put("title", "Cookie Login ($targetPkg)")
+                .put("components", JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(fCookie))))
+
+            replyInteraction(id, token, 9, modalData)
+        } else if (kind == "pilot_cs2") {
             val srcPkg = sel.substringBefore("|")
             val srcUser = sel.substringAfter("|", "")
             val header = "**📦 Moving `$srcUser`** (from **$myCloud** `$srcPkg`)\nSelect Destination Cloud Phone:"
