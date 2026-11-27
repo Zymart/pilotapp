@@ -252,7 +252,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.8"
+    const val APP_VERSION = "v1.3.9"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -1335,9 +1335,8 @@ class DiscordBot(private val ctx: Context) {
             val atts = d.optJSONArray("attachments")
             val hasFile = atts != null && atts.length() > 0
             val isSkip = content.equals("skip", ignoreCase = true)
-            val isInlineJson = content.startsWith("{") && content.endsWith("}")
 
-            if (hasFile || isSkip || isInlineJson) {
+            if (hasFile || isSkip || (!content.startsWith("!") && content.isNotEmpty())) {
                 if (isSkip) {
                     awaiting.skipJson = true
                 } else if (hasFile) {
@@ -1961,7 +1960,7 @@ class DiscordBot(private val ctx: Context) {
             **📖 PILOT BOT COMMANDS (${PilotCore.APP_VERSION})**
 
             **🚀 Account Launch & Setup**
-            • `!accountlaunch` (or `!al`) — Submit `.ROBLOSECURITY` cookie via modal, resolve username, upload Nousigi Hub JSON (`message.txt`), pick an available UGPhone slot & launch
+            • `!accountlaunch` (or `!al`) — Submit `.ROBLOSECURITY` cookie via modal, resolve username, upload Nousigi Hub config (`message.txt`), pick an available UGPhone slot & launch
 
             **🔍 Monitoring & Search**
             • `!scan` — Select a cloud phone to list all Roblox instances & statuses
@@ -2162,7 +2161,7 @@ class DiscordBot(private val ctx: Context) {
                             "• **Account:** `$nameOrErr` (`$rbxUid`)\n" +
                             "• **Target Config:** `${AccountLaunchManager.NOUSIGI_DIR}/${nameOrErr}_${gameSuffix}.json`\n" +
                             "• **Session:** `$sid`\n\n" +
-                            "📄 **Next Step:** Send your Nousigi Hub JSON file (`message.txt` or `.json`) in this channel now — or type `skip` to launch without a config file *(type `!cancel` to abort)*."
+                            "📄 **Next Step:** Send your Nousigi Hub config file (`message.txt` or `.json`) or paste the text in this channel now — or type `skip` to launch without a config file *(type `!cancel` to abort)*."
                         )
                     }
                 }
