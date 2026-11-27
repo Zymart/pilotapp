@@ -234,7 +234,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.2.8"
+    const val APP_VERSION = "v1.3.0"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -472,40 +472,7 @@ object PilotCore {
 
     @Synchronized
     fun installAutoExec(c: Context) {
-        val lua = """
-            repeat task.wait(0.5) until game:IsLoaded()
-            local Players = game:GetService("Players")
-            local HttpService = game:GetService("HttpService")
-
-            local lp = Players.LocalPlayer
-            while not lp do
-                task.wait(0.5)
-                lp = Players.LocalPlayer
-            end
-
-            local req = request or http_request or (syn and syn.request)
-            if not req then return end
-
-            local function snapMe()
-                pcall(function()
-                    req({
-                        Url = "http://127.0.0.1:8765/ss?user=" .. HttpService:UrlEncode(lp.Name),
-                        Method = "GET"
-                    })
-                end)
-            end
-
-            getgenv().PilotSnap = snapMe
-
-            task.spawn(function()
-                task.wait(5)
-                snapMe()
-                while task.wait(3600) do
-                    snapMe()
-                end
-            end)
-        """.trimIndent()
-
+        val lua = Rejoiner.buildBridgeLua()
         runCatching {
             val tmp = File(c.filesDir, "pilot_bridge.lua")
             tmp.writeText(lua)
@@ -1194,6 +1161,31 @@ class DiscordBot(private val ctx: Context) {
             "!cookielogin", "!login" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "ck", "**🍪 Select Cloud Phone to Login via Cookie:**")
             }
+            "!autorejoin", "!ar" -> ioExec.execute {
+                collectAndPostSharedCloudMenu(ch, msgId, "ar", "**🔁 Select Cloud Phone to Configure Auto-Rejoin:**")
+            }
+            "!rejoin" -> {
+                if (arg.isEmpty()) {
+                    ioExec.execute {
+                        if (!hasBotRepliedAfter(ch, msgId)) sendMsg(ch, "⚠️ **Missing username!** Usage: `!rejoin <username>`")
+                    }
+                } else {
+                    ioExec.execute {
+                        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+                        val q = arg.lowercase()
+                        val match = list.firstOrNull { it.user != "Empty" && (it.user.lowercase().contains(q) || PilotCore.similarity(q, it.user.lowercase()) >= 0.45) }
+                        if (match != null) {
+                            sendMsg(ch, "🔁 **📱 $cl** — Force-rejoining **${match.user}** (`${match.pkg}`)...")
+                            Rejoiner.relaunch(ctx, match.pkg)
+                        } else {
+                            runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
+                            if (!hasBotRepliedAfter(ch, msgId)) {
+                                sendMsg(ch, "⚠️ No matching account found for `$arg` on any online cloud phone.")
+                            }
+                        }
+                    }
+                }
+            }
             "!scan" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "s", "**Select Cloud to Scan:**")
             }
@@ -1580,6 +1572,10 @@ class DiscordBot(private val ctx: Context) {
             • `!checkstatus <username> [click]` — Capture **only** inside that player's Roblox screen (add `click` to tap/focus it first)
             • `!version` — Show the installed Pilot version on every online cloud phone
 
+            **🔁 All-in-One Auto-Rejoiner**
+            • `!autorejoin` — Toggle Auto-Rejoin ON/OFF or set a Place ID / Private Server link
+            • `!rejoin <username>` — Immediately force-restart & rejoin a specific account
+
             **📸 Screenshots & Auto-Capture**
             • `!ss` — Select a cloud phone for a full-screen screenshot (or `!ss all`)
             • `!sschannel` — Set this channel for hourly Delta auto-screenshots & Lua triggers
@@ -1668,6 +1664,43 @@ class DiscordBot(private val ctx: Context) {
         val myCloud = PilotCore.getCloud(ctx)
 
         if (intType == 5) {
+            if (cid.startsWith("pilot_ar_modal:")) {
+                val targetCloud = cid.removePrefix("pilot_ar_modal:")
+                if (!targetCloud.equals(myCloud, ignoreCase = true)) return
+                if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                    replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                    return
+                }
+                var targetLink = ""
+                val rows = data.optJSONArray("components")
+                if (rows != null) {
+                    for (r in 0 until rows.length()) {
+                        val comps = rows.getJSONObject(r).optJSONArray("components") ?: continue
+                        for (c in 0 until comps.length()) {
+                            val item = comps.getJSONObject(c)
+                            if (item.optString("custom_id") == "target") {
+                                targetLink = item.optString("value", "")
+                            }
+                        }
+                    }
+                }
+                Rejoiner.setConfig(ctx, enabled = true, target = targetLink)
+                val displayTarget = targetLink.trim().ifEmpty { "Auto-detect each account's last Place ID" }
+                replyInteraction(
+                    id, token, 4,
+                    JSONObject()
+                        .put(
+                            "content",
+                            "✅ **Auto-Rejoiner Enabled on $myCloud!**\n" +
+                            "• **Target:** `$displayTarget`\n" +
+                            "• **Checks:** Delta Heartbeat + Freeze Detector + Roblox Presence API + Process Watchdog\n" +
+                            "• **Teleport Protection:** Active (pauses during place-to-place teleports)"
+                        )
+                        .put("flags", 64)
+                )
+                return
+            }
+
             if (cid.startsWith("pilot_ck_modal:")) {
                 val p = cid.removePrefix("pilot_ck_modal:").split(":", limit = 2)
                 if (p.size < 2 || !p[1].equals(myCloud, ignoreCase = true)) return
@@ -1792,6 +1825,29 @@ class DiscordBot(private val ctx: Context) {
 
             if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
                 replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                return
+            }
+
+            if (mode == "ar") {
+                val enabled = Rejoiner.isEnabled(ctx)
+                val curTarget = Rejoiner.getTarget(ctx).ifEmpty { "Auto (Last Place ID)" }
+                val opts = JSONArray()
+                    .put(JSONObject().put("label", "✅ Enable Auto-Rejoin (Auto Last Place)").put("value", "ON_AUTO").put("description", "Rejoin each account's last Place ID automatically"))
+                    .put(JSONObject().put("label", "🔗 Enable Auto-Rejoin (Custom Place / VIP Link)").put("value", "ON_LINK").put("description", "Enter a specific Place ID or Private Server URL"))
+                    .put(JSONObject().put("label", "🛑 Disable Auto-Rejoin").put("value", "OFF").put("description", "Turn off automatic rejoin monitoring on $myCloud"))
+                val menu = JSONObject()
+                    .put("type", 3)
+                    .put("custom_id", "pilot_ar_act:cfg:$myCloud")
+                    .put("placeholder", "Choose Auto-Rejoin action for $myCloud...")
+                    .put("options", opts)
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+                replyInteraction(
+                    id, token, 4,
+                    JSONObject()
+                        .put("content", "**🔁 $myCloud — Auto-Rejoiner Settings**\n• **Status:** ${if (enabled) "🟢 ON" else "🔴 OFF"}\n• **Target:** `$curTarget`")
+                        .put("components", row)
+                        .put("flags", 64)
+                )
                 return
             }
 
@@ -1921,7 +1977,34 @@ class DiscordBot(private val ctx: Context) {
             return
         }
 
-        if (kind == "pilot_ck_slot") {
+        if (kind == "pilot_ar_act") {
+            when (sel) {
+                "ON_AUTO" -> {
+                    Rejoiner.setConfig(ctx, enabled = true, target = "")
+                    replyInteraction(id, token, 7, JSONObject().put("content", "✅ **Auto-Rejoiner Enabled** on **$myCloud** (Auto Last Place ID + Freeze & Teleport Guard).").put("components", JSONArray()))
+                }
+                "OFF" -> {
+                    Rejoiner.setConfig(ctx, enabled = false, target = Rejoiner.getTarget(ctx))
+                    replyInteraction(id, token, 7, JSONObject().put("content", "🛑 **Auto-Rejoiner Disabled** on **$myCloud**.").put("components", JSONArray()))
+                }
+                "ON_LINK" -> {
+                    val fTarget = JSONObject()
+                        .put("type", 4)
+                        .put("custom_id", "target")
+                        .put("label", "Place ID or Private Server URL")
+                        .put("style", 1)
+                        .put("min_length", 4)
+                        .put("max_length", 300)
+                        .put("placeholder", "e.g. 2753915549 or https://www.roblox.com/games/...")
+                        .put("required", false)
+                    val modal = JSONObject()
+                        .put("custom_id", "pilot_ar_modal:$myCloud")
+                        .put("title", "Auto-Rejoin Target ($myCloud)")
+                        .put("components", JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(fTarget))))
+                    replyInteraction(id, token, 9, modal)
+                }
+            }
+        } else if (kind == "pilot_ck_slot") {
             val targetPkg = sel
             val fCookie = JSONObject()
                 .put("type", 4)
@@ -2060,7 +2143,7 @@ class PilotService : Service() {
     private var bot: DiscordBot? = null
     private var wl: PowerManager.WakeLock? = null
     private val syncExec = Executors.newSingleThreadScheduledExecutor()
-    private val bridgePool = Executors.newFixedThreadPool(2)
+    private val bridgePool = Executors.newFixedThreadPool(3)
     private var localServer: ServerSocket? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -2079,7 +2162,7 @@ class PilotService : Service() {
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
-            .setContentText("GVIP Optimized • Auto-syncing Roblox")
+            .setContentText("GVIP Optimized • Watchdog & Roblox Bridge Active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)
@@ -2098,13 +2181,18 @@ class PilotService : Service() {
             }
         }, 1, 10, TimeUnit.SECONDS)
 
+        // Delegated to Rejoiner.kt
+        syncExec.scheduleAtFixedRate({
+            runCatching { Rejoiner.tick(this) }
+        }, 15, 15, TimeUnit.SECONDS)
+
         syncExec.scheduleAtFixedRate({
             AppUpdater.checkAndInstall(this, force = false)
         }, 5, 30, TimeUnit.MINUTES)
 
         Thread {
             runCatching {
-                localServer = ServerSocket(8765, 20, InetAddress.getByName("127.0.0.1"))
+                localServer = ServerSocket(8765, 30, InetAddress.getByName("127.0.0.1"))
                 while (isRunning) {
                     val sock = localServer?.accept() ?: break
                     bridgePool.execute {
@@ -2112,12 +2200,18 @@ class PilotService : Service() {
                             val reqLine = sock.getInputStream().bufferedReader().readLine() ?: ""
                             sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
                             sock.close()
-                            val userParam = Regex("""[?&]user=([^&\s]+)""").find(reqLine)?.groupValues?.get(1)
-                            val ch = PilotCore.getSsChannel(this)
-                            if (!userParam.isNullOrEmpty() && ch.isNotEmpty()) {
-                                val user = URLDecoder.decode(userParam, "UTF-8")
-                                PilotCore.log("[LUA-SS] $user")
-                                bot?.sendLuaWindowShot(ch, user)
+
+                            val pathAndQuery = reqLine.substringAfter(" ", "").substringBefore(" ")
+                            if (Rejoiner.handleBridgeRequest(this, pathAndQuery)) return@runCatching
+
+                            if (pathAndQuery.startsWith("/ss")) {
+                                val userParam = Regex("""[?&]user=([^&\s]+)""").find(pathAndQuery)?.groupValues?.get(1)
+                                val user = if (!userParam.isNullOrEmpty()) URLDecoder.decode(userParam, "UTF-8").trim() else ""
+                                val ch = PilotCore.getSsChannel(this)
+                                if (user.isNotEmpty() && ch.isNotEmpty()) {
+                                    PilotCore.log("[LUA-SS] $user")
+                                    bot?.sendLuaWindowShot(ch, user)
+                                }
                             }
                         }
                     }
