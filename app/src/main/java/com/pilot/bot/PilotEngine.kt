@@ -252,7 +252,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.4"
+    const val APP_VERSION = "v1.3.5"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -539,10 +539,6 @@ object PilotCore {
         return null
     }
 
-    /**
-     * Finds the outer DecorView floating window frame (including title bar) for `pkg`.
-     * Used to locate the [□] maximize icon at (outer.right - 46, outer.top + 17) on UGPhone.
-     */
     fun findOuterWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
         val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
         val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
@@ -638,7 +634,6 @@ object PilotCore {
         var tappedMaxBtn: Pair<Int, Int>? = null
         val afterBounds = findOuterWindowBounds(pkg, fullW, fullH) ?: preBounds
         if (afterBounds != null && (afterBounds.width() < fullW - 60 || afterBounds.height() < fullH - 120)) {
-            // Tap the [□] maximize icon inside the floating window's top-right title bar (to the left of X)
             val maxBtnX = (afterBounds.right - 46).coerceIn(10, fullW - 10)
             val maxBtnY = (afterBounds.top + 17).coerceIn(8, fullH - 10)
             SuShell.exec("input tap $maxBtnX $maxBtnY")
@@ -962,12 +957,14 @@ object PilotCore {
     }
 
     @Synchronized
-    fun injectCookie(c: Context, pkg: String, rawCookie: String): Pair<Boolean, String> {
-        var clean = rawCookie.trim().trim('"', '\'', '`')
-        if (clean.startsWith(".ROBLOSECURITY=", ignoreCase = true)) {
-            clean = clean.substringAfter("=")
-        }
-        clean = clean.replace(Regex("""[\r\n\t]"""), "").trim()
+    fun injectCookie(
+        c: Context,
+        pkg: String,
+        rawCookie: String,
+        knownUser: String = "",
+        knownUserId: Long = 0L
+    ): Pair<Boolean, String> {
+        val clean = AccountLaunchManager.sanitizeCookie(rawCookie)
         if (clean.length < 50) {
             return false to "Cookie is too short or invalid."
         }
@@ -977,7 +974,8 @@ object PilotCore {
             return false to "Package `$pkg` is not installed on this cloud phone."
         }
 
-        SuShell.exec("am force-stop $pkg")
+        // Force-stop and clear stale cached session metadata so the new cookie loads cleanly
+        SuShell.exec("am force-stop $pkg && rm -rf /data/data/$pkg/shared_prefs/* /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/*")
 
         val cookieDir = "/data/data/$pkg/app_webview/Default"
         val cookiePath = "$cookieDir/Cookies"
@@ -1044,6 +1042,13 @@ object PilotCore {
             return false to "Failed to write `.ROBLOSECURITY` into SQLite database."
         }
 
+        val launchUri = if (Rejoiner.isEnabled(c)) Rejoiner.buildLaunchUri(c, pkg, null) else ""
+        val launchCmd = if (launchUri.isNotEmpty()) {
+            "am start -a android.intent.action.VIEW -d '$launchUri' -p $pkg >/dev/null 2>&1"
+        } else {
+            "monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"
+        }
+
         val restoreSh = """
             mkdir -p '$cookieDir'
             rm -f '${cookiePath}-wal' '${cookiePath}-shm'
@@ -1053,15 +1058,20 @@ object PilotCore {
               chown -R ${'$'}uid '$cookieDir' 2>/dev/null
             fi
             restorecon -RF /data/data/$pkg 2>/dev/null
-            monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+            $launchCmd
         """.trimIndent()
         SuShell.exec(restoreSh)
         c.cacheDir.listFiles { f -> f.name.startsWith(tmpDb.name) }?.forEach { it.delete() }
 
+        if (knownUser.isNotEmpty()) {
+            histPrefs(c).edit().putString(pkg, knownUser).apply()
+            if (knownUserId > 0L) Rejoiner.saveUserId(c, knownUser, knownUserId)
+        }
+
         runCatching { Thread.sleep(3500) }
         val updated = scanRbx(c).firstOrNull { it.pkg == pkg }
-        val loggedUser = updated?.user?.takeIf { it != "Empty" } ?: "Session Loaded"
-        log("[COOKIE] Injected into $pkg -> $loggedUser")
+        val loggedUser = knownUser.ifEmpty { updated?.user?.takeIf { it != "Empty" } ?: "Session Loaded" }
+        log("[LAUNCH] Cookie injected into $pkg -> $loggedUser")
         return true to loggedUser
     }
 
@@ -1107,6 +1117,10 @@ class DiscordBot(private val ctx: Context) {
 
     private val checkIns = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
     private val checkInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
+
+    // Dedicated check-in tracking for !accountlaunch (only phones with Empty/Logged Out slots)
+    private val freeCheckIns = ConcurrentHashMap<String, ConcurrentHashMap<String, Pair<String, Int>>>()
+    private val freeCheckInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
 
     fun start() { connect() }
 
@@ -1255,6 +1269,39 @@ class DiscordBot(private val ctx: Context) {
                         }
                     }
                 }
+                content.startsWith("PILOT_FREE:") -> {
+                    // PILOT_FREE:<anchorMsgId>:<cloud>:<ver>:<freeCount>
+                    val p = content.split(":", limit = 5)
+                    if (p.size >= 5) {
+                        val anchor = p[1]
+                        val cloud = p[2]
+                        val ver = p[3]
+                        val freeCnt = p[4].toIntOrNull() ?: 0
+                        if (freeCnt > 0) {
+                            freeCheckIns.computeIfAbsent(anchor) { ConcurrentHashMap() }[cloud] = ver to freeCnt
+                        }
+                        val mid = d.optString("id")
+                        if (mid.isNotEmpty()) {
+                            freeCheckInMsgIds.computeIfAbsent(anchor) { ConcurrentLinkedQueue() }.add(mid)
+                        }
+                    }
+                }
+                content.startsWith("✅ **Cookie Verified!**") -> {
+                    // Sync verified username/userId & AWAITING_JSON stage across all online phones
+                    val sid = Regex("""\*\*Session:\*\*\s*`([^`]+)`""").find(content)?.groupValues?.get(1)
+                    val accMatch = Regex("""\*\*Account:\*\*\s*`([^`]+)`\s*\(`(\d+)`\)""").find(content)
+                    if (!sid.isNullOrEmpty() && accMatch != null) {
+                        AccountLaunchManager.sessions[sid]?.let { s ->
+                            s.username = accMatch.groupValues[1]
+                            s.userId = accMatch.groupValues[2].toLongOrNull() ?: 0L
+                            s.stage = LaunchStage.AWAITING_JSON
+                        }
+                    }
+                }
+                content.startsWith("❌ **Account Launch Failed**") -> {
+                    val sid = Regex("""\(`([^`]+)`\)""").find(content)?.groupValues?.get(1)
+                    if (!sid.isNullOrEmpty()) AccountLaunchManager.sessions.remove(sid)
+                }
                 content.startsWith("PILOT_PACK_REQ:") -> {
                     ioExec.execute { handlePackRequest(d) }
                 }
@@ -1266,9 +1313,40 @@ class DiscordBot(private val ctx: Context) {
         }
 
         if (!PilotCore.isAuthorized(ctx, authorId, memberRoles)) return
-        if (!content.startsWith("!")) return
         val msgId = d.optString("id", "")
         val cl = PilotCore.getCloud(ctx)
+
+        // Intercept JSON attachment / inline JSON / "skip" / "!cancel" for an active !accountlaunch session
+        val awaiting = AccountLaunchManager.findAwaitingSession(authorId, ch)
+        if (awaiting != null) {
+            if (content.equals("!cancel", ignoreCase = true)) {
+                AccountLaunchManager.sessions.remove(awaiting.sessionId)
+                if (awaiting.coordinatorCloud.equals(cl, ignoreCase = true)) {
+                    ioExec.execute { sendMsg(ch, "🛑 Cancelled **!accountlaunch** session (`${awaiting.sessionId}`).") }
+                }
+                return
+            }
+
+            val atts = d.optJSONArray("attachments")
+            val hasFile = atts != null && atts.length() > 0
+            val isSkip = content.equals("skip", ignoreCase = true)
+            val isInlineJson = content.startsWith("{") && content.endsWith("}")
+
+            if (hasFile || isSkip || isInlineJson) {
+                if (isSkip) {
+                    awaiting.skipJson = true
+                } else if (hasFile) {
+                    awaiting.jsonUrl = atts!!.getJSONObject(0).optString("url", "")
+                } else {
+                    awaiting.inlineJson = content
+                }
+                awaiting.stage = LaunchStage.PICKING_CLOUD
+                ioExec.execute { collectAndPostAvailableCloudMenu(ch, msgId, awaiting) }
+                return
+            }
+        }
+
+        if (!content.startsWith("!")) return
         val parts = content.split(" ", limit = 2)
         val cmd = parts[0].lowercase()
         val arg = parts.getOrNull(1)?.trim() ?: ""
@@ -1296,8 +1374,22 @@ class DiscordBot(private val ctx: Context) {
                     row
                 )
             }
-            "!cookielogin", "!login" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "ck", "**🍪 Select Cloud Phone to Login via Cookie:**")
+            "!accountlaunch", "!al" -> ioExec.execute {
+                val delayMs = (abs(cl.hashCode()) % 14) * 110L
+                if (delayMs > 0) runCatching { Thread.sleep(delayMs) }
+                if (hasBotRepliedAfter(ch, msgId)) return@execute
+                val sid = msgId.takeLast(8).ifEmpty { (100000..999999).random().toString() }
+                val btn = JSONObject()
+                    .put("type", 2)
+                    .put("style", 3)
+                    .put("label", "🚀 Enter Roblox Cookie")
+                    .put("custom_id", "pilot_al_btn:open:$cl:$sid")
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(btn)))
+                sendMsg(
+                    ch,
+                    "**🚀 Pilot Account Launch**\nClick the button below to submit the `.ROBLOSECURITY` cookie. Pilot will resolve the username, prompt for your Nousigi Hub JSON (`message.txt`), and let you pick an available UGPhone slot:",
+                    row
+                )
             }
             "!autorejoin", "!ar" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "ar", "**🔁 Select Cloud Phone to Configure Auto-Rejoin:**")
@@ -1453,6 +1545,130 @@ class DiscordBot(private val ctx: Context) {
         return pa.size.compareTo(pb.size)
     }
 
+    /**
+     * Collects ONLY online cloud phones that have at least one EMPTY or LOGGED OUT Roblox slot
+     * and posts a single shared dropdown for `!accountlaunch`.
+     */
+    private fun collectAndPostAvailableCloudMenu(ch: String, anchorMsgId: String, session: LaunchSession) {
+        val myCloud = PilotCore.getCloud(ctx)
+        val myVer = PilotCore.APP_VERSION
+        val freeSlots = PilotCore.scanRbx(ctx).filter { it.status == "EMPTY" || it.status == "LOGGED OUT" }
+        val freeCount = freeSlots.size
+        val title = "**🚀 Account Launch (`${session.username}`)** — Select a Cloud Phone with an available slot:"
+
+        if (freeCount == 0) {
+            if (session.coordinatorCloud.equals(myCloud, ignoreCase = true)) {
+                runCatching { Thread.sleep(3200) }
+                if (!hasBotRepliedAfter(ch, anchorMsgId)) {
+                    AccountLaunchManager.sessions.remove(session.sessionId)
+                    sendMsg(ch, "⚠️ No online cloud phones currently have an **Empty** or **Logged Out** slot available for `${session.username}`.")
+                }
+            }
+            return
+        }
+
+        val map = freeCheckIns.computeIfAbsent(anchorMsgId) { ConcurrentHashMap() }
+        map[myCloud] = myVer to freeCount
+
+        val jitterMs = (abs(myCloud.hashCode()) % 14) * 95L
+        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
+
+        val existing = findCanonicalBotMessage(ch, anchorMsgId, title)
+        val targetId: String
+        if (existing == null) {
+            val opt = JSONObject()
+                .put("label", "📱 $myCloud")
+                .put("value", myCloud)
+                .put("description", "$freeCount free slot(s) • $myVer")
+            val menu = JSONObject()
+                .put("type", 3)
+                .put("custom_id", "pilot_al_cloud:${session.sessionId}:row0")
+                .put("placeholder", "Scanning clouds with free slots...")
+                .put("options", JSONArray().put(opt))
+            val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+            val postedRaw = apiPost(
+                "https://discord.com/api/v10/channels/$ch/messages",
+                JSONObject().put("content", title).put("components", row)
+            )
+            val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
+
+            runCatching { Thread.sleep(300) }
+            val canonical = findCanonicalBotMessage(ch, anchorMsgId, title)
+            if (canonical != null && postedId.isNotEmpty() && canonical.optString("id") != postedId) {
+                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
+                sendMsg(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
+                return
+            }
+            targetId = canonical?.optString("id")?.takeIf { it.isNotEmpty() } ?: postedId
+        } else {
+            sendMsg(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
+            return
+        }
+
+        if (targetId.isEmpty()) return
+
+        runCatching { Thread.sleep(2200) }
+
+        val recentRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$anchorMsgId&limit=50")
+        runCatching {
+            val arr = JSONArray(recentRaw)
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                val c = m.optString("content")
+                if (c.startsWith("PILOT_FREE:$anchorMsgId:")) {
+                    val p = c.split(":", limit = 5)
+                    if (p.size >= 5) {
+                        val cnt = p[4].toIntOrNull() ?: 0
+                        if (cnt > 0) map[p[2]] = p[3] to cnt
+                        val mid = m.optString("id")
+                        if (mid.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$mid")
+                    }
+                }
+            }
+        }
+
+        val q = freeCheckInMsgIds.remove(anchorMsgId)
+        if (q != null) {
+            while (true) {
+                val mid = q.poll() ?: break
+                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$mid")
+            }
+        }
+
+        val sortedClouds = map.keys.sortedWith { a, b -> naturalCompare(a, b) }
+        val allOpts = sortedClouds.map { cloud ->
+            val (ver, cnt) = map[cloud] ?: (myVer to 1)
+            JSONObject()
+                .put("label", "📱 $cloud")
+                .put("value", cloud)
+                .put("description", "$cnt free slot(s) • $ver")
+        }
+        freeCheckIns.remove(anchorMsgId)
+
+        val rows = JSONArray()
+        val chunks = allOpts.chunked(25).take(5)
+        chunks.forEachIndexed { idx, chunk ->
+            val arr = JSONArray()
+            chunk.forEach { arr.put(it) }
+            val ph = if (chunks.size > 1) {
+                "Select Available Cloud (${idx * 25 + 1}–${idx * 25 + chunk.size})..."
+            } else {
+                "Select Cloud (${allOpts.size} with free slots)..."
+            }
+            val menu = JSONObject()
+                .put("type", 3)
+                .put("custom_id", "pilot_al_cloud:${session.sessionId}:row$idx")
+                .put("placeholder", ph)
+                .put("options", arr)
+            rows.put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+        }
+
+        apiPatch(
+            "https://discord.com/api/v10/channels/$ch/messages/$targetId",
+            JSONObject().put("content", title).put("components", rows)
+        )
+    }
+
     private fun electAndCollectClouds(
         ch: String,
         anchorMsgId: String,
@@ -1602,7 +1818,10 @@ class DiscordBot(private val ctx: Context) {
             val arr = JSONArray(afterRaw)
             (0 until arr.length()).any { i ->
                 val m = arr.getJSONObject(i)
-                m.optJSONObject("author")?.optString("id") == botId && !m.optString("content").startsWith("PILOT_HERE:")
+                val c = m.optString("content")
+                m.optJSONObject("author")?.optString("id") == botId &&
+                    !c.startsWith("PILOT_HERE:") &&
+                    !c.startsWith("PILOT_FREE:")
             }
         }.getOrDefault(false)
     }
@@ -1704,6 +1923,9 @@ class DiscordBot(private val ctx: Context) {
         val helpText = """
             **📖 PILOT BOT COMMANDS (${PilotCore.APP_VERSION})**
 
+            **🚀 Account Launch & Setup**
+            • `!accountlaunch` (or `!al`) — Submit `.ROBLOSECURITY` cookie via modal, resolve username, upload Nousigi Hub JSON (`message.txt`), pick an available UGPhone slot & launch
+
             **🔍 Monitoring & Search**
             • `!scan` — Select a cloud phone to list all Roblox instances & statuses
             • `!search <username>` — Find which cloud & slot has an account (exact or close match)
@@ -1720,7 +1942,6 @@ class DiscordBot(private val ctx: Context) {
             • *Lua Trigger:* Call `getgenv().PilotSnap()` inside any Delta script
 
             **⚙️ Account & Cloud Management**
-            • `!cookielogin` — Inject a `.ROBLOSECURITY` cookie into any Roblox slot via modal form and launch it
             • `!createconfig` — Build a new `XXXXXXX-...` Sync Code (supports `@` token bypass & multiple User/Role IDs)
             • `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
             • `!logout` — Log out one or all accounts on a cloud (keeps last username history)
@@ -1785,6 +2006,39 @@ class DiscordBot(private val ctx: Context) {
         replyInteraction(id, token, 9, modalData)
     }
 
+    private fun openAccountLaunchModal(id: String, token: String, targetCloud: String, sid: String) {
+        val fCookie = JSONObject()
+            .put("type", 4)
+            .put("custom_id", "cookie")
+            .put("label", ".ROBLOSECURITY Cookie")
+            .put("style", 2)
+            .put("min_length", 50)
+            .put("max_length", 2500)
+            .put("placeholder", "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in...")
+            .put("required", true)
+
+        val fGame = JSONObject()
+            .put("type", 4)
+            .put("custom_id", "game")
+            .put("label", "Nousigi Hub Game Suffix (optional)")
+            .put("style", 1)
+            .put("max_length", 60)
+            .put("value", "AnimeAdventures")
+            .put("placeholder", "AnimeAdventures")
+            .put("required", false)
+
+        val rows = JSONArray()
+            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fCookie)))
+            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fGame)))
+
+        val modalData = JSONObject()
+            .put("custom_id", "pilot_al_modal:$targetCloud:$sid")
+            .put("title", "Account Launch — Cookie Setup")
+            .put("components", rows)
+
+        replyInteraction(id, token, 9, modalData)
+    }
+
     private fun onInteraction(d: JSONObject) {
         val intType = d.optInt("type")
         if (intType != 3 && intType != 5) return
@@ -1802,6 +2056,83 @@ class DiscordBot(private val ctx: Context) {
         val myCloud = PilotCore.getCloud(ctx)
 
         if (intType == 5) {
+            if (cid.startsWith("pilot_al_modal:")) {
+                val p = cid.removePrefix("pilot_al_modal:").split(":", limit = 2)
+                if (p.size < 2) return
+                val coordinatorCloud = p[0]
+                val sid = p[1]
+
+                if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                    if (coordinatorCloud.equals(myCloud, ignoreCase = true)) {
+                        replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                    }
+                    return
+                }
+
+                var rawCookie = ""
+                var rawGame = "AnimeAdventures"
+                val rows = data.optJSONArray("components")
+                if (rows != null) {
+                    for (r in 0 until rows.length()) {
+                        val comps = rows.getJSONObject(r).optJSONArray("components") ?: continue
+                        for (c in 0 until comps.length()) {
+                            val item = comps.getJSONObject(c)
+                            when (item.optString("custom_id")) {
+                                "cookie" -> rawCookie = item.optString("value", "")
+                                "game" -> rawGame = item.optString("value", "AnimeAdventures")
+                            }
+                        }
+                    }
+                }
+
+                val gameSuffix = AccountLaunchManager.sanitizeGameSuffix(rawGame)
+                AccountLaunchManager.cleanupExpired()
+
+                // Passively cache cookie in RAM on ALL online phones so the cookie never touches Discord chat
+                val session = LaunchSession(
+                    sessionId = sid,
+                    coordinatorCloud = coordinatorCloud,
+                    authorId = userId,
+                    channelId = ch,
+                    rawCookie = rawCookie,
+                    gameSuffix = gameSuffix
+                )
+                AccountLaunchManager.sessions[sid] = session
+
+                // Only the coordinator phone verifies the cookie and replies to Discord
+                if (!coordinatorCloud.equals(myCloud, ignoreCase = true)) return
+
+                replyInteraction(
+                    id, token, 4,
+                    JSONObject().put("content", "⏳ Verifying `.ROBLOSECURITY` cookie with Roblox...").put("flags", 64)
+                )
+
+                ioExec.execute {
+                    val (ok, rbxUid, nameOrErr) = AccountLaunchManager.resolveCookieUser(rawCookie)
+                    if (!ok) {
+                        AccountLaunchManager.sessions.remove(sid)
+                        if (ch.isNotEmpty()) {
+                            sendMsg(ch, "❌ **Account Launch Failed** (`$sid`): $nameOrErr")
+                        }
+                        return@execute
+                    }
+                    session.username = nameOrErr
+                    session.userId = rbxUid
+                    session.stage = LaunchStage.AWAITING_JSON
+                    if (ch.isNotEmpty()) {
+                        sendMsg(
+                            ch,
+                            "✅ **Cookie Verified!**\n" +
+                            "• **Account:** `$nameOrErr` (`$rbxUid`)\n" +
+                            "• **Target Config:** `${AccountLaunchManager.NOUSIGI_DIR}/${nameOrErr}_${gameSuffix}.json`\n" +
+                            "• **Session:** `$sid`\n\n" +
+                            "📄 **Next Step:** Send your Nousigi Hub JSON file (`message.txt` or `.json`) in this channel now — or type `skip` to launch without a config file *(type `!cancel` to abort)*."
+                        )
+                    }
+                }
+                return
+            }
+
             if (cid.startsWith("pilot_ar_modal:")) {
                 val targetCloud = cid.removePrefix("pilot_ar_modal:")
                 if (!targetCloud.equals(myCloud, ignoreCase = true)) return
@@ -1836,41 +2167,6 @@ class DiscordBot(private val ctx: Context) {
                         )
                         .put("flags", 64)
                 )
-                return
-            }
-
-            if (cid.startsWith("pilot_ck_modal:")) {
-                val p = cid.removePrefix("pilot_ck_modal:").split(":", limit = 2)
-                if (p.size < 2 || !p[1].equals(myCloud, ignoreCase = true)) return
-                if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
-                    replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
-                    return
-                }
-                val targetPkg = p[0]
-                var rawCookie = ""
-                val rows = data.optJSONArray("components")
-                if (rows != null) {
-                    for (r in 0 until rows.length()) {
-                        val comps = rows.getJSONObject(r).optJSONArray("components") ?: continue
-                        for (c in 0 until comps.length()) {
-                            val item = comps.getJSONObject(c)
-                            if (item.optString("custom_id") == "cookie") {
-                                rawCookie = item.optString("value", "")
-                            }
-                        }
-                    }
-                }
-                replyInteraction(id, token, 4, JSONObject().put("content", "⏳ Injecting cookie into **$myCloud** (`$targetPkg`) and launching Roblox...").put("flags", 64))
-                ioExec.execute {
-                    val (ok, info) = PilotCore.injectCookie(ctx, targetPkg, rawCookie)
-                    if (ch.isNotEmpty()) {
-                        if (ok) {
-                            sendMsg(ch, "✅ **Cookie Login Complete!**\n• **Cloud:** **$myCloud**\n• **Slot:** `$targetPkg`\n• **Account:** **$info**")
-                        } else {
-                            sendMsg(ch, "❌ **Cookie Login Failed** on **$myCloud** (`$targetPkg`): $info")
-                        }
-                    }
-                }
                 return
             }
 
@@ -1936,6 +2232,20 @@ class DiscordBot(private val ctx: Context) {
             return
         }
 
+        if (cid.startsWith("pilot_al_btn:open:")) {
+            val p = cid.removePrefix("pilot_al_btn:open:").split(":", limit = 2)
+            if (p.size < 2) return
+            val targetCloud = p[0]
+            val sid = p[1]
+            if (!targetCloud.equals(myCloud, ignoreCase = true)) return
+            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                return
+            }
+            openAccountLaunchModal(id, token, myCloud, sid)
+            return
+        }
+
         if (cid.startsWith("pilot_cfg_btn:open:")) {
             val targetCloud = cid.removePrefix("pilot_cfg_btn:open:")
             if (!targetCloud.equals(myCloud, ignoreCase = true)) return
@@ -1957,6 +2267,55 @@ class DiscordBot(private val ctx: Context) {
         val kind = cid.substring(0, firstColon)
         val mode = cid.substring(firstColon + 1, lastColon)
         val suffix = cid.substring(lastColon + 1)
+
+        if (kind == "pilot_al_cloud") {
+            if (!sel.equals(myCloud, ignoreCase = true)) return
+            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                return
+            }
+            val session = AccountLaunchManager.sessions[mode]
+            if (session == null) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "⚠️ Account Launch session expired or phone just restarted. Please run `!accountlaunch` again.").put("flags", 64))
+                return
+            }
+
+            val allSlots = PilotCore.scanRbx(ctx)
+            val freeIndexed = allSlots.mapIndexedNotNull { idx, acc ->
+                if (acc.status == "EMPTY" || acc.status == "LOGGED OUT") idx to acc else null
+            }
+            if (freeIndexed.isEmpty()) {
+                replyInteraction(id, token, 4, JSONObject().put("content", "⚠️ **$myCloud** no longer has any Empty or Logged Out slots.").put("flags", 64))
+                return
+            }
+
+            val opts = JSONArray()
+            freeIndexed.take(25).forEach { (idx, acc) ->
+                opts.put(
+                    JSONObject()
+                        .put("label", "[${idx + 1}] ${acc.user} [${acc.status}] (${acc.pkg})")
+                        .put("value", acc.pkg)
+                        .put("description", "Launch ${session.username} in ${acc.pkg}")
+                )
+            }
+            val menu = JSONObject()
+                .put("type", 3)
+                .put("custom_id", "pilot_al_slot:${session.sessionId}:$myCloud")
+                .put("placeholder", "Pick available slot on $myCloud...")
+                .put("options", opts)
+            val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+            replyInteraction(
+                id, token, 4,
+                JSONObject()
+                    .put(
+                        "content",
+                        "**🚀 $myCloud** — Select an available slot for **`${session.username}`**:\n${PilotCore.fmtAll(allSlots)}"
+                    )
+                    .put("components", row)
+                    .put("flags", 64)
+            )
+            return
+        }
 
         if (kind == "pilot_cloud") {
             if (!sel.equals(myCloud, ignoreCase = true)) return
@@ -1983,37 +2342,6 @@ class DiscordBot(private val ctx: Context) {
                     id, token, 4,
                     JSONObject()
                         .put("content", "**🔁 $myCloud — Auto-Rejoiner Settings**\n• **Status:** ${if (enabled) "🟢 ON" else "🔴 OFF"}\n• **Target:** `$curTarget`")
-                        .put("components", row)
-                        .put("flags", 64)
-                )
-                return
-            }
-
-            if (mode == "ck") {
-                val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
-                if (list.isEmpty()) {
-                    replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No Roblox clones found.").put("flags", 64))
-                    return
-                }
-                val opts = JSONArray()
-                list.take(25).forEachIndexed { i, a ->
-                    opts.put(
-                        JSONObject()
-                            .put("label", "[${i + 1}] ${a.user} [${a.status}] (${a.pkg})")
-                            .put("value", a.pkg)
-                            .put("description", "Inject .ROBLOSECURITY cookie into ${a.pkg}")
-                    )
-                }
-                val menu = JSONObject()
-                    .put("type", 3)
-                    .put("custom_id", "pilot_ck_slot:pick:$myCloud")
-                    .put("placeholder", "Pick Roblox slot on $myCloud...")
-                    .put("options", opts)
-                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                replyInteraction(
-                    id, token, 4,
-                    JSONObject()
-                        .put("content", "**🍪 $myCloud** — Select which Roblox slot to log into:\n${PilotCore.fmtAll(list)}")
                         .put("components", row)
                         .put("flags", 64)
                 )
@@ -2115,7 +2443,27 @@ class DiscordBot(private val ctx: Context) {
             return
         }
 
-        if (kind == "pilot_ar_act") {
+        if (kind == "pilot_al_slot") {
+            val targetPkg = sel
+            val session = AccountLaunchManager.sessions.remove(mode)
+            if (session == null) {
+                replyInteraction(id, token, 7, JSONObject().put("content", "⚠️ Session expired. Please run `!accountlaunch` again.").put("components", JSONArray()))
+                return
+            }
+            replyInteraction(
+                id, token, 7,
+                JSONObject()
+                    .put("content", "⏳ Injecting cookie & saving Nousigi Hub config for **`${session.username}`** on **$myCloud** (`$targetPkg`)...")
+                    .put("components", JSONArray())
+            )
+            ioExec.execute {
+                val (ok, resultMsg) = AccountLaunchManager.executeLaunch(ctx, targetPkg, session)
+                if (ch.isNotEmpty()) {
+                    if (ok) sendMsg(ch, resultMsg)
+                    else sendMsg(ch, "❌ **Account Launch Failed** on **$myCloud** (`$targetPkg`): $resultMsg")
+                }
+            }
+        } else if (kind == "pilot_ar_act") {
             when (sel) {
                 "ON_AUTO" -> {
                     Rejoiner.setConfig(ctx, enabled = true, target = "")
@@ -2142,24 +2490,6 @@ class DiscordBot(private val ctx: Context) {
                     replyInteraction(id, token, 9, modal)
                 }
             }
-        } else if (kind == "pilot_ck_slot") {
-            val targetPkg = sel
-            val fCookie = JSONObject()
-                .put("type", 4)
-                .put("custom_id", "cookie")
-                .put("label", ".ROBLOSECURITY Cookie")
-                .put("style", 2)
-                .put("min_length", 50)
-                .put("max_length", 2500)
-                .put("placeholder", "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in...")
-                .put("required", true)
-
-            val modalData = JSONObject()
-                .put("custom_id", "pilot_ck_modal:$targetPkg:$myCloud")
-                .put("title", "Cookie Login ($targetPkg)")
-                .put("components", JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(fCookie))))
-
-            replyInteraction(id, token, 9, modalData)
         } else if (kind == "pilot_cs2") {
             val srcPkg = sel.substringBefore("|")
             val srcUser = sel.substringAfter("|", "")
