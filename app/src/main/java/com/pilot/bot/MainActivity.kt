@@ -1,12 +1,16 @@
 package com.pilot.bot
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -20,13 +24,92 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.*
 
+/** Custom Tactical Arc Telemetry Gauge (RAM % + Active Slots) */
+class TelemetryArcView(context: Context) : View(context) {
+    var ramPct: Float = 0f
+    var activeSlots: Int = 0
+    var totalSlots: Int = 4
+    var labelRight: String = "0 MB FREE"
+
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 10f
+        color = Color.parseColor("#1E293B")
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val ramPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 10f
+        color = Color.parseColor("#06B6D4")
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val slotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 10f
+        color = Color.parseColor("#10B981")
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val numPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#F8FAFC")
+        textSize = 24f
+        typeface = Typeface.MONOSPACE
+        textAlign = Paint.Align.CENTER
+    }
+    private val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#94A3B8")
+        textSize = 15f
+        typeface = Typeface.MONOSPACE
+        textAlign = Paint.Align.CENTER
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val h = height.toFloat()
+        val r = (h * 0.36f).coerceAtMost(48f)
+        val cy = h * 0.52f
+
+        // Left Arc: RAM Load
+        val cx1 = width * 0.25f
+        val rect1 = RectF(cx1 - r, cy - r, cx1 + r, cy + r)
+        canvas.drawArc(rect1, 135f, 270f, false, trackPaint)
+        ramPaint.color = when {
+            ramPct > 85f -> Color.parseColor("#EF4444")
+            ramPct > 70f -> Color.parseColor("#F59E0B")
+            else -> Color.parseColor("#06B6D4")
+        }
+        canvas.drawArc(rect1, 135f, (ramPct.coerceIn(0f, 100f) / 100f) * 270f, false, ramPaint)
+        canvas.drawText("${ramPct.toInt()}%", cx1, cy + 7f, numPaint)
+        canvas.drawText("RAM", cx1, cy + r + 14f, subPaint)
+
+        // Right Arc: Active Fleet Slots
+        val cx2 = width * 0.75f
+        val rect2 = RectF(cx2 - r, cy - r, cx2 + r, cy + r)
+        canvas.drawArc(rect2, 135f, 270f, false, trackPaint)
+        val ratio = if (totalSlots > 0) (activeSlots.toFloat() / totalSlots.toFloat()).coerceIn(0f, 1f) else 0f
+        canvas.drawArc(rect2, 135f, ratio * 270f, false, slotPaint)
+        canvas.drawText("$activeSlots/$totalSlots", cx2, cy + 7f, numPaint)
+        canvas.drawText("SLOTS", cx2, cy + r + 14f, subPaint)
+    }
+}
+
 class MainActivity : Activity() {
     private val uiHandler = Handler(Looper.getMainLooper())
+    private var currentTab = 0 // 0 = FLEET, 1 = CONFIG, 2 = CONSOLE
+
     private lateinit var powerBtn: Button
     private lateinit var statusPill: TextView
+    private lateinit var cloudBadge: TextView
+    private lateinit var arcGauge: TelemetryArcView
     private lateinit var keyStatusText: TextView
-    private lateinit var slotMonitorText: TextView
+    private lateinit var slotMatrixContainer: LinearLayout
     private lateinit var telemetryText: TextView
+
+    private lateinit var tabFleetBtn: Button
+    private lateinit var tabConfigBtn: Button
+    private lateinit var tabConsoleBtn: Button
+    private lateinit var fleetPane: ScrollView
+    private lateinit var configPane: ScrollView
+    private lateinit var consolePane: ScrollView
 
     // Identity & Sync Code inputs
     private lateinit var syncCodeInput: EditText
@@ -35,17 +118,13 @@ class MainActivity : Activity() {
     private lateinit var cloudInput: EditText
     private lateinit var updateUrlInput: EditText
 
-    // Rejoiner & Key Automator inputs
+    // Rejoiner & Delta Key inputs
     private lateinit var gameSpinner: Spinner
     private lateinit var placeIdInput: EditText
     private lateinit var vipInput: EditText
     private lateinit var fpsSwitch: Switch
     private lateinit var render3dSwitch: Switch
     private lateinit var bootSwitch: Switch
-    private lateinit var nousigiSwitch: Switch
-    private lateinit var luarmorInput: EditText
-    private lateinit var lvEmailInput: EditText
-    private lateinit var lvPassInput: EditText
     private lateinit var keyPathInput: EditText
     private lateinit var deltaSwitch: Switch
     private lateinit var deltaUrlInput: EditText
@@ -54,7 +133,7 @@ class MainActivity : Activity() {
         override fun run() {
             syncPowerButton()
             refreshTelemetry()
-            uiHandler.postDelayed(this, 1500L)
+            uiHandler.postDelayed(this, 1600L)
         }
     }
 
@@ -64,7 +143,7 @@ class MainActivity : Activity() {
         buildHud()
         loadFieldsFromPrefs()
 
-        // Auto-start on app restart ONLY if the user previously started the bot (never right after Apply Code)
+        // Auto-start ONLY if the user previously started the bot (never immediately after Apply Code)
         if (PilotCore.shouldAutoStart(this) && PilotCore.getToken(this).isNotEmpty() && !PilotCore.isRunning) {
             PilotCore.startService(this)
         }
@@ -84,81 +163,111 @@ class MainActivity : Activity() {
     }
 
     private fun buildHud() {
-        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0A0F1A"))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(Color.parseColor("#060B14"))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
         }
 
-        // Top Bar
+        // Tactical Top Header
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = cardBg("#111827", "#1F2937")
+            background = cardBg("#0D1526", "#1E293B")
         }
-        val title = TextView(this).apply {
-            text = "PILOT HUD  ${PilotCore.APP_VERSION}"
-            textSize = 15f
-            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
-            setTextColor(Color.parseColor("#F8FAFC"))
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
+        val title = TextView(this).apply {
+            text = "PILOT // FLEET COMMAND"
+            textSize = 14f
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+            setTextColor(Color.parseColor("#F8FAFC"))
+        }
+        cloudBadge = TextView(this).apply {
+            text = "${PilotCore.getCloud(this@MainActivity)} • ${PilotCore.APP_VERSION}"
+            textSize = 10.5f
+            setTypeface(Typeface.MONOSPACE)
+            setTextColor(Color.parseColor("#38BDF8"))
+        }
+        titleCol.addView(title)
+        titleCol.addView(cloudBadge)
+
         statusPill = TextView(this).apply {
             textSize = 11f
             setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
-            setPadding(dp(10), dp(4), dp(10), dp(4))
+            setPadding(dp(10), dp(5), dp(10), dp(5))
         }
-        header.addView(title)
+        header.addView(titleCol)
         header.addView(statusPill)
         root.addView(header)
 
-        // Main Body: 2 Columns in Landscape, Stacked in Portrait
-        val bodyContainer = LinearLayout(this).apply {
-            orientation = if (isLandscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        // 3-Tab Tactical Dock
+        val dock = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
-            ).apply { topMargin = dp(10) }
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8); bottomMargin = dp(8) }
+        }
+        tabFleetBtn = makeTabBtn("⚡ FLEET") { switchTab(0) }
+        tabConfigBtn = makeTabBtn("⚙️ CONFIG") { switchTab(1) }
+        tabConsoleBtn = makeTabBtn("📟 CONSOLE") { switchTab(2) }
+        dock.addView(tabFleetBtn)
+        dock.addView(tabConfigBtn)
+        dock.addView(tabConsoleBtn)
+        root.addView(dock)
+
+        // Stacked Panes
+        val frame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
-        val leftScroll = ScrollView(this).apply {
-            layoutParams = if (isLandscape)
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.15f).apply { rightMargin = dp(8) }
-            else
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.2f).apply { bottomMargin = dp(8) }
-        }
-        leftScroll.addView(buildControlsColumn())
+        fleetPane = ScrollView(this).apply { addView(buildFleetTab()) }
+        configPane = ScrollView(this).apply { addView(buildConfigTab()) }
+        consolePane = ScrollView(this).apply { addView(buildConsoleTab()) }
 
-        val rightScroll = ScrollView(this).apply {
-            layoutParams = if (isLandscape)
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.85f)
-            else
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.8f)
-        }
-        rightScroll.addView(buildMonitorColumn())
+        frame.addView(fleetPane)
+        frame.addView(configPane)
+        frame.addView(consolePane)
+        root.addView(frame)
 
-        bodyContainer.addView(leftScroll)
-        bodyContainer.addView(rightScroll)
-        root.addView(bodyContainer)
         setContentView(root)
+        switchTab(currentTab)
         syncPowerButton()
     }
 
-    private fun buildControlsColumn(): LinearLayout {
+    private fun switchTab(idx: Int) {
+        currentTab = idx
+        fleetPane.visibility = if (idx == 0) View.VISIBLE else View.GONE
+        configPane.visibility = if (idx == 1) View.VISIBLE else View.GONE
+        consolePane.visibility = if (idx == 2) View.VISIBLE else View.GONE
+
+        fun styleTab(btn: Button, active: Boolean) {
+            btn.background = if (active) cardBg("#0284C7", "#38BDF8") else cardBg("#0F172A", "#1E293B")
+            btn.setTextColor(if (active) Color.WHITE else Color.parseColor("#94A3B8"))
+        }
+        styleTab(tabFleetBtn, idx == 0)
+        styleTab(tabConfigBtn, idx == 1)
+        styleTab(tabConsoleBtn, idx == 2)
+    }
+
+    private fun buildFleetTab(): LinearLayout {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // 1. Power Card
-        val powerCard = makeCard("BOT CONTROL")
+        // Reactor Power + Arc Telemetry Card
+        val reactorCard = makeCard("REACTOR POWER & SYSTEM TELEMETRY")
         powerBtn = Button(this).apply {
             textSize = 13f
-            setTypeface(Typeface.DEFAULT_BOLD)
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
             setTextColor(Color.WHITE)
             setOnClickListener {
                 if (PilotCore.isRunning) {
                     PilotCore.setShouldAutoStart(this@MainActivity, false)
+                    Rejoiner.stop()
                     PilotCore.stopService(this@MainActivity)
+                    toast("Bot hard-stopped")
                 } else {
                     saveFieldsSilent()
                     if (!Settings.canDrawOverlays(this@MainActivity)) {
@@ -173,42 +282,89 @@ class MainActivity : Activity() {
                 syncPowerButton()
             }
         }
-        powerCard.addView(powerBtn)
+        reactorCard.addView(powerBtn)
 
-        val quickRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+        arcGauge = TelemetryArcView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(105)).apply {
                 topMargin = dp(8)
             }
         }
-        quickRow.addView(makeSmallBtn("REJOIN ALL", "#1D4ED8") {
+        reactorCard.addView(arcGauge)
+
+        // Quick Fleet Controls Row 1
+        val row1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        row1.addView(makeSmallBtn("🔁 REJOIN ACTIVE", "#1D4ED8") {
             saveFieldsSilent()
             Thread { Rejoiner.killAllAndStaggeredRejoin(this, "HUD button") }.start()
-            toast("Staggered rejoin queued")
+            toast("Rejoining logged-in clones only")
         })
-        quickRow.addView(makeSmallBtn("NOUSIGI KEY", "#7C3AED") {
-            saveFieldsSilent()
-            KeyAutomator.startNousigiRenewal(this)
-            toast("Opening Luarmor in Chrome — copy key when done")
+        row1.addView(makeSmallBtn("🪟 ARRANGE 2×2", "#0369A1") {
+            Thread {
+                val n = PilotCore.arrange2x2(this)
+                uiHandler.post { toast("Arranged $n logged-in clone(s)") }
+            }.start()
         })
-        quickRow.addView(makeSmallBtn("DELTA KEY", "#0F766E") {
+        row1.addView(makeSmallBtn("🧹 CLEAN .BAK", "#334155") {
+            Thread {
+                val n = KeyAutomator.cleanBakFiles()
+                uiHandler.post { toast("Removed $n .bak file(s)") }
+            }.start()
+        })
+        reactorCard.addView(row1)
+
+        // Quick Key Controls Row 2
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        row2.addView(makeSmallBtn("🔑 SET NOUSIGI", "#6D28D9") { showNousigiKeyDialog() })
+        row2.addView(makeSmallBtn("⏳ DELTA KEY", "#0F766E") {
             saveFieldsSilent()
             KeyAutomator.startDeltaRenewal(this)
-            toast("Testing Baseplate (${KeyAutomator.BASEPLATE_PLACE_ID}) & checking Delta key...")
+            toast("Testing Baseplate (${KeyAutomator.BASEPLATE_PLACE_ID})...")
         })
-        quickRow.addView(makeSmallBtn("PASTE KEY", "#B45309") {
+        row2.addView(makeSmallBtn("📋 PASTE KEY", "#B45309") {
             saveFieldsSilent()
             Thread {
                 val clip = KeyAutomator.readClipboard(this)
                 val (_, msg) = KeyAutomator.applyManualKey(this, clip)
-                uiHandler.post { toast(msg) }
+                uiHandler.post { toast(msg.replace("`", "").replace("*", "")) }
             }.start()
         })
-        powerCard.addView(quickRow)
-        col.addView(powerCard)
+        reactorCard.addView(row2)
+        col.addView(reactorCard)
 
-        // 2. Sync Code & Identity Card
-        val idCard = makeCard("ALL-IN-ONE SYNC CODE & IDENTITY")
+        // Key Watcher Live Banner
+        val keyCard = makeCard("KEY WATCHER & EXECUTOR STATUS")
+        keyStatusText = TextView(this).apply {
+            textSize = 11f
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+            setTextColor(Color.parseColor("#38BDF8"))
+            text = "IDLE"
+        }
+        keyCard.addView(keyStatusText)
+        col.addView(keyCard)
+
+        // Live 4-Slot Matrix
+        val matrixCard = makeCard("ROBLOX CLONE SLOT MATRIX")
+        slotMatrixContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        matrixCard.addView(slotMatrixContainer)
+        col.addView(matrixCard)
+
+        return col
+    }
+
+    private fun buildConfigTab(): LinearLayout {
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val idCard = makeCard("ALL-IN-ONE SYNC CODE & BOT IDENTITY")
         syncCodeInput = makeInput("Paste XXXXXXX-... Sync Code (restores ALL settings)")
         val codeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -222,13 +378,13 @@ class MainActivity : Activity() {
                 toast("Paste a sync code first")
             } else {
                 Thread {
-                    // startSvc = false -> saves settings & grants permissions, waits for user to click START BOT
+                    // startSvc = false -> saves settings & permissions, waits for START BOT tap
                     val (ok, _) = PilotCore.applyCode(this, code, startSvc = false)
                     uiHandler.post {
                         if (ok) {
                             loadFieldsFromPrefs()
                             syncPowerButton()
-                            toast("Config applied! Tap START BOT to run.")
+                            toast("Config applied! Tap START BOT when ready.")
                         } else {
                             toast("Invalid sync code")
                         }
@@ -236,7 +392,7 @@ class MainActivity : Activity() {
                 }.start()
             }
         })
-        codeRow.addView(makeSmallBtn("COPY FULL CONFIG CODE", "#334155") {
+        codeRow.addView(makeSmallBtn("COPY FULL CONFIG", "#334155") {
             saveFieldsSilent()
             val code = PilotCore.makeCode(this, autoRoot = true)
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -257,8 +413,7 @@ class MainActivity : Activity() {
         idCard.addView(updateUrlInput)
         col.addView(idCard)
 
-        // 3. Rejoiner Settings Card
-        val rjCard = makeCard("REJOINER SETTINGS")
+        val rjCard = makeCard("REJOINER & PERFORMANCE")
         rjCard.addView(makeLabel("Famous Game Preset"))
         gameSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(
@@ -288,20 +443,10 @@ class MainActivity : Activity() {
         rjCard.addView(bootSwitch)
         col.addView(rjCard)
 
-        // 4. Key Automator Card
-        val keyCard = makeCard("CHROME KEY HELPER & AUTO-CLIPBOARD")
-        nousigiSwitch = makeSwitch("Open Chrome on Blacklisted/Expired Nousigi Key")
-        luarmorInput = makeInput("Luarmor URL")
-        lvEmailInput = makeInput("Linkvertise Email (saved in config & sync code)")
-        lvPassInput = makeInput("Linkvertise Password", password = true)
-        keyPathInput = makeInput("Existing Key File Path (auto-detected if blank)")
+        val keyCard = makeCard("KEY PATHS & DELTA PLATORELAY")
+        keyPathInput = makeInput("Nousigi Key File Path (auto-detected if blank)")
         deltaSwitch = makeSwitch("Test Baseplate & Open Chrome on Missing Delta Key")
-        deltaUrlInput = makeInput("Saved PlatoRelay URL (auto-grabbed if empty)")
-
-        keyCard.addView(nousigiSwitch)
-        keyCard.addView(luarmorInput)
-        keyCard.addView(lvEmailInput)
-        keyCard.addView(lvPassInput)
+        deltaUrlInput = makeInput("Saved PlatoRelay URL (auto-caught on Receive Key)")
         keyCard.addView(keyPathInput)
         keyCard.addView(deltaSwitch)
         keyCard.addView(deltaUrlInput)
@@ -309,13 +454,15 @@ class MainActivity : Activity() {
         val saveBtn = Button(this).apply {
             text = "SAVE ALL SETTINGS & SYNC"
             textSize = 12f
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
             setTextColor(Color.WHITE)
             background = cardBg("#0284C7", "#38BDF8")
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) }
+            ).apply { topMargin = dp(10) }
             setOnClickListener {
                 saveFieldsSilent()
+                cloudBadge.text = "${PilotCore.getCloud(this@MainActivity)} • ${PilotCore.APP_VERSION}"
                 toast("All settings saved & synced!")
             }
         }
@@ -325,56 +472,55 @@ class MainActivity : Activity() {
         return col
     }
 
-    private fun buildMonitorColumn(): LinearLayout {
+    private fun buildConsoleTab(): LinearLayout {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-
-        val keyMonCard = makeCard("KEY WATCHER LIVE STATUS")
-        keyStatusText = TextView(this).apply {
-            textSize = 11.5f
-            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
-            setTextColor(Color.parseColor("#38BDF8"))
-            text = "IDLE"
-        }
-        keyMonCard.addView(keyStatusText)
-        col.addView(keyMonCard)
-
-        val slotCard = makeCard("LIVE ROBLOX SLOTS (PING WATCHDOG)")
-        slotMonitorText = TextView(this).apply {
-            textSize = 11.5f
-            setTypeface(Typeface.MONOSPACE)
-            setTextColor(Color.parseColor("#E2E8F0"))
-            text = "Scanning com.roblox.clien*..."
-        }
-        slotCard.addView(slotMonitorText)
-        col.addView(slotCard)
-
-        val logCard = makeCard("LIVE SYSTEM TELEMETRY")
+        val logCard = makeCard("LIVE SYSTEM TELEMETRY STREAM")
         telemetryText = TextView(this).apply {
             textSize = 10.5f
             setTypeface(Typeface.MONOSPACE)
-            setTextColor(Color.parseColor("#94A3B8"))
+            setTextColor(Color.parseColor("#CBD5E1"))
             text = "Waiting for events..."
         }
         logCard.addView(telemetryText)
         col.addView(logCard)
-
         return col
+    }
+
+    private fun showNousigiKeyDialog() {
+        val rep = KeyAutomator.inspectNousigiKey(this)
+        val input = EditText(this).apply {
+            hint = "Enter new Nousigi / Luarmor key"
+            if (rep.keyFound != "None") setText(rep.keyFound)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Update Nousigi Key (Autoexecute + Hub)")
+            .setMessage("Current: ${rep.keyFound}\nUpdates Autoexecute & Nousigi Hub and removes .bak files.")
+            .setView(input)
+            .setPositiveButton("Update") { _, _ ->
+                val newKey = input.text.toString().trim()
+                Thread {
+                    val (ok, msg) = KeyAutomator.updateNousigiKeyEverywhere(this, newKey)
+                    uiHandler.post { toast(if (ok) "Nousigi key updated & .bak cleaned!" else msg) }
+                }.start()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun syncPowerButton() {
         val online = PilotCore.isRunning
         if (online) {
-            powerBtn.text = "■  STOP BOT"
-            powerBtn.background = cardBg("#DC2626", "#F87171")
+            powerBtn.text = "■  STOP BOT (HARD STOP)"
+            powerBtn.background = cardBg("#B91C1C", "#F87171")
             statusPill.text = "● ONLINE"
             statusPill.setTextColor(Color.parseColor("#4ADE80"))
             statusPill.background = cardBg("#052E16", "#166534")
         } else {
             powerBtn.text = "▶  START BOT"
-            powerBtn.background = cardBg("#16A34A", "#4ADE80")
+            powerBtn.background = cardBg("#15803D", "#4ADE80")
             statusPill.text = "○ OFFLINE"
             statusPill.setTextColor(Color.parseColor("#94A3B8"))
-            statusPill.background = cardBg("#1E293B", "#334155")
+            statusPill.background = cardBg("#0F172A", "#334155")
         }
     }
 
@@ -385,16 +531,76 @@ class MainActivity : Activity() {
 
         val now = System.currentTimeMillis()
         val slots = Rejoiner.slots.values.sortedBy { it.pkg }
-        slotMonitorText.text = if (slots.isEmpty()) {
-            "No com.roblox.clien* slots detected yet."
+        val activeCount = slots.count { it.status == "ACTIVE" }
+
+        // Update Arc Gauge
+        val memParts = SuShell.exec("free -m | awk '/Mem:/ {print \$2\" \"\$3}'").trim().split(Regex("\\s+"))
+        if (memParts.size >= 2) {
+            val tot = memParts[0].toFloatOrNull() ?: 1f
+            val used = memParts[1].toFloatOrNull() ?: 0f
+            arcGauge.ramPct = if (tot > 0f) (used * 100f / tot) else 0f
+        }
+        arcGauge.activeSlots = activeCount
+        arcGauge.totalSlots = slots.size.coerceAtLeast(1)
+        arcGauge.invalidate()
+
+        // Rebuild Slot Matrix Cards
+        slotMatrixContainer.removeAllViews()
+        if (slots.isEmpty()) {
+            slotMatrixContainer.addView(TextView(this).apply {
+                text = "No com.roblox.clien* clones detected."
+                textSize = 11f
+                setTextColor(Color.parseColor("#64748B"))
+            })
         } else {
-            slots.joinToString("\n") { s ->
-                val pingAgo = if (s.lastPingMs > 0) "${(now - s.lastPingMs) / 1000}s ago" else "no ping"
-                val user = s.username.ifBlank { "(unknown)" }
-                "• ${s.pkg.removePrefix("com.roblox.")} | $user | ${s.status} | ${s.fps} FPS ($pingAgo)"
+            for (s in slots) {
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = cardBg("#0B1220", "#1E293B")
+                    setPadding(dp(10), dp(7), dp(10), dp(7))
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { bottomMargin = dp(6) }
+                }
+                val dotColor = when (s.status) {
+                    "ACTIVE" -> "#22C55E"
+                    "PAUSED", "COOLDOWN", "NO_DELTA_KEY" -> "#F59E0B"
+                    "LOGGED_OUT", "REVOKED", "FROZEN" -> "#EF4444"
+                    else -> "#475569"
+                }
+                val dot = TextView(this).apply {
+                    text = "● "
+                    textSize = 13f
+                    setTextColor(Color.parseColor(dotColor))
+                }
+                val infoCol = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                val nameTv = TextView(this).apply {
+                    val u = s.username.ifBlank { "(Empty Slot)" }
+                    text = "$u  [${s.pkg.removePrefix("com.roblox.")}]"
+                    textSize = 11.5f
+                    setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+                    setTextColor(Color.parseColor("#F1F5F9"))
+                }
+                val subTv = TextView(this).apply {
+                    val pingAgo = if (s.lastPingMs > 0) "${(now - s.lastPingMs) / 1000}s ago" else "no ping"
+                    text = "${s.status} • ${s.gameState} • ${s.fps} FPS • ${s.pingMs}ms ($pingAgo)"
+                    textSize = 10f
+                    setTypeface(Typeface.MONOSPACE)
+                    setTextColor(Color.parseColor("#94A3B8"))
+                }
+                infoCol.addView(nameTv)
+                infoCol.addView(subTv)
+                card.addView(dot)
+                card.addView(infoCol)
+                slotMatrixContainer.addView(card)
             }
         }
-        telemetryText.text = PilotCore.getLogs().takeLast(24).joinToString("\n").ifBlank { "No logs yet." }
+
+        telemetryText.text = PilotCore.getLogs().takeLast(35).joinToString("\n").ifBlank { "No logs yet." }
     }
 
     private fun loadFieldsFromPrefs() {
@@ -409,23 +615,9 @@ class MainActivity : Activity() {
         fpsSwitch.isChecked = cfg.fpsOptimization
         render3dSwitch.isChecked = cfg.render3dOff
         bootSwitch.isChecked = cfg.autoStartOnBoot
-        nousigiSwitch.isChecked = cfg.autoGetNousigiKey
-        luarmorInput.setText(cfg.luarmorUrl)
-        lvEmailInput.setText(cfg.lvEmail)
-        lvPassInput.setText(cfg.lvPassword)
+        keyPathInput.setText(cfg.nousigiKeyPath)
         deltaSwitch.isChecked = cfg.autoGetDeltaKey
         deltaUrlInput.setText(cfg.deltaPlatoUrl)
-
-        if (cfg.nousigiKeyPath.isNotBlank()) {
-            keyPathInput.setText(cfg.nousigiKeyPath)
-        } else {
-            Thread {
-                val found = KeyAutomator.detectExistingKeyFile(this)
-                if (found.isNotEmpty()) {
-                    uiHandler.post { if (keyPathInput.text.isNullOrBlank()) keyPathInput.setText(found) }
-                }
-            }.start()
-        }
 
         val presetIdx = Rejoiner.FAMOUS_GAMES.indexOfFirst { it.placeId == cfg.targetPlaceId }
             .takeIf { it >= 0 } ?: (Rejoiner.FAMOUS_GAMES.size - 1)
@@ -447,10 +639,6 @@ class MainActivity : Activity() {
                 fpsOptimization = fpsSwitch.isChecked,
                 render3dOff = render3dSwitch.isChecked,
                 autoStartOnBoot = bootSwitch.isChecked,
-                autoGetNousigiKey = nousigiSwitch.isChecked,
-                luarmorUrl = luarmorInput.text.toString().trim(),
-                lvEmail = lvEmailInput.text.toString().trim(),
-                lvPassword = lvPassInput.text.toString(),
                 nousigiKeyPath = keyPathInput.text.toString().trim(),
                 autoGetDeltaKey = deltaSwitch.isChecked,
                 deltaPlatoUrl = deltaUrlInput.text.toString().trim()
@@ -469,14 +657,14 @@ class MainActivity : Activity() {
 
     private fun makeCard(header: String): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        background = cardBg("#111827", "#1F2937")
+        background = cardBg("#0D1526", "#1E293B")
         setPadding(dp(12), dp(10), dp(12), dp(12))
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { bottomMargin = dp(10) }
         addView(TextView(this@MainActivity).apply {
             text = header
-            textSize = 11f
+            textSize = 10.5f
             setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
             setTextColor(Color.parseColor("#38BDF8"))
             setPadding(0, 0, 0, dp(6))
@@ -490,10 +678,10 @@ class MainActivity : Activity() {
 
     private fun makeInput(hintText: String, password: Boolean = false) = EditText(this).apply {
         hint = hintText
-        setHintTextColor(Color.parseColor("#64748B"))
+        setHintTextColor(Color.parseColor("#475569"))
         setTextColor(Color.parseColor("#F8FAFC"))
         textSize = 12f
-        background = cardBg("#0F172A", "#334155")
+        background = cardBg("#090E1A", "#334155")
         setPadding(dp(10), dp(8), dp(10), dp(8))
         inputType = if (password) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -509,9 +697,18 @@ class MainActivity : Activity() {
         setPadding(0, dp(6), 0, dp(4))
     }
 
+    private fun makeTabBtn(label: String, onClick: () -> Unit) = Button(this).apply {
+        text = label
+        textSize = 11f
+        setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+        layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply { rightMargin = dp(4) }
+        setOnClickListener { onClick() }
+    }
+
     private fun makeSmallBtn(label: String, hex: String, onClick: () -> Unit) = Button(this).apply {
         text = label
         textSize = 9.5f
+        setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
         setTextColor(Color.WHITE)
         background = cardBg(hex, hex)
         layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply { rightMargin = dp(4) }

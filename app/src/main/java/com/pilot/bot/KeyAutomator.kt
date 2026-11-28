@@ -23,18 +23,14 @@ data class KeyCheckReport(
 )
 
 /**
- * Full-Chrome Key Helper + Baseplate Executor Tester + Nousigi/Delta Key Inspector & Autoexecute Updater
+ * Delta Key Baseplate Tester + Full Chrome PlatoRelay Helper + Nousigi Key Inspector & Autoexecute Updater
  */
 object KeyAutomator {
-    enum class Mode { NOUSIGI_LUARMOR, DELTA_PLATO }
-
-    // Baseplate place ID used to verify whether Delta autoexecutes scripts
     const val BASEPLATE_PLACE_ID = "123974602339071"
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val running = AtomicBoolean(false)
 
-    @Volatile private var currentMode: Mode? = null
     @Volatile private var waitingForPlatoLink = false
     @Volatile private var startedAtMs = 0L
     @Volatile private var currentStep = "Idle"
@@ -43,7 +39,6 @@ object KeyAutomator {
     @Volatile private var appCtx: Context? = null
     @Volatile private var completionCb: ((Boolean, String) -> Unit)? = null
 
-    private val LUARMOR_KEY_RX = Regex("""^[A-Za-z0-9]{32}$""")
     private val DELTA_KEY_RX = Regex("""^KEY_[A-Za-z0-9_-]{12,64}$""")
     private val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
@@ -55,7 +50,7 @@ object KeyAutomator {
         return "ACTIVE (${sec}s) — $currentStep"
     }
 
-    /** Removes any .bak files left behind in Delta folders. */
+    /** Deletes any .bak files left behind in Delta folders. */
     fun cleanBakFiles(): Int {
         val countStr = SuShell.exec(
             "cnt=\$(find /storage/emulated/0/Delta -type f -iname '*.bak' 2>/dev/null | wc -l); " +
@@ -63,17 +58,6 @@ object KeyAutomator {
             "echo \$cnt"
         ).trim()
         return countStr.toIntOrNull() ?: 0
-    }
-
-    /** Finds the existing key file in Delta/Workspace/Nousigi Hub (or custom saved path). */
-    fun detectExistingKeyFile(ctx: Context? = null): String {
-        val saved = ctx?.let { Rejoiner.loadConfig(it).nousigiKeyPath.trim() }.orEmpty()
-        if (saved.isNotEmpty() && SuShell.exec("[ -f '$saved' ] && echo OK").trim() == "OK") {
-            return saved
-        }
-        return SuShell.exec(
-            "find '/storage/emulated/0/Delta/Workspace/Nousigi Hub' '/storage/emulated/0/Delta/Workspace' -maxdepth 3 -type f -iname '*key*' 2>/dev/null | head -n 1"
-        ).trim()
     }
 
     /** Inspects Delta/Autoexecute and Delta/Workspace/Nousigi Hub for the active Nousigi key. */
@@ -287,11 +271,6 @@ object KeyAutomator {
         return "${h}h ${m}m"
     }
 
-    private fun readCurrentFileContent(path: String): String {
-        if (path.isBlank()) return ""
-        return SuShell.exec("cat '$path' 2>/dev/null").trim()
-    }
-
     private fun updateStep(step: String) {
         currentStep = step
         if (step != lastLoggedStep) {
@@ -331,22 +310,10 @@ object KeyAutomator {
                 }
 
                 if (clip.isNotEmpty() && clip != previousKeySnapshot) {
-                    when (currentMode) {
-                        Mode.NOUSIGI_LUARMOR -> {
-                            val token = extractLuarmorKey(clip)
-                            if (token != null && token != previousKeySnapshot) {
-                                applyNousigiKeyInternal(ctx, token)
-                                return
-                            }
-                        }
-                        Mode.DELTA_PLATO -> {
-                            val token = extractDeltaKey(clip)
-                            if (token != null && token != previousKeySnapshot) {
-                                applyDeltaKeyInternal(ctx, token)
-                                return
-                            }
-                        }
-                        null -> Unit
+                    val token = extractDeltaKey(clip)
+                    if (token != null && token != previousKeySnapshot) {
+                        applyDeltaKeyInternal(ctx, token)
+                        return
                     }
                 }
             }
@@ -355,42 +322,10 @@ object KeyAutomator {
         }
     }
 
-    fun startNousigiRenewal(
-        ctx: Context,
-        blacklistedReset: Boolean = false,
-        onDone: ((Boolean, String) -> Unit)? = null
-    ): Boolean {
-        val cfg = Rejoiner.loadConfig(ctx)
-        if (cfg.luarmorUrl.isBlank()) {
-            onDone?.invoke(false, "Luarmor URL is empty in Rejoiner Settings.")
-            return false
-        }
-        if (!running.compareAndSet(false, true)) {
-            PilotCore.log("[KEYAUTO] Already waiting for key — opening Chrome URL again...")
-            Thread { openInFullChrome(cfg.luarmorUrl) }.start()
-            return false
-        }
-
-        appCtx = ctx.applicationContext
-        currentMode = Mode.NOUSIGI_LUARMOR
-        waitingForPlatoLink = false
-        lastLoggedStep = ""
-        completionCb = onDone
-        startedAtMs = System.currentTimeMillis()
-
-        val existingPath = detectExistingKeyFile(ctx)
-        previousKeySnapshot = readCurrentFileContent(existingPath)
-
-        if (previousKeySnapshot.isNotEmpty() && readClipboard(ctx).trim() == previousKeySnapshot) {
-            writeClipboard(ctx, "")
-        }
-
-        updateStep("Opened Luarmor in Chrome — complete check & tap Copy on your key...")
-        Thread { openInFullChrome(cfg.luarmorUrl) }.start()
-        mainHandler.postDelayed(clipboardWatchRunnable, 2000L)
-        return true
-    }
-
+    /**
+     * Tests Delta key on Baseplate (123974602339071) using ONLY a logged-in clone.
+     * Never opens or launches logged-out or empty (no-account) clones.
+     */
     fun startDeltaRenewal(
         ctx: Context,
         explicitUrl: String = "",
@@ -401,38 +336,46 @@ object KeyAutomator {
             return false
         }
         appCtx = ctx.applicationContext
-        currentMode = Mode.DELTA_PLATO
         waitingForPlatoLink = false
         lastLoggedStep = ""
         completionCb = onDone
         startedAtMs = System.currentTimeMillis()
 
         Thread {
-            val testSlot = Rejoiner.pickBestTestClone()
-            if (testSlot != null) {
-                val testStartMs = System.currentTimeMillis()
-                updateStep("Launching ${testSlot.pkg.removePrefix("com.roblox.")} into Baseplate ($BASEPLATE_PLACE_ID) to test Delta key...")
-                Rejoiner.launchSingleCloneToPlace(ctx, testSlot.pkg, BASEPLATE_PLACE_ID)
-
-                val testDeadline = testStartMs + 28_000L
-                while (running.get() && System.currentTimeMillis() < testDeadline) {
-                    Thread.sleep(1500L)
-                    if (Rejoiner.lastAnyBridgePingMs > testStartMs) {
-                        val pingUser = Rejoiner.lastPingUser.ifBlank { testSlot.pkg }
-                        updateStep("Baseplate script executed ($pingUser) — Delta key is STILL VALID!")
-                        Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key verified on Baseplate")
-                        finishFlow(true, "Baseplate test passed ($pingUser executed script) — Delta key is still valid! Returning to main game.")
-                        return@Thread
-                    }
-                }
-                if (!running.get()) return@Thread
-                updateStep("No script ping on Baseplate after 28s — Delta key expired/missing.")
+            val testSlot = Rejoiner.pickBestTestClone(ctx)
+            if (testSlot == null) {
+                finishFlow(false, "Skipped Delta Baseplate test — no logged-in Roblox accounts found on this device (all slots are Empty or Logged Out).")
+                return@Thread
             }
+
+            val testStartMs = System.currentTimeMillis()
+            updateStep("Launching ${testSlot.username} (${testSlot.pkg.removePrefix("com.roblox.")}) into Baseplate ($BASEPLATE_PLACE_ID)...")
+            val launched = Rejoiner.launchSingleCloneToPlace(ctx, testSlot.pkg, BASEPLATE_PLACE_ID)
+            if (!launched) {
+                finishFlow(false, "Aborted Baseplate test — `${testSlot.pkg}` has no logged-in account.")
+                return@Thread
+            }
+
+            val testDeadline = testStartMs + 28_000L
+            while (running.get() && System.currentTimeMillis() < testDeadline) {
+                Thread.sleep(1500L)
+                if (Rejoiner.lastAnyBridgePingMs > testStartMs) {
+                    val pingUser = Rejoiner.lastPingUser.ifBlank { testSlot.username }
+                    updateStep("Baseplate script executed ($pingUser) — Delta key is STILL VALID!")
+                    if (Rejoiner.isBotActive()) {
+                        Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key verified on Baseplate")
+                    }
+                    finishFlow(true, "Baseplate test passed ($pingUser executed script) — Delta key is still valid! Returning to main game.")
+                    return@Thread
+                }
+            }
+            if (!running.get()) return@Thread
+            updateStep("No script ping on Baseplate after 28s — Delta key expired/missing.")
 
             val currentClip = readClipboard(ctx).trim()
             previousKeySnapshot = currentClip
 
-            var url = explicitUrl.trim()
+            val url = explicitUrl.trim()
                 .ifBlank { Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim() }
                 .ifBlank { if (isPlatoUrl(currentClip)) currentClip else "" }
                 .ifBlank { scanDeltaFilesForPlatoUrl() }
@@ -451,7 +394,7 @@ object KeyAutomator {
             }
 
             waitingForPlatoLink = true
-            updateStep("Baseplate ($BASEPLATE_PLACE_ID) is open — tap 'Receive Key' in Delta now (auto-catching link)...")
+            updateStep("Baseplate ($BASEPLATE_PLACE_ID) is open on ${testSlot.username} — tap 'Receive Key' in Delta now...")
             mainHandler.postDelayed(clipboardWatchRunnable, 1500L)
         }.start()
         return true
@@ -464,6 +407,7 @@ object KeyAutomator {
         return if (isPlatoUrl(found)) found else ""
     }
 
+    /** Applies a pasted Delta key, PlatoRelay URL, or Nousigi key. */
     fun applyManualKey(ctx: Context, rawInput: String): Pair<Boolean, String> {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return false to "Clipboard/input is empty."
@@ -483,41 +427,36 @@ object KeyAutomator {
             } else {
                 Thread {
                     writeClipboard(ctx, deltaKey)
-                    val cached = overwriteExistingKeyFile(null, "/storage/emulated/0/Delta/Internals", deltaKey, "")
-                    Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key applied")
+                    val cached = overwriteDeltaKeyFile(ctx, deltaKey)
+                    if (Rejoiner.isBotActive()) {
+                        Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key applied")
+                    }
                     PilotCore.log("[KEYAUTO] Manual Delta key applied ($deltaKey, cached=$cached)")
                 }.start()
             }
-            return true to "Applied Delta key `$deltaKey` and restarting clones."
+            return true to "Applied Delta key `$deltaKey`."
         }
 
-        val luarmorKey = extractLuarmorKey(trimmed) ?: trimmed.takeIf { it.length >= 8 && !it.contains(" ") }
+        val nousigiKey = trimmed.takeIf { it.length >= 8 && !it.contains(" ") }
             ?: return false to "Could not recognize a valid key or PlatoRelay link."
 
-        val (ok, msg) = updateNousigiKeyEverywhere(ctx, luarmorKey)
-        if (ok) {
+        val (ok, msg) = updateNousigiKeyEverywhere(ctx, nousigiKey)
+        if (ok && Rejoiner.isBotActive()) {
             Thread { Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Nousigi key updated") }.start()
         }
         return ok to msg
     }
 
-    private fun applyNousigiKeyInternal(ctx: Context, key: String) {
-        Thread {
-            updateStep("Detected key! Updating Autoexecute & Nousigi Hub...")
-            val (_, msg) = updateNousigiKeyEverywhere(ctx, key)
-            Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Nousigi key updated")
-            finishFlow(true, msg)
-        }.start()
-    }
-
     private fun applyDeltaKeyInternal(ctx: Context, key: String) {
         Thread {
-            updateStep("Detected Delta key! Applying to clipboard, cache & clones...")
+            updateStep("Detected Delta key! Applying to clipboard, cache & active clones...")
             writeClipboard(ctx, key)
-            val cached = overwriteExistingKeyFile(null, "/storage/emulated/0/Delta/Internals", key, preferSubdir = "")
-            Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key renewed")
+            val cached = overwriteDeltaKeyFile(ctx, key)
+            if (Rejoiner.isBotActive()) {
+                Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key renewed")
+            }
             val extra = if (cached != null) " + updated `$cached`" else ""
-            finishFlow(true, "Delta key `$key` applied (Clipboard$extra). All clones restarting.")
+            finishFlow(true, "Delta key `$key` applied (Clipboard$extra).")
         }.start()
     }
 
@@ -529,12 +468,6 @@ object KeyAutomator {
         if (res != "CHROME_OK") {
             SuShell.exec("am start -a android.intent.action.VIEW -d '$safeUrl' >/dev/null 2>&1")
         }
-    }
-
-    private fun extractLuarmorKey(text: String): String? {
-        val clean = text.trim()
-        if (LUARMOR_KEY_RX.matches(clean)) return clean
-        return Regex("""\b[A-Za-z0-9]{32}\b""").find(clean)?.value
     }
 
     private fun extractDeltaKey(text: String): String? {
@@ -566,18 +499,10 @@ object KeyAutomator {
         }
     }
 
-    private fun overwriteExistingKeyFile(ctx: Context?, baseDir: String, key: String, preferSubdir: String): String? {
-        val explicitPath = ctx?.let { Rejoiner.loadConfig(it).nousigiKeyPath.trim() }.orEmpty()
-        val existing = if (explicitPath.isNotEmpty() && SuShell.exec("[ -f '$explicitPath' ] && echo OK").trim() == "OK") {
-            explicitPath
-        } else {
-            val searchFirst = if (preferSubdir.isNotBlank()) "'$baseDir/$preferSubdir' '$baseDir'" else "'$baseDir'"
-            SuShell.exec("find $searchFirst -maxdepth 3 -type f -iname '*key*' 2>/dev/null | head -n 1").trim()
-        }
+    private fun overwriteDeltaKeyFile(ctx: Context, key: String): String? {
+        val existing = SuShell.exec("find '/storage/emulated/0/Delta/Internals' -maxdepth 3 -type f -iname '*key*' 2>/dev/null | head -n 1").trim()
         if (existing.isBlank()) return null
-
-        val c = appCtx ?: ctx ?: return null
-        val tmp = File(c.cacheDir, "key_write_tmp")
+        val tmp = File(ctx.cacheDir, "delta_key_write_tmp")
         FileOutputStream(tmp).use { it.write(key.toByteArray(Charsets.UTF_8)) }
         SuShell.exec("cp '${tmp.absolutePath}' '$existing' && chmod 666 '$existing'")
         tmp.delete()

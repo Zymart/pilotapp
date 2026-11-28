@@ -2,8 +2,6 @@ package com.pilot.bot
 
 import android.app.*
 import android.content.*
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Rect
 import android.os.*
 import android.provider.Settings
@@ -249,8 +247,10 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.4.4"
+    const val APP_VERSION = "v1.4.6"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
+    private const val GUARDIAN_SCRIPT = "/data/local/tmp/pilot_guardian.sh"
+    private const val GUARDIAN_STOP_FLAG = "/data/local/tmp/pilot_guardian.stop"
 
     var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
@@ -281,6 +281,17 @@ object PilotCore {
     private fun histPrefs(c: Context): SharedPreferences =
         c.applicationContext.getSharedPreferences("pilot_hist", Context.MODE_PRIVATE)
 
+    fun getSlotHistoryUser(c: Context, pkg: String): String =
+        histPrefs(c).getString(pkg, "").orEmpty()
+
+    fun readDiskUsername(pkg: String): String {
+        val line = SuShell.exec(
+            "grep -rnEI 'UserName|Username' '/data/data/$pkg/files/appData/LocalStorage/appStorage.json' '/data/data/$pkg/shared_prefs/' 2>/dev/null | head -n 1"
+        )
+        val rx = Regex("""(?:UserName|Username)["'>:\s]+([a-zA-Z0-9_]{3,20})""")
+        return rx.find(line)?.groupValues?.get(1).orEmpty()
+    }
+
     fun setShouldAutoStart(c: Context, shouldStart: Boolean) {
         prefs(c).edit().putBoolean("bot_should_autostart", shouldStart).apply()
     }
@@ -294,13 +305,50 @@ object PilotCore {
         runCatching {
             if (Build.VERSION.SDK_INT >= 26) app.startForegroundService(svc) else app.startService(svc)
         }
+        startRootGuardian(app)
     }
 
     fun stopService(c: Context) {
         val app = c.applicationContext
+        stopRootGuardian()
+        Rejoiner.stop()
         runCatching { app.stopService(Intent(app, PilotService::class.java)) }
         PilotService.isRunning = false
-        log("[CORE] Service stop requested")
+        log("[CORE] Service hard-stopped")
+    }
+
+    /** Protects PilotService from Android's Low-Memory Killer and launches a detached root revive guard. */
+    fun startRootGuardian(c: Context) {
+        val myPid = android.os.Process.myPid()
+        val guardSh = """
+            #!/system/bin/sh
+            rm -f '$GUARDIAN_STOP_FLAG'
+            while [ ! -f '$GUARDIAN_STOP_FLAG' ]; do
+              sleep 8
+              [ -f '$GUARDIAN_STOP_FLAG' ] && exit 0
+              pid=${'$'}(pidof com.pilot.bot)
+              if [ -z "${'$'}pid" ]; then
+                am start-foreground-service -n com.pilot.bot/.PilotService >/dev/null 2>&1 || am startservice -n com.pilot.bot/.PilotService >/dev/null 2>&1
+              else
+                echo -800 > /proc/${'$'}pid/oom_score_adj 2>/dev/null
+              fi
+            done
+        """.trimIndent()
+        val local = File(c.cacheDir, "pilot_guardian.sh")
+        local.writeText(guardSh)
+        SuShell.exec(
+            "echo -800 > /proc/$myPid/oom_score_adj 2>/dev/null; " +
+            "rm -f '$GUARDIAN_STOP_FLAG'; " +
+            "cp '${local.absolutePath}' '$GUARDIAN_SCRIPT' && chmod 755 '$GUARDIAN_SCRIPT'"
+        )
+        local.delete()
+        runCatching {
+            ProcessBuilder("su", "-c", "nohup sh '$GUARDIAN_SCRIPT' </dev/null >/dev/null 2>&1 &").start()
+        }
+    }
+
+    fun stopRootGuardian() {
+        SuShell.exec("touch '$GUARDIAN_STOP_FLAG' && pkill -f pilot_guardian.sh 2>/dev/null")
     }
 
     fun cleanBotToken(raw: String): String =
@@ -348,6 +396,15 @@ object PilotCore {
         val clean = name.trim().ifEmpty { detectDeviceName(c) }
         prefs(c).edit().putString("cloud", clean).putString("cloud_name", clean).apply()
         runCatching { File("/sdcard/cloud_name.txt").writeText(clean) }
+    }
+
+    fun matchesCloudTarget(c: Context, query: String): Boolean {
+        val q = query.trim()
+        if (q.isEmpty()) return false
+        val cl = getCloud(c)
+        if (cl.equals(q, ignoreCase = true)) return true
+        val numSuffix = cl.substringAfterLast(" ", "").substringAfterLast("-", "")
+        return numSuffix.isNotEmpty() && numSuffix.equals(q, ignoreCase = true)
     }
 
     fun getToken(c: Context): String {
@@ -452,10 +509,6 @@ object PilotCore {
             .put("vip", rj.privateServerLinks)
             .put("fps", rj.fpsOptimization)
             .put("r3d", rj.render3dOff)
-            .put("ank", rj.autoGetNousigiKey)
-            .put("lurl", rj.luarmorUrl)
-            .put("lve", rj.lvEmail)
-            .put("lvp", rj.lvPassword)
             .put("nkp", rj.nousigiKeyPath)
             .put("adk", rj.autoGetDeltaKey)
             .put("durl", rj.deltaPlatoUrl)
@@ -474,8 +527,8 @@ object PilotCore {
     }
 
     /**
-     * Applies sync code settings & grants permissions. Does NOT auto-start the service unless startSvc=true,
-     * leaving the bot OFFLINE until the user explicitly taps START BOT.
+     * Applies sync code settings & grants permissions. Leaves the bot OFFLINE until the user
+     * explicitly taps START BOT (unless startSvc=true).
      */
     fun applyCode(c: Context, code: String, startSvc: Boolean = false): Pair<Boolean, Boolean> {
         val parsed = runCatching {
@@ -518,10 +571,6 @@ object PilotCore {
                     privateServerLinks = r.optString("vip", cur.privateServerLinks),
                     fpsOptimization = r.optBoolean("fps", cur.fpsOptimization),
                     render3dOff = r.optBoolean("r3d", cur.render3dOff),
-                    autoGetNousigiKey = r.optBoolean("ank", cur.autoGetNousigiKey),
-                    luarmorUrl = r.optString("lurl", cur.luarmorUrl),
-                    lvEmail = r.optString("lve", cur.lvEmail),
-                    lvPassword = r.optString("lvp", cur.lvPassword),
                     nousigiKeyPath = r.optString("nkp", cur.nousigiKeyPath),
                     autoGetDeltaKey = r.optBoolean("adk", cur.autoGetDeltaKey),
                     deltaPlatoUrl = r.optString("durl", cur.deltaPlatoUrl)
@@ -571,7 +620,6 @@ object PilotCore {
         log("[AUTOEXEC] Deployed pilot_bridge.lua")
     }
 
-    /** Single-pass fast device telemetry collector so heavily loaded cloud phones respond well within Discord limits. */
     fun collectDeviceSpecs(c: Context): Map<String, String> {
         val raw = SuShell.exec(
             """
@@ -582,8 +630,8 @@ object PilotCore {
             echo "UID=$(id -u)"
             echo "CORES=$(nproc)"
             echo "LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
-            echo "MEM=$(free -m | awk '/Mem:/ {print $2" "$3" "$4}')"
-            echo "DISK=$(df -h /storage/emulated/0 2>/dev/null | tail -n 1 | awk '{print $4" free / "$2" ("$5" used)"}')"
+            echo "MEM=$(free -m | awk '/Mem:/ {print ${'$'}2" "${'$'}3" "${'$'}4}')"
+            echo "DISK=$(df -h /storage/emulated/0 2>/dev/null | tail -n 1 | awk '{print ${'$'}4" free / "${'$'}2" ("${'$'}5" used)"}')"
             echo "IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(k=1;k<=NF;k++) if(${'$'}k=="src") print ${'$'}(k+1)}')"
             echo "WMSIZE=$(wm size 2>/dev/null | tail -n 1)"
             """.trimIndent()
@@ -657,7 +705,7 @@ object PilotCore {
         return null
     }
 
-    fun findOuterWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
+    fun findOuterWindowBounds(pkg: String): Rect? {
         val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
         val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
         var bestOuter: Rect? = null
@@ -719,11 +767,12 @@ object PilotCore {
         return fallbackX to fallbackY
     }
 
+    /** Expands a Roblox freeform window to full screen without ever cropping the image. */
     @Synchronized
     fun expandRobloxFullTab(pkg: String): WindowSnapshot {
         Rejoiner.hold3dRenderForScreenshot(6000L)
         val (fullW, fullH) = getDisplaySize()
-        val preBounds = findOuterWindowBounds(pkg, fullW, fullH)
+        val preBounds = findOuterWindowBounds(pkg)
         val taskId = findTaskId(pkg)
         var tappedMaxBtn: Pair<Int, Int>? = null
 
@@ -732,7 +781,12 @@ object PilotCore {
             SuShell.exec("input tap $mx $my")
             tappedMaxBtn = mx to my
             runCatching { Thread.sleep(750) }
-            log("[FULLTAB] Tapped [□] maximize for $pkg at ($mx, $my)")
+            val postBounds = findOuterWindowBounds(pkg)
+            if (postBounds != null && postBounds.width() < fullW - 60 && taskId != null) {
+                SuShell.exec("am task set-windowing-mode $taskId 1 >/dev/null 2>&1")
+                runCatching { Thread.sleep(500) }
+            }
+            log("[FULLTAB] Expanded $pkg to full screen")
         } else if (preBounds == null) {
             SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
             runCatching { Thread.sleep(1000) }
@@ -743,15 +797,32 @@ object PilotCore {
     @Synchronized
     fun restoreRobloxWindow(pkg: String, snap: WindowSnapshot) {
         if (snap.tappedMaxBtn != null) {
-            val fullWin = findOuterWindowBounds(pkg, snap.fullW, snap.fullH)
-                ?: Rect(0, 0, snap.fullW, snap.fullH)
+            val fullWin = findOuterWindowBounds(pkg) ?: Rect(0, 0, snap.fullW, snap.fullH)
             val (rx, ry) = findTitleBarMaximizeButton(fullWin, snap.fullW, snap.fullH)
             SuShell.exec("input tap $rx $ry")
             runCatching { Thread.sleep(300) }
-            log("[FULLTAB] Tapped [□] restore for $pkg at ($rx, $ry) -> snapped back to 2x2")
+            if (snap.taskId != null && snap.preBounds != null) {
+                val b = snap.preBounds
+                SuShell.exec(
+                    "am task set-windowing-mode ${snap.taskId} 5 >/dev/null 2>&1; " +
+                    "am task resize ${snap.taskId} ${b.left} ${b.top} ${b.right} ${b.bottom} >/dev/null 2>&1"
+                )
+            }
+            log("[FULLTAB] Restored $pkg back to 2x2")
         }
     }
 
+    /** Zero-crop full-resolution screenshot capture. */
+    @Synchronized
+    fun captureFullScreen(c: Context): File? {
+        Rejoiner.hold3dRenderForScreenshot(5000L)
+        val rawPath = File(c.cacheDir, "screen_${System.nanoTime()}.png").absolutePath
+        SuShell.exec("screencap -p '$rawPath' && chmod 666 '$rawPath'")
+        val rawFile = File(rawPath)
+        return if (rawFile.exists() && rawFile.length() > 0L) rawFile else null
+    }
+
+    /** Expands a single clone to full tab, captures full-resolution PNG (no crop), and restores 2x2. */
     @Synchronized
     fun captureFullTabScreen(c: Context, pkg: String): File? {
         val snap = expandRobloxFullTab(pkg)
@@ -762,144 +833,14 @@ object PilotCore {
         return if (rawFile.exists() && rawFile.length() > 0L) rawFile else null
     }
 
-    fun findWindowBounds(pkg: String, fullW: Int, fullH: Int): Rect? {
-        val pkgRx = Regex("""\b${Regex.escape(pkg)}\b""")
-        val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
-        val surfaceRectRx = Regex("""rect=\((-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)\)\s+(\d+)\s*x\s*(\d+)""")
-
-        fun isFullDisplayContainer(w: Int, h: Int): Boolean =
-            w >= fullW - 24 && h >= fullH - 96
-
-        var bestSurfaceRect: Rect? = null
-        var bestSurfaceArea = 0
-        var bestWindowRect: Rect? = null
-        var bestWindowArea = 0
-
-        val winDump = SuShell.exec("dumpsys window windows 2>/dev/null")
-        if (winDump.isNotEmpty()) {
-            for (block in winDump.split("Window #")) {
-                if (!pkgRx.containsMatchIn(block)) continue
-                if (block.contains("mHasSurface=false") || block.contains("mViewVisibility=0x8")) continue
-
-                val isSurface = block.contains("SurfaceView")
-                for (line in block.lines()) {
-                    val trimmed = line.trim()
-                    if (trimmed.contains("mParentFrame=") || trimmed.contains("mDisplayFrame=") ||
-                        trimmed.contains("parent=[") || trimmed.contains("display=[") ||
-                        trimmed.contains("mStable=") || trimmed.contains("mOverscan=")) {
-                        continue
-                    }
-
-                    val sm = surfaceRectRx.find(trimmed)
-                    if (sm != null) {
-                        val l = sm.groupValues[1].toFloatOrNull()?.toInt() ?: 0
-                        val t = sm.groupValues[2].toFloatOrNull()?.toInt() ?: 0
-                        val w = sm.groupValues[3].toIntOrNull() ?: 0
-                        val h = sm.groupValues[4].toIntOrNull() ?: 0
-                        if (w >= 140 && h >= 140 && !isFullDisplayContainer(w, h)) {
-                            val area = w * h
-                            val r = Rect(l, t, l + w, t + h)
-                            if (isSurface && area > bestSurfaceArea) {
-                                bestSurfaceArea = area
-                                bestSurfaceRect = r
-                            } else if (area > bestWindowArea) {
-                                bestWindowArea = area
-                                bestWindowRect = r
-                            }
-                        }
-                    }
-
-                    if (!trimmed.contains("mFrame=") && !trimmed.contains("mBounds=") &&
-                        !trimmed.contains("content=") && !trimmed.contains("frame=") &&
-                        !trimmed.contains("bounds=")) continue
-
-                    val bm = bracketRx.find(trimmed) ?: continue
-                    val l = bm.groupValues[1].toIntOrNull() ?: 0
-                    val t = bm.groupValues[2].toIntOrNull() ?: 0
-                    val r = bm.groupValues[3].toIntOrNull() ?: 0
-                    val b = bm.groupValues[4].toIntOrNull() ?: 0
-                    val w = r - l
-                    val h = b - t
-                    if (w < 140 || h < 140 || isFullDisplayContainer(w, h)) continue
-
-                    val area = w * h
-                    val rect = Rect(l, t, r, b)
-                    if (isSurface && area > bestSurfaceArea) {
-                        bestSurfaceArea = area
-                        bestSurfaceRect = rect
-                    } else if (area > bestWindowArea) {
-                        bestWindowArea = area
-                        bestWindowRect = rect
-                    }
-                }
-            }
-        }
-
-        if (bestSurfaceRect != null) return bestSurfaceRect
-        if (bestWindowRect != null) {
-            val topTrim = if (bestWindowRect.height() > 220) 38 else 0
-            val sideTrim = if (bestWindowRect.width() > 220) 2 else 0
-            return Rect(
-                bestWindowRect.left + sideTrim,
-                bestWindowRect.top + topTrim,
-                bestWindowRect.right - sideTrim,
-                bestWindowRect.bottom - sideTrim
-            )
-        }
-        return null
-    }
-
-    @Synchronized
-    fun captureScreen(c: Context, pkg: String? = null, tapInsideFirst: Boolean = false): Pair<File?, Boolean> {
-        Rejoiner.hold3dRenderForScreenshot(5000L)
-        val rawPath = File(c.cacheDir, "raw.png").absolutePath
-        val outPath = File(c.cacheDir, "crop.jpg").absolutePath
-
-        if (!pkg.isNullOrEmpty() && tapInsideFirst) {
-            val (fw, fh) = getDisplaySize()
-            val preBounds = findWindowBounds(pkg, fw, fh)
-            if (preBounds != null) {
-                val tapX = preBounds.centerX().coerceAtLeast(10)
-                val tapY = (preBounds.top + 28).coerceAtMost(preBounds.bottom - 10)
-                SuShell.exec("input tap $tapX $tapY")
-                runCatching { Thread.sleep(250) }
-            }
-        }
-
-        SuShell.exec("screencap -p '$rawPath' && chmod 666 '$rawPath'")
-        val rawFile = File(rawPath)
-        if (!rawFile.exists() || rawFile.length() == 0L) return null to false
-
-        if (pkg.isNullOrEmpty()) return rawFile to true
-
-        return runCatching {
-            val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
-            val full = BitmapFactory.decodeFile(rawPath, opts) ?: return rawFile to false
-            val w = full.width
-            val h = full.height
-
-            val bounds = findWindowBounds(pkg, w, h)
-            if (bounds == null) {
-                full.recycle()
-                return rawFile to false
-            }
-
-            val l = bounds.left.coerceIn(0, w - 1)
-            val t = bounds.top.coerceIn(0, h - 1)
-            val r = bounds.right.coerceIn(l + 1, w)
-            val b = bounds.bottom.coerceIn(t + 1, h)
-
-            val cropped = Bitmap.createBitmap(full, l, t, r - l, b - t)
-            full.recycle()
-
-            val outFile = File(outPath)
-            FileOutputStream(outFile).use { cropped.compress(Bitmap.CompressFormat.JPEG, 92, it) }
-            cropped.recycle()
-            rawFile.delete()
-            outFile to true
-        }.getOrElse {
-            rawFile to false
-        }
+    /** Grabs the latest native Roblox CaptureService screenshot if saved within the last 12 seconds. */
+    fun findRecentNativeRobloxCapture(): File? {
+        val found = SuShell.exec(
+            "find /storage/emulated/0/Pictures /storage/emulated/0/DCIM -maxdepth 3 -type f \\( -iname '*Roblox*' -o -iname '*Capture*' \\) -mmin -1 2>/dev/null | head -n 1"
+        ).trim()
+        if (found.isEmpty()) return null
+        val f = File(found)
+        return if (f.exists() && f.length() > 0L && (System.currentTimeMillis() - f.lastModified()) < 15_000L) f else null
     }
 
     fun scanRbx(c: Context): List<AccInfo> {
@@ -933,12 +874,25 @@ object PilotCore {
                 res.add(AccInfo(pkg, u, "ACTIVE"))
                 Rejoiner.slots.getOrPut(pkg) { CloneSlot(pkg) }.apply {
                     if (username != u) username = u
-                    if (!paused && status != "ACTIVE") status = "ACTIVE"
+                    if (!paused && status != "ACTIVE" && status != "NO_DELTA_KEY" && status != "COOLDOWN") {
+                        status = "ACTIVE"
+                    }
                 }
             } else {
                 val old = hp.getString(pkg, null)
-                if (!old.isNullOrEmpty()) res.add(AccInfo(pkg, old, "LOGGED OUT"))
-                else res.add(AccInfo(pkg, "Empty", "EMPTY"))
+                if (!old.isNullOrEmpty()) {
+                    res.add(AccInfo(pkg, old, "LOGGED OUT"))
+                    Rejoiner.slots.getOrPut(pkg) { CloneSlot(pkg) }.apply {
+                        username = old
+                        if (status != "REVOKED") status = "LOGGED_OUT"
+                    }
+                } else {
+                    res.add(AccInfo(pkg, "Empty", "EMPTY"))
+                    Rejoiner.slots.getOrPut(pkg) { CloneSlot(pkg) }.apply {
+                        username = ""
+                        status = "EMPTY"
+                    }
+                }
             }
         }
         if (changed) edit.apply()
@@ -948,9 +902,13 @@ object PilotCore {
     }
 
     fun wipe(c: Context, pkg: String, clearHist: Boolean): Boolean {
+        val oldUser = getSlotHistoryUser(c, pkg).ifEmpty { readDiskUsername(pkg) }
         val revoked = SessionVault.fullLogoutAndWipe(c, pkg)
         SuShell.exec("rm -rf /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/*")
         if (clearHist) {
+            if (oldUser.isNotEmpty()) {
+                NousigiConfigManager.deleteAllUserJsonFiles(oldUser, pkg)
+            }
             histPrefs(c).edit().remove(pkg).apply()
             Rejoiner.slots[pkg]?.apply { username = ""; status = "EMPTY"; placeId = "" }
         } else {
@@ -960,13 +918,17 @@ object PilotCore {
         return revoked
     }
 
+    /**
+     * Packs Roblox session files AND recursively migrates all user .json files across
+     * Delta/Workspace/ (Nousigi Hub, cache, subfolders) matching Username or numeric UserId.
+     */
     @Synchronized
     fun packAccountBundle(c: Context, pkg: String, username: String): Pair<File?, Int> {
-        val safeUser = username.replace(Regex("[^a-zA-Z0-9_-]"), "")
         val bundleFile = File(c.cacheDir, "xfer_${System.nanoTime()}.tar.gz")
         val stageDir = "/data/local/tmp/pilot_stage_${System.nanoTime()}"
 
-        val sh = """
+        SuShell.exec(
+            """
             am force-stop $pkg
             rm -rf '$stageDir' && mkdir -p '$stageDir/session' '$stageDir/ext'
             for sub in app_webview/Default shared_prefs files/LocalStorage files/appData/LocalStorage; do
@@ -975,25 +937,21 @@ object PilotCore {
                 cp -rf "/data/data/$pkg/${'$'}sub/." "$stageDir/session/${'$'}sub/" 2>/dev/null
               fi
             done
-            cnt=0
-            if [ -n "$safeUser" ]; then
-              cd /storage/emulated/0 2>/dev/null && find -L . -maxdepth 8 -iname "*${safeUser}*" ! -path "./Android/data/*" ! -path "./Android/obb/*" ! -path "./DCIM/*" ! -path "./Pictures/*" ! -path "./Movies/*" ! -path "./Music/*" 2>/dev/null | while IFS= read -r rel; do
-                [ -z "${'$'}rel" ] && continue
-                clean=${'$'}{rel#./}
-                mkdir -p "$stageDir/ext/${'$'}(dirname "${'$'}clean")"
-                cp -rf "/storage/emulated/0/${'$'}clean" "$stageDir/ext/${'$'}clean" 2>/dev/null
-                rm -rf "/storage/emulated/0/${'$'}clean" 2>/dev/null
-              done
-              cnt=${'$'}(find "$stageDir/ext" -type f 2>/dev/null | wc -l)
-            fi
+            """.trimIndent()
+        )
+
+        val migratedJsonCount = NousigiConfigManager.migrateUserJsonFilesToStage("$stageDir/ext", username, pkg)
+
+        val out = SuShell.exec(
+            """
+            cnt=${'$'}(find "$stageDir/ext" -type f 2>/dev/null | wc -l)
             tar -czf '${bundleFile.absolutePath}' -C '$stageDir' . 2>/dev/null
             chmod 666 '${bundleFile.absolutePath}' 2>/dev/null
             rm -rf '$stageDir'
             echo "FILES:${'$'}cnt"
-        """.trimIndent()
-
-        val out = SuShell.exec(sh)
-        val fileCount = Regex("""FILES:(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            """.trimIndent()
+        )
+        val fileCount = Regex("""FILES:(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: migratedJsonCount
         return if (bundleFile.exists() && bundleFile.length() > 0L) bundleFile to fileCount else null to 0
     }
 
@@ -1030,6 +988,7 @@ object PilotCore {
 
         val out = SuShell.exec(sh)
         bundleFile.delete()
+        KeyAutomator.cleanBakFiles()
         val ok = out.contains("RESTORED:")
         val count = Regex("""RESTORED:(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         if (ok && username.isNotEmpty() && username != "Empty") {
@@ -1040,7 +999,8 @@ object PilotCore {
         return ok to count
     }
 
-    fun arrange2x2(): Int {
+    /** Arranges ONLY clones that have an active logged-in account (skips Empty / Logged Out slots). */
+    fun arrange2x2(c: Context): Int {
         val (rawW, rawH) = getDisplaySize()
         val w = max(rawW, rawH)
         val h = min(rawW, rawH)
@@ -1055,7 +1015,8 @@ object PilotCore {
             Rect(halfW, topOffset + halfH, w, h)
         )
 
-        val clones = Rejoiner.discoverClones().take(4)
+        scanRbx(c)
+        val clones = Rejoiner.discoverClones().filter { Rejoiner.hasLoggedInAccount(c, it.pkg) }.take(4)
         clones.forEachIndexed { idx, slot ->
             SuShell.exec("monkey -p ${slot.pkg} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
             runCatching { Thread.sleep(600) }
@@ -1076,10 +1037,11 @@ object PilotCore {
         val now = System.currentTimeMillis()
         val telemetry = if (slot != null && slot.lastPingMs > 0L) {
             val ago = (now - slot.lastPingMs) / 1000L
-            " • `${slot.fps} FPS` • ping `${ago}s` ago"
+            " • `${slot.fps} FPS` • `${slot.pingMs}ms` • ping `${ago}s` ago"
         } else ""
         val extra = when {
             slot != null && slot.status == "NO_DELTA_KEY" -> " ⚠️ *(No Delta Key)*"
+            slot != null && slot.status == "COOLDOWN" -> " 🛡️ *(268 Cooldown)*"
             slot != null && slot.paused -> " ⏸️ *(Paused)*"
             else -> ""
         }
@@ -1228,14 +1190,12 @@ class DiscordBot(private val ctx: Context) {
         replyInteraction(id, token, type, data)
     }
 
-    /** Immediately defers an interaction (type 5) so slow/loaded cloud phones never hit Discord's 3s timeout. */
     private fun deferInteraction(id: String, token: String, ephemeral: Boolean = false) {
         val data = JSONObject()
         if (ephemeral) data.put("flags", 64)
         replyInteraction(id, token, 5, data)
     }
 
-    /** Edits the original deferred interaction response via webhook PATCH. */
     private fun editDeferredEmbed(
         appId: String,
         token: String,
@@ -1258,7 +1218,7 @@ class DiscordBot(private val ctx: Context) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
         val summary = if (list.isNotEmpty()) PilotCore.fmtAll(list) else "No Roblox slots found."
-        val (img, _) = PilotCore.captureScreen(ctx, null)
+        val img = PilotCore.captureFullScreen(ctx)
         if (img != null) {
             sendImageEmbed(ch, "📸 $cl — Full Device Screen", summary, COLOR_BLUE, img)
             img.delete()
@@ -1267,9 +1227,14 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
+    /**
+     * Rich, zero-crop !checkstatus dashboard:
+     * - Signals Roblox CaptureService for clean unobstructed render (with full-tab maximize fallback)
+     * - Displays live telemetry fields + interactive action buttons underneath.
+     */
     fun sendAccountShot(ch: String, triggerMsgId: String, rawQuery: String) {
         val cl = PilotCore.getCloud(ctx)
-        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+        val list = PilotCore.scanRbx(ctx)
         val query = rawQuery.trim()
         val q = query.lowercase()
 
@@ -1283,21 +1248,76 @@ class DiscordBot(private val ctx: Context) {
         }
 
         if (matches.isEmpty()) {
-            runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
-            if (!hasBotRepliedAfter(ch, triggerMsgId)) {
-                sendEmbed(ch, "⚠️ Account Not Found", "No matching account found for `$query` on any online cloud phone.", COLOR_AMBER)
+            if (triggerMsgId.isNotEmpty()) {
+                runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
+                if (!hasBotRepliedAfter(ch, triggerMsgId)) {
+                    sendEmbed(ch, "⚠️ Account Not Found", "No matching account found for `$query` on any online cloud phone.", COLOR_AMBER)
+                }
             }
             return
         }
 
         for ((idx, acc) in matches) {
-            val img = PilotCore.captureFullTabScreen(ctx, acc.pkg)
+            val slot = Rejoiner.slots[acc.pkg]
+            val now = System.currentTimeMillis()
+            val isInGame = acc.status == "ACTIVE" && slot != null && slot.lastPingMs > 0L && (now - slot.lastPingMs) < 35_000L
+
+            var img: File? = null
+            if (isInGame) {
+                Rejoiner.requestLuaNativeCapture(acc.user)
+                val deadline = System.currentTimeMillis() + 5500L
+                while (System.currentTimeMillis() < deadline) {
+                    Thread.sleep(500L)
+                    val nativeShot = PilotCore.findRecentNativeRobloxCapture()
+                    if (nativeShot != null) {
+                        img = nativeShot
+                        break
+                    }
+                }
+            }
+            if (img == null) {
+                img = PilotCore.captureFullTabScreen(ctx, acc.pkg)
+            }
+
+            val placeStr = slot?.placeId?.ifBlank { "Auto" } ?: "N/A"
+            val jobStr = slot?.jobId?.take(12)?.ifBlank { "—" } ?: "—"
+            val stateStr = slot?.gameState ?: acc.status
+            val fpsStr = if (slot != null && slot.lastPingMs > 0L) "${slot.fps} FPS" else "—"
+            val pingStr = if (slot != null && slot.pingMs > 0) "${slot.pingMs} ms" else "—"
+            val memStr = if (slot != null && slot.memMb > 0) "${slot.memMb} MB" else "—"
+            val agoStr = if (slot != null && slot.lastPingMs > 0L) "${(now - slot.lastPingMs) / 1000L}s ago" else "No ping"
+            val nousigiFound = NousigiConfigManager.findAllUserJsonFiles(acc.user).size
+
+            val fields = listOf(
+                Triple("🎮 Game & Server", "Place: `$placeStr`\nJob: `$jobStr`", true),
+                Triple("⚡ Performance", "`$fpsStr` • `$pingStr`\nRAM: `$memStr`", true),
+                Triple("📡 State & Config", "State: **$stateStr**\nPing: `$agoStr` • JSONs: `$nousigiFound`", true)
+            )
+
+            fun btn(label: String, customId: String, style: Int): JSONObject =
+                JSONObject().put("type", 2).put("style", style).put("label", label).put("custom_id", customId)
+
+            val row = JSONArray().put(
+                JSONObject().put("type", 1).put(
+                    "components", JSONArray()
+                        .put(btn("🔁 Rejoin Slot", "pilot_slotact:rejoin:$cl:${acc.pkg}", 3))
+                        .put(btn("🎛️ Nousigi Config", "pilot_slotact:nousigi:$cl:${acc.user}", 1))
+                        .put(btn("📸 Refresh Shot", "pilot_slotact:refresh:$cl:${acc.user}", 2))
+                        .put(btn(if (slot?.paused == true) "▶️ Resume" else "⏸️ Pause", "pilot_slotact:togglepause:$cl:${acc.pkg}", 2))
+                )
+            )
+
+            val color = when {
+                acc.status != "ACTIVE" -> COLOR_RED
+                slot?.paused == true -> COLOR_AMBER
+                else -> COLOR_GREEN
+            }
             val desc = PilotCore.fmtLine(idx, acc)
             if (img != null) {
-                sendImageEmbed(ch, "📸 $cl — Full-Tab Status (${acc.user})", desc, COLOR_GREEN, img)
-                img.delete()
+                sendImageEmbed(ch, "📊 $cl — Live Account Status (${acc.user})", desc, color, img, fields, row)
+                if (img.absolutePath.startsWith(ctx.cacheDir.absolutePath)) img.delete()
             } else {
-                sendEmbed(ch, "📱 $cl — Status (${acc.user})", desc, COLOR_BLUE)
+                sendEmbed(ch, "📊 $cl — Live Account Status (${acc.user})", desc, color, fields, row)
             }
         }
     }
@@ -1311,13 +1331,154 @@ class DiscordBot(private val ctx: Context) {
         }.firstOrNull() ?: return
 
         val (idx, acc) = match
-        val (img, croppedOk) = PilotCore.captureScreen(ctx, acc.pkg, tapInsideFirst = false)
-        val note = if (!croppedOk) "\n*(Window minimized/hidden — showing full screen)*" else ""
-        val desc = "${PilotCore.fmtLine(idx, acc)}$note"
+        val img = PilotCore.findRecentNativeRobloxCapture() ?: PilotCore.captureFullScreen(ctx)
+        val desc = PilotCore.fmtLine(idx, acc)
         if (img != null) {
             sendImageEmbed(ch, "📸 $cl — Lua Snapshot (${acc.user})", desc, COLOR_PURPLE, img)
-            img.delete()
+            if (img.absolutePath.startsWith(ctx.cacheDir.absolutePath)) img.delete()
         }
+    }
+
+    /** Builds the interactive Discord Nousigi UI Config Editor embed + components for an account. */
+    private fun buildNousigiEditorPayload(
+        cloud: String,
+        username: String,
+        filePathArg: String = "",
+        categoryFilter: String = "All",
+        page: Int = 0
+    ): Pair<JSONObject, JSONArray> {
+        val uid = NousigiConfigManager.resolveUserId(username)
+        val allFiles = NousigiConfigManager.findAllUserJsonFiles(username, uid)
+        val activePath = filePathArg.ifBlank { NousigiConfigManager.ensureDefaultConfig(ctx, username) }
+        val settings = NousigiConfigManager.readSettings(activePath)
+        val filtered = if (categoryFilter.equals("All", true)) settings
+        else settings.filter { it.category.equals(categoryFilter, true) }
+
+        val pageSize = 15
+        val totalPages = max(1, (filtered.size + pageSize - 1) / pageSize)
+        val safePage = page.coerceIn(0, totalPages - 1)
+        val slice = filtered.drop(safePage * pageSize).take(pageSize)
+
+        val fileSummary = if (allFiles.isEmpty()) "`${activePath.removePrefix("/storage/emulated/0/")}`"
+        else allFiles.joinToString("\n") {
+            val mark = if (it.fullPath == activePath) "👉 " else "• "
+            "$mark`${it.displayName}`"
+        }
+
+        val lines = if (slice.isEmpty()) {
+            "*No configurable settings in category **$categoryFilter**.*"
+        } else {
+            slice.joinToString("\n") { entry ->
+                val icon = when (entry.type) {
+                    "bool" -> if (entry.valueStr.equals("true", true)) "🟢" else "🔴"
+                    "number" -> "🔢"
+                    else -> "📝"
+                }
+                val dispVal = if (entry.valueStr.length > 42) entry.valueStr.take(39) + "..." else entry.valueStr.ifBlank { "(blank)" }
+                "$icon **${entry.key}:** `$dispVal`"
+            }
+        }
+
+        val fields = listOf(
+            Triple("📁 Detected User JSONs (${max(1, allFiles.size)})", fileSummary.take(1000), false),
+            Triple("🎛️ Settings — $categoryFilter (Page ${safePage + 1}/$totalPages)", lines.take(1000), false)
+        )
+
+        val embed = buildEmbed(
+            title = "🎛️ Nousigi UI Config — $username ($cloud)",
+            description = "Select any setting below to toggle `true/false` instantly or edit text/numbers (`.bak` files auto-cleaned):",
+            color = COLOR_PURPLE,
+            fields = fields
+        )
+
+        val rows = JSONArray()
+
+        // Row 1: Category Filter Dropdown
+        val cats = listOf("All", "Auto Joiners", "Match Flow", "Webhooks", "Other")
+        val catOpts = JSONArray()
+        cats.forEach { cName ->
+            catOpts.put(
+                JSONObject()
+                    .put("label", "Category: $cName")
+                    .put("value", cName)
+                    .put("default", cName.equals(categoryFilter, true))
+            )
+        }
+        rows.put(
+            JSONObject().put("type", 1).put(
+                "components", JSONArray().put(
+                    JSONObject()
+                        .put("type", 3)
+                        .put("custom_id", "pilot_ns_cat:$cloud:$username:$safePage")
+                        .put("placeholder", "Filter Category ($categoryFilter)...")
+                        .put("options", catOpts)
+                )
+            )
+        )
+
+        // Row 2: Setting Selector Dropdown (up to 25 items)
+        if (slice.isNotEmpty()) {
+            val setOpts = JSONArray()
+            slice.forEach { entry ->
+                val badge = when (entry.type) {
+                    "bool" -> if (entry.valueStr.equals("true", true)) "[ON] " else "[OFF] "
+                    else -> "[EDIT] "
+                }
+                setOpts.put(
+                    JSONObject()
+                        .put("label", "$badge${entry.key}".take(100))
+                        .put("value", entry.key.take(100))
+                        .put("description", "Current: ${entry.valueStr}".take(100))
+                )
+            }
+            rows.put(
+                JSONObject().put("type", 1).put(
+                    "components", JSONArray().put(
+                        JSONObject()
+                            .put("type", 3)
+                            .put("custom_id", "pilot_ns_edit:$cloud:$username:$categoryFilter:$safePage")
+                            .put("placeholder", "Tap a setting to toggle or edit...")
+                            .put("options", setOpts)
+                    )
+                )
+            )
+        }
+
+        // Row 3: File Switcher (if multiple JSON files exist for this user across Nousigi Hub / cache)
+        if (allFiles.size > 1) {
+            val fileOpts = JSONArray()
+            allFiles.take(25).forEach { uf ->
+                fileOpts.put(
+                    JSONObject()
+                        .put("label", uf.displayName.take(100))
+                        .put("value", uf.fullPath.take(100))
+                        .put("default", uf.fullPath == activePath)
+                )
+            }
+            rows.put(
+                JSONObject().put("type", 1).put(
+                    "components", JSONArray().put(
+                        JSONObject()
+                            .put("type", 3)
+                            .put("custom_id", "pilot_ns_file:$cloud:$username")
+                            .put("placeholder", "Switch user JSON file (${allFiles.size} found)...")
+                            .put("options", fileOpts)
+                    )
+                )
+            )
+        }
+
+        // Row 4: Action Buttons (Prev/Next Page + Rejoin Account)
+        fun btn(label: String, customId: String, style: Int, disabled: Boolean = false): JSONObject =
+            JSONObject().put("type", 2).put("style", style).put("label", label).put("custom_id", customId).put("disabled", disabled)
+
+        val btnArr = JSONArray()
+            .put(btn("◀ Prev", "pilot_ns_btn:prev:$cloud:$username:$categoryFilter:$safePage", 2, safePage <= 0))
+            .put(btn("Next ▶", "pilot_ns_btn:next:$cloud:$username:$categoryFilter:$safePage", 2, safePage >= totalPages - 1))
+            .put(btn("🔁 Rejoin $username", "pilot_ns_btn:rejoin:$cloud:$username:$categoryFilter:$safePage", 3))
+        rows.put(JSONObject().put("type", 1).put("components", btnArr))
+
+        return embed to rows
     }
 
     private fun connect() {
@@ -1418,6 +1579,25 @@ class DiscordBot(private val ctx: Context) {
                 )
                 sendEmbed(ch, "🩺 $cl — Fleet Health", specs["Network & Uptime"] ?: "", COLOR_GREEN, fields)
             }
+            "!nousigi" -> ioExec.execute {
+                if (arg.isEmpty()) {
+                    collectAndPostSharedCloudMenu(ch, msgId, "nousigi_pick", "🎛️ Select UGPhone to Configure Nousigi UI")
+                } else {
+                    val list = PilotCore.scanRbx(ctx)
+                    val q = arg.lowercase()
+                    val match = list.firstOrNull { it.user != "Empty" && it.user.equals(q, true) }
+                        ?: list.firstOrNull { it.user != "Empty" && it.user.lowercase().contains(q) }
+                    if (match != null) {
+                        val (embed, rows) = buildNousigiEditorPayload(cl, match.user)
+                        sendEmbed(ch, embed.getString("title"), embed.getString("description"), COLOR_PURPLE, extractFields(embed), rows)
+                    } else {
+                        runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
+                        if (!hasBotRepliedAfter(ch, msgId)) {
+                            sendEmbed(ch, "⚠️ Account Not Found", "No account matching `$arg` found on any online UGPhone.", COLOR_AMBER)
+                        }
+                    }
+                }
+            }
             "!createconfig", "!newconfig" -> ioExec.execute {
                 val btn = JSONObject()
                     .put("type", 2)
@@ -1433,7 +1613,11 @@ class DiscordBot(private val ctx: Context) {
                 )
             }
             "!login" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "login", "🔐 Select Cloud Phone to Login Roblox Account")
+                if (arg.isNotEmpty() && PilotCore.matchesCloudTarget(ctx, arg)) {
+                    postLoginSlotMenuToChannel(ch, cl)
+                } else if (arg.isEmpty()) {
+                    collectAndPostSharedCloudMenu(ch, msgId, "login", "🔐 Select Cloud Phone to Login Roblox Account")
+                }
             }
             "!autorejoin", "!ar" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "ar", "🔁 Select Cloud Phone to Configure Auto-Rejoin & Keys", includeAllOption = true)
@@ -1447,17 +1631,20 @@ class DiscordBot(private val ctx: Context) {
                     }
                 } else {
                     ioExec.execute {
-                        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+                        val list = PilotCore.scanRbx(ctx)
                         val q = arg.lowercase()
-                        val match = list.firstOrNull { it.user != "Empty" && (it.user.lowercase().contains(q) || PilotCore.similarity(q, it.user.lowercase()) >= 0.45) }
+                        val match = list.firstOrNull {
+                            it.user != "Empty" && it.status == "ACTIVE" &&
+                                (it.user.lowercase().contains(q) || PilotCore.similarity(q, it.user.lowercase()) >= 0.45)
+                        }
                         if (match != null) {
                             sendEmbed(ch, "🔁 Force-Rejoining Account", "Restarting **${match.user}** (`${match.pkg}`) on **$cl**...", COLOR_BLUE)
-                            val slot = Rejoiner.slots.getOrPut(match.pkg) { CloneSlot(match.pkg, username = match.user) }
+                            val slot = Rejoiner.slots.getOrPut(match.pkg) { CloneSlot(match.pkg, username = match.user, status = "ACTIVE") }
                             Rejoiner.queueStaggeredLaunch(ctx, slot, "Manual !rejoin")
                         } else {
                             runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
                             if (!hasBotRepliedAfter(ch, msgId)) {
-                                sendEmbed(ch, "⚠️ Account Not Found", "No matching account found for `$arg` on any online cloud phone.", COLOR_AMBER)
+                                sendEmbed(ch, "⚠️ Active Account Not Found", "No logged-in account found for `$arg` on any online cloud phone.", COLOR_AMBER)
                             }
                         }
                     }
@@ -1466,7 +1653,7 @@ class DiscordBot(private val ctx: Context) {
             "!pause", "!resume" -> {
                 if (arg.isEmpty()) return
                 ioExec.execute {
-                    val slot = Rejoiner.setSlotPaused(arg, paused = (cmd == "!pause"))
+                    val slot = Rejoiner.setSlotPaused(ctx, arg, paused = (cmd == "!pause"))
                     if (slot != null) {
                         val isPaused = cmd == "!pause"
                         sendEmbed(
@@ -1485,28 +1672,22 @@ class DiscordBot(private val ctx: Context) {
                 if (url.isEmpty()) {
                     ioExec.execute {
                         if (!hasBotRepliedAfter(ch, msgId)) {
-                            sendEmbed(ch, "⚠️ Missing URL", "Usage: `!getkey [cloud] <luarmor_or_platorelay_url>`", COLOR_AMBER)
+                            sendEmbed(ch, "⚠️ Missing URL", "Usage: `!getkey [cloud] <platorelay_url>`", COLOR_AMBER)
                         }
                     }
                     return
                 }
-                if (targetCloud.isNotEmpty() && !targetCloud.equals(cl, true)) return
+                if (targetCloud.isNotEmpty() && !PilotCore.matchesCloudTarget(ctx, targetCloud)) return
                 ioExec.execute {
                     if (targetCloud.isEmpty()) {
                         val won = postSingleCoordinatorEmbed(
                             ch, msgId, "🔑 Chrome Key Helper Started",
-                            "Opened URL in Chrome on **$cl** — complete verification and tap **Copy** on your key.",
+                            "Started Delta key helper on **$cl** (skips empty/logged-out slots)...",
                             COLOR_PURPLE, null
                         )
                         if (!won) return@execute
                     }
-                    if (url.contains("luarmor", true)) {
-                        val updated = Rejoiner.loadConfig(ctx).copy(luarmorUrl = url)
-                        Rejoiner.saveConfig(ctx, updated)
-                        KeyAutomator.startNousigiRenewal(ctx)
-                    } else {
-                        KeyAutomator.startDeltaRenewal(ctx, explicitUrl = url)
-                    }
+                    KeyAutomator.startDeltaRenewal(ctx, explicitUrl = url)
                 }
             }
             "!setkey" -> {
@@ -1514,14 +1695,14 @@ class DiscordBot(private val ctx: Context) {
                 if (tokens.isEmpty()) {
                     ioExec.execute {
                         if (!hasBotRepliedAfter(ch, msgId)) {
-                            sendEmbed(ch, "⚠️ Missing Key", "Usage: `!setkey [cloud] <luarmor_or_delta_key>`", COLOR_AMBER)
+                            sendEmbed(ch, "⚠️ Missing Key", "Usage: `!setkey [cloud] <nousigi_or_delta_key>`", COLOR_AMBER)
                         }
                     }
                     return
                 }
                 val targetCloud = if (tokens.size >= 2) tokens[0] else ""
                 val keyVal = if (tokens.size >= 2) tokens[1] else tokens[0]
-                if (targetCloud.isNotEmpty() && !targetCloud.equals(cl, true)) return
+                if (targetCloud.isNotEmpty() && !PilotCore.matchesCloudTarget(ctx, targetCloud)) return
                 ioExec.execute {
                     val (ok, msg) = KeyAutomator.applyManualKey(ctx, keyVal)
                     sendEmbed(ch, if (ok) "✅ Key Updated ($cl)" else "❌ Key Update Failed ($cl)", msg, if (ok) COLOR_GREEN else COLOR_RED)
@@ -1583,7 +1764,14 @@ class DiscordBot(private val ctx: Context) {
                 }
             }
             "!scan" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "scan_device", "📱 Select UGPhone to Inspect Device & Fleet")
+                if (arg.isNotEmpty()) {
+                    if (PilotCore.matchesCloudTarget(ctx, arg)) {
+                        val (embed, buttons) = buildDeviceScanDashboard(cl)
+                        sendEmbed(ch, embed.getString("title"), embed.getString("description"), COLOR_BLUE, extractFields(embed), buttons)
+                    }
+                } else {
+                    collectAndPostSharedCloudMenu(ch, msgId, "scan_device", "📱 Select UGPhone to Inspect Device & Fleet")
+                }
             }
             "!logout" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "l", "🚪 Select Cloud to Logout (Revoke Token + Wipe)")
@@ -1592,16 +1780,38 @@ class DiscordBot(private val ctx: Context) {
                 collectAndPostSharedCloudMenu(ch, msgId, "d", "🗑️ Select Cloud to Delete Account & History")
             }
             "!arrange" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "arrange", "🪟 Select Cloud to Arrange 2×2 Grid", includeAllOption = true)
+                if (arg.isNotEmpty() && PilotCore.matchesCloudTarget(ctx, arg)) {
+                    val n = PilotCore.arrange2x2(ctx)
+                    sendEmbed(ch, "🪟 Arranged 2×2 ($cl)", "Snapped **$n** logged-in clones into 2×2 grid.", COLOR_GREEN)
+                } else if (arg.isEmpty()) {
+                    collectAndPostSharedCloudMenu(ch, msgId, "arrange", "🪟 Select Cloud to Arrange 2×2 Grid", includeAllOption = true)
+                }
             }
             "!logs" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "logs", "📜 Select Cloud to View Live Logs")
+                if (arg.isNotEmpty() && PilotCore.matchesCloudTarget(ctx, arg)) {
+                    val dump = PilotCore.getLogs().takeLast(25).joinToString("\n").ifBlank { "No logs yet." }
+                    sendEmbed(ch, "📜 Live Logs ($cl)", "```\n${dump.take(1800)}\n```", COLOR_BLUE)
+                } else if (arg.isEmpty()) {
+                    collectAndPostSharedCloudMenu(ch, msgId, "logs", "📜 Select Cloud to View Live Logs")
+                }
             }
             "!killall" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "killall", "🛑 Select Cloud to Force-Stop All Clones", includeAllOption = true)
+                if (arg.isNotEmpty() && PilotCore.matchesCloudTarget(ctx, arg)) {
+                    val list = Rejoiner.discoverClones()
+                    list.forEach { SuShell.exec("am force-stop ${it.pkg}") }
+                    sendEmbed(ch, "🛑 Force-Stopped ($cl)", "Stopped **${list.size}** clones.", COLOR_RED)
+                } else if (arg.isEmpty()) {
+                    collectAndPostSharedCloudMenu(ch, msgId, "killall", "🛑 Select Cloud to Force-Stop All Clones", includeAllOption = true)
+                }
             }
             "!reboot" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "reboot", "🔄 Select Cloud Phone to Reboot")
+                if (arg.isNotEmpty() && PilotCore.matchesCloudTarget(ctx, arg)) {
+                    sendEmbed(ch, "🔄 Rebooting ($cl)", "Rebooting device now (Rejoiner auto-starts on boot)...", COLOR_RED)
+                    Thread.sleep(1000)
+                    SuShell.exec("reboot")
+                } else if (arg.isEmpty()) {
+                    collectAndPostSharedCloudMenu(ch, msgId, "reboot", "🔄 Select Cloud Phone to Reboot")
+                }
             }
             "!changeslot" -> ioExec.execute {
                 if (arg.isEmpty()) {
@@ -1650,7 +1860,9 @@ class DiscordBot(private val ctx: Context) {
             "!ss" -> ioExec.execute {
                 if (arg.equals("all", ignoreCase = true)) {
                     captureAndSendAll(ch)
-                } else {
+                } else if (arg.isNotEmpty() && PilotCore.matchesCloudTarget(ctx, arg)) {
+                    captureAndSendAll(ch)
+                } else if (arg.isEmpty()) {
                     collectAndPostSharedCloudMenu(ch, msgId, "ss", "📸 Select Cloud to Screenshot")
                 }
             }
@@ -1720,7 +1932,37 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    /** Builds the full !scan Device & Fleet Embed + 2 rows of interactive buttons for a UGPhone. */
+    private fun extractFields(embed: JSONObject): List<Triple<String, String, Boolean>> {
+        val arr = embed.optJSONArray("fields") ?: return emptyList()
+        val list = mutableListOf<Triple<String, String, Boolean>>()
+        for (i in 0 until arr.length()) {
+            val f = arr.getJSONObject(i)
+            list.add(Triple(f.optString("name"), f.optString("value"), f.optBoolean("inline")))
+        }
+        return list
+    }
+
+    private fun postLoginSlotMenuToChannel(ch: String, cloud: String) {
+        val list = PilotCore.scanRbx(ctx)
+        if (list.isEmpty()) {
+            sendEmbed(ch, "📱 $cloud", "No Roblox instances found.", COLOR_AMBER)
+            return
+        }
+        val opts = JSONArray()
+        list.take(25).forEachIndexed { idx, a ->
+            opts.put(
+                JSONObject()
+                    .put("label", "[${idx + 1}] ${a.user} [${a.status}] (${a.pkg.removePrefix("com.roblox.")})".take(100))
+                    .put("value", a.pkg.take(100))
+                    .put("description", "Login Roblox account into ${a.pkg}".take(100))
+            )
+        }
+        val menu = JSONObject().put("type", 3).put("custom_id", "pilot_login_slot:go:$cloud")
+            .put("placeholder", "Select Roblox slot on $cloud...").put("options", opts)
+        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+        sendEmbed(ch, "🔐 Select Slot ($cloud)", PilotCore.fmtAll(list), COLOR_BLUE, components = row)
+    }
+
     private fun buildDeviceScanDashboard(cloud: String): Pair<JSONObject, JSONArray> {
         val specs = PilotCore.collectDeviceSpecs(ctx)
         val scanList = PilotCore.scanRbx(ctx)
@@ -1732,7 +1974,7 @@ class DiscordBot(private val ctx: Context) {
 
         val embed = buildEmbed(
             title = "📱 $cloud — Device & Fleet Dashboard",
-            description = "Live hardware telemetry, active executor slots, and instant key/device controls:",
+            description = "Live hardware telemetry, active executor slots, and instant key/config/device controls:",
             color = COLOR_BLUE,
             fields = fields
         )
@@ -1749,12 +1991,13 @@ class DiscordBot(private val ctx: Context) {
                 .put(btn("🔑 Check Nousigi Key", "pilot_dev:check_nousigi:$cloud", 1))
                 .put(btn("⏳ Check Delta Key", "pilot_dev:check_delta:$cloud", 1))
                 .put(btn("✏️ Change Nousigi Key", "pilot_dev:change_nousigi:$cloud", 3))
+                .put(btn("🎛️ Nousigi Config", "pilot_dev:nousigi_cfg:$cloud", 1))
                 .put(btn("🔁 Rejoin All", "pilot_dev:rejoin_all:$cloud", 3))
-                .put(btn("🛑 Kill All", "pilot_dev:kill_all:$cloud", 4))
         )
 
         val row2 = JSONObject().put("type", 1).put(
             "components", JSONArray()
+                .put(btn("🛑 Kill All", "pilot_dev:kill_all:$cloud", 4))
                 .put(btn("🪟 Arrange 2×2", "pilot_dev:arrange:$cloud", 2))
                 .put(btn("📸 Screenshot", "pilot_dev:ss:$cloud", 2))
                 .put(btn("🧹 Clean .bak & Logs", "pilot_dev:clean:$cloud", 2))
@@ -1813,7 +2056,7 @@ class DiscordBot(private val ctx: Context) {
     ) {
         val myCloud = PilotCore.getCloud(ctx)
         val myVer = PilotCore.APP_VERSION
-        val initialJitter = (abs(myCloud.hashCode()) % 15) * 95L
+        val initialJitter = (abs(myCloud.hashCode()) % 18) * 95L
         if (initialJitter > 0) runCatching { Thread.sleep(initialJitter) }
 
         var existing = findCanonicalEmbedMessage(ch, anchorMsgId, title)
@@ -1839,7 +2082,7 @@ class DiscordBot(private val ctx: Context) {
                 .put("placeholder", "Select Cloud Phone...")
                 .put("options", opts)
             val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-            val postedRaw = sendEmbed(ch, title, "Choose a UGPhone from the dropdown below:", COLOR_BLUE, emptyList(), row)
+            val postedRaw = sendEmbed(ch, title, "Choose a UGPhone from the dropdown below (or pass cloud name directly):", COLOR_BLUE, emptyList(), row)
             val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
 
             runCatching { Thread.sleep(380) }
@@ -1852,7 +2095,7 @@ class DiscordBot(private val ctx: Context) {
             }
         }
 
-        val staggerMs = ((abs(myCloud.hashCode()) % 25) * 190L) + 300L
+        val staggerMs = ((abs(myCloud.hashCode()) % 32) * 200L) + 320L
         runCatching { Thread.sleep(staggerMs) }
 
         val targetId = existing.optString("id")
@@ -1984,14 +2227,14 @@ class DiscordBot(private val ctx: Context) {
         if (msgId.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$msgId")
 
         if (ok) {
-            PilotCore.log("[XFER-OK] $srcUser restored to $dstPkg (+$scriptCount script files)")
+            PilotCore.log("[XFER-OK] $srcUser restored to $dstPkg (+$scriptCount JSON/script files)")
             sendEmbed(
                 ch,
                 "✅ Slot Transfer Complete",
                 "• **Account:** `$srcUser`\n" +
                 "• **From:** **$srcCloud** (`$srcPkg` → now Empty)\n" +
                 "• **To:** **$myCloud** (`$dstPkg`)\n" +
-                "• **Script Data Restored:** `$scriptCount` file(s)",
+                "• **Nousigi / Workspace JSONs Restored:** `$scriptCount` file(s)",
                 COLOR_GREEN
             )
         } else {
@@ -2006,29 +2249,30 @@ class DiscordBot(private val ctx: Context) {
 
         val fields = listOf(
             Triple(
-                "📱 Device Dashboard & Key Controls",
-                "• `!scan` — Pick a UGPhone to inspect **full device specs + slots** with quick buttons:\n" +
-                "  `🔑 Check Nousigi Key` • `⏳ Check Delta Key` • `✏️ Change Nousigi Key`\n" +
+                "📱 Device Dashboard, Keys & Nousigi UI",
+                "• `!scan [cloud]` — Inspect **device specs + slots** with buttons:\n" +
+                "  `🔑 Check Nousigi Key` • `⏳ Check Delta Key` • `✏️ Change Nousigi Key` • `🎛️ Nousigi Config`\n" +
                 "  `🔁 Rejoin All` • `🛑 Kill All` • `🪟 Arrange 2×2` • `📸 Screenshot` • `🧹 Clean .bak` • `🔄 Reboot`\n" +
+                "• `!nousigi [username]` — Edit Nousigi Auto Joiners, Webhooks & JSON settings in Discord\n" +
                 "• `!health` — Live RAM, CPU, slots & key watcher summary\n" +
-                "• `!getkey [cloud] <url>` / `!setkey [cloud] <key>` — Chrome key helper or direct key update",
+                "• `!getkey [cloud] <url>` / `!setkey [cloud] <key>` — Delta key helper or key update",
                 false
             ),
             Triple(
                 "🔐 Account Login & Session Control",
-                "• `!login` — Native Roblox login modal (User / Pass / 2FA Backup Code)\n" +
+                "• `!login [cloud]` — Native Roblox login modal (User / Pass / 2FA Backup Code)\n" +
                 "• `!logout` — Revoke server token (`v2/logout`), wipe vault & log out\n" +
-                "• `!delete` — Full purge + clear slot username history\n" +
-                "• `!changeslot [username]` — Move account + workspace files across slots/clouds",
+                "• `!delete` — Full purge + delete all user JSONs (`Nousigi Hub` & `cache`) + clear history\n" +
+                "• `!changeslot [username]` — Move account + all matching user JSONs across slots/clouds",
                 false
             ),
             Triple(
-                "🔁 Rejoiner, Screenshots & Config",
-                "• `!autorejoin` (`!ar`) — Control Rejoiner, Game Place ID, FPS Opt, 3D Render Off & Key Helpers\n" +
+                "🔁 Rejoiner, Live Status & Config",
+                "• `!autorejoin` (`!ar`) — Control Rejoiner, Game Place ID, FPS Opt, 3D Render Off & Delta Key\n" +
+                "• `!checkstatus <user>` — Zero-crop `CaptureService` shot + live Ping/FPS/RAM card\n" +
                 "• `!rejoin <user>` / `!pause <user>` / `!resume <user>` — Single-slot controls\n" +
-                "• `!checkstatus <user>` / `!ss` / `!ss all` / `!sschannel` — Full-tab & screen captures\n" +
-                "• `!setconfig <user>` / `!pushscript` — Upload Nousigi JSON or `.lua` autoexecute script\n" +
-                "• `!createconfig` / `!config` / `!rename <name>` / `!update` — Sync codes & OTA updates",
+                "• `!ss [cloud|all]` / `!sschannel` / `!setconfig <user>` / `!pushscript`\n" +
+                "• `!createconfig` / `!config` / `!rename <name>` / `!update`",
                 false
             )
         )
@@ -2127,6 +2371,33 @@ class DiscordBot(private val ctx: Context) {
         replyInteraction(id, token, 9, modalData)
     }
 
+    private fun openNousigiSettingModal(
+        id: String,
+        token: String,
+        targetCloud: String,
+        username: String,
+        settingKey: String,
+        currentValue: String
+    ) {
+        val input = JSONObject()
+            .put("type", 4)
+            .put("custom_id", "ns_val")
+            .put("label", settingKey.take(45))
+            .put("style", 1)
+            .put("min_length", 0)
+            .put("max_length", 300)
+            .put("placeholder", "Enter value for $settingKey...")
+            .put("required", false)
+        if (currentValue.isNotEmpty()) input.put("value", currentValue.take(300))
+
+        val modalData = JSONObject()
+            .put("custom_id", "pilot_ns_val_modal:$targetCloud:$username:$settingKey")
+            .put("title", "Edit Nousigi Setting ($username)".take(45))
+            .put("components", JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(input))))
+
+        replyInteraction(id, token, 9, modalData)
+    }
+
     private fun onInteraction(d: JSONObject) {
         val intType = d.optInt("type")
         if (intType != 3 && intType != 5) return
@@ -2146,6 +2417,38 @@ class DiscordBot(private val ctx: Context) {
 
         // --- Modal Submissions (type 5) ---
         if (intType == 5) {
+            if (cid.startsWith("pilot_ns_val_modal:")) {
+                val p = cid.removePrefix("pilot_ns_val_modal:").split(":", limit = 3)
+                if (p.size < 3 || !p[0].equals(myCloud, ignoreCase = true)) return
+                if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) return
+                val targetUser = p[1]
+                val settingKey = p[2]
+                var newVal = ""
+                val rows = data.optJSONArray("components")
+                if (rows != null) {
+                    for (r in 0 until rows.length()) {
+                        val comps = rows.getJSONObject(r).optJSONArray("components") ?: continue
+                        for (c in 0 until comps.length()) {
+                            val item = comps.getJSONObject(c)
+                            if (item.optString("custom_id") == "ns_val") newVal = item.optString("value", "")
+                        }
+                    }
+                }
+                val cfgPath = NousigiConfigManager.ensureDefaultConfig(ctx, targetUser)
+                val (ok, msg) = NousigiConfigManager.updateSettingValue(ctx, cfgPath, settingKey, newVal)
+                if (!ok) {
+                    replyEmbed(id, token, 4, "❌ Invalid Value", msg, COLOR_RED)
+                } else {
+                    val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, targetUser, cfgPath)
+                    val respData = JSONObject()
+                        .put("content", "")
+                        .put("embeds", JSONArray().put(embed))
+                        .put("components", rowsComp)
+                    replyInteraction(id, token, 7, respData)
+                }
+                return
+            }
+
             if (cid.startsWith("pilot_nousigi_modal:")) {
                 val targetCloud = cid.removePrefix("pilot_nousigi_modal:")
                 if (!targetCloud.equals(myCloud, ignoreCase = true)) return
@@ -2294,7 +2597,7 @@ class DiscordBot(private val ctx: Context) {
                 id, token, 4,
                 "✅ Full Pilot Sync Code Generated",
                 "• **Allowed IDs (${idList.size}):** `${idList.joinToString(", ")}`\n" +
-                "• **Includes:** Bot Identity + Rejoiner Settings + Key Helper Config\n\n" +
+                "• **Includes:** Bot Identity + Rejoiner Settings + Delta Key Config\n\n" +
                 "**Paste into Pilot → APPLY CODE (then tap START BOT):**\n```\n$syncCode\n```",
                 COLOR_GREEN
             )
@@ -2307,6 +2610,81 @@ class DiscordBot(private val ctx: Context) {
                     sendEmbed(dmCh, "📋 Your Full Pilot Sync Code", "`$syncCode`\n```\n$syncCode\n```", COLOR_BLUE)
                 }
             }
+            return
+        }
+
+        // --- !checkstatus Quick Action Buttons (pilot_slotact:<act>:<cloud>:<pkgOrUser>) ---
+        if (cid.startsWith("pilot_slotact:")) {
+            val parts = cid.split(":", limit = 4)
+            if (parts.size < 4) return
+            val act = parts[1]
+            val targetCloud = parts[2]
+            val targetRef = parts[3]
+            if (!targetCloud.equals(myCloud, ignoreCase = true)) return
+            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
+                replyEmbed(id, token, 4, "⛔ Unauthorized", "You are not authorized.", COLOR_RED)
+                return
+            }
+
+            when (act) {
+                "rejoin" -> {
+                    val slot = Rejoiner.slots[targetRef] ?: CloneSlot(targetRef)
+                    replyEmbed(id, token, 4, "🔁 Rejoining Slot ($myCloud)", "Restarting **${slot.username.ifBlank { targetRef }}**...", COLOR_BLUE)
+                    Rejoiner.queueStaggeredLaunch(ctx, slot, "!checkstatus Rejoin button")
+                }
+                "nousigi" -> {
+                    deferInteraction(id, token, ephemeral = false)
+                    val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, targetRef)
+                    val body = JSONObject().put("content", "").put("embeds", JSONArray().put(embed)).put("components", rowsComp)
+                    apiPatchNoAuth("https://discord.com/api/v10/webhooks/$appId/$token/messages/@original", body)
+                }
+                "refresh" -> {
+                    replyEmbed(id, token, 4, "📸 Refreshing Status ($myCloud)", "Capturing fresh render for **$targetRef**...", COLOR_BLUE)
+                    ioExec.execute { if (ch.isNotEmpty()) sendAccountShot(ch, "", targetRef) }
+                }
+                "togglepause" -> {
+                    val cur = Rejoiner.slots[targetRef]?.paused ?: false
+                    val updated = Rejoiner.setSlotPaused(ctx, targetRef, !cur)
+                    replyEmbed(
+                        id, token, 4,
+                        if (!cur) "⏸️ Slot Paused ($myCloud)" else "▶️ Slot Resumed ($myCloud)",
+                        "**${updated?.username?.ifBlank { targetRef } ?: targetRef}** is now **${if (!cur) "PAUSED" else "ACTIVE"}**.",
+                        if (!cur) COLOR_AMBER else COLOR_GREEN
+                    )
+                }
+            }
+            return
+        }
+
+        // --- Nousigi UI Editor Buttons (pilot_ns_btn:<act>:<cloud>:<user>:<cat>:<page>) ---
+        if (cid.startsWith("pilot_ns_btn:")) {
+            val p = cid.removePrefix("pilot_ns_btn:").split(":", limit = 5)
+            if (p.size < 5) return
+            val act = p[0]
+            val targetCloud = p[1]
+            val targetUser = p[2]
+            val cat = p[3]
+            val page = p[4].toIntOrNull() ?: 0
+            if (!targetCloud.equals(myCloud, ignoreCase = true)) return
+            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) return
+
+            if (act == "rejoin") {
+                val list = PilotCore.scanRbx(ctx)
+                val acc = list.firstOrNull { it.user.equals(targetUser, true) }
+                if (acc != null) {
+                    val slot = Rejoiner.slots.getOrPut(acc.pkg) { CloneSlot(acc.pkg, username = acc.user, status = "ACTIVE") }
+                    Rejoiner.queueStaggeredLaunch(ctx, slot, "Nousigi UI Config Save")
+                    replyEmbed(id, token, 4, "🔁 Rejoining $targetUser ($myCloud)", "Restarting `${acc.pkg}` to apply updated Nousigi JSON...", COLOR_GREEN)
+                } else {
+                    replyEmbed(id, token, 4, "⚠️ Slot Not Active", "Could not find an active slot for **$targetUser**.", COLOR_AMBER)
+                }
+                return
+            }
+
+            val nextPage = if (act == "next") page + 1 else (page - 1).coerceAtLeast(0)
+            val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, targetUser, "", cat, nextPage)
+            val respData = JSONObject().put("content", "").put("embeds", JSONArray().put(embed)).put("components", rowsComp)
+            replyInteraction(id, token, 7, respData)
             return
         }
 
@@ -2349,8 +2727,27 @@ class DiscordBot(private val ctx: Context) {
                         if (rep.isHealthy) COLOR_GREEN else COLOR_AMBER
                     )
                 }
+                "nousigi_cfg" -> {
+                    val list = PilotCore.scanRbx(ctx).filter { it.user != "Empty" }
+                    if (list.isEmpty()) {
+                        editDeferredEmbed(appId, token, "🎛️ Nousigi Config ($myCloud)", "No accounts found on **$myCloud**.", COLOR_AMBER)
+                    } else if (list.size == 1) {
+                        val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, list[0].user)
+                        val body = JSONObject().put("content", "").put("embeds", JSONArray().put(embed)).put("components", rowsComp)
+                        apiPatchNoAuth("https://discord.com/api/v10/webhooks/$appId/$token/messages/@original", body)
+                    } else {
+                        val opts = JSONArray()
+                        list.take(25).forEach { a ->
+                            opts.put(JSONObject().put("label", "${a.user} [${a.status}]").put("value", a.user))
+                        }
+                        val menu = JSONObject().put("type", 3).put("custom_id", "pilot_ns_acc:pick:$myCloud")
+                            .put("placeholder", "Select account on $myCloud...").put("options", opts)
+                        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+                        editDeferredEmbed(appId, token, "🎛️ Select Account ($myCloud)", "Choose an account to configure its Nousigi JSON:", COLOR_PURPLE, components = row)
+                    }
+                }
                 "rejoin_all" -> {
-                    editDeferredEmbed(appId, token, "🔁 Rejoin All Queued ($myCloud)", "Force-stopping and staggered-relaunching all active clones...", COLOR_BLUE)
+                    editDeferredEmbed(appId, token, "🔁 Rejoin All Queued ($myCloud)", "Restarting active logged-in clones only (skipping Empty/Logged Out)...", COLOR_BLUE)
                     Rejoiner.killAllAndStaggeredRejoin(ctx, "!scan Rejoin All button")
                 }
                 "kill_all" -> {
@@ -2359,8 +2756,8 @@ class DiscordBot(private val ctx: Context) {
                     editDeferredEmbed(appId, token, "🛑 Force-Stopped Clones ($myCloud)", "Stopped **${list.size}** Roblox clone(s).", COLOR_RED)
                 }
                 "arrange" -> {
-                    val n = PilotCore.arrange2x2()
-                    editDeferredEmbed(appId, token, "🪟 Arranged 2×2 Grid ($myCloud)", "Snapped **$n** clone(s) into 2×2 freeform windows.", COLOR_GREEN)
+                    val n = PilotCore.arrange2x2(ctx)
+                    editDeferredEmbed(appId, token, "🪟 Arranged 2×2 Grid ($myCloud)", "Snapped **$n** logged-in clone(s) into 2×2 freeform windows.", COLOR_GREEN)
                 }
                 "ss" -> {
                     editDeferredEmbed(appId, token, "📸 Capturing Screenshot ($myCloud)", "Uploading full device screen...", COLOR_BLUE)
@@ -2397,6 +2794,50 @@ class DiscordBot(private val ctx: Context) {
         val vals = data.optJSONArray("values") ?: return
         val sel = vals.optString(0).trim()
 
+        // Nousigi UI Editor dropdowns
+        if (cid.startsWith("pilot_ns_acc:")) {
+            val targetCloud = cid.removePrefix("pilot_ns_acc:pick:")
+            if (!targetCloud.equals(myCloud, ignoreCase = true)) return
+            val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, sel)
+            val respData = JSONObject().put("content", "").put("embeds", JSONArray().put(embed)).put("components", rowsComp)
+            replyInteraction(id, token, 7, respData)
+            return
+        }
+        if (cid.startsWith("pilot_ns_cat:")) {
+            val p = cid.removePrefix("pilot_ns_cat:").split(":", limit = 3)
+            if (p.size < 3 || !p[0].equals(myCloud, ignoreCase = true)) return
+            val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, p[1], "", sel, 0)
+            val respData = JSONObject().put("content", "").put("embeds", JSONArray().put(embed)).put("components", rowsComp)
+            replyInteraction(id, token, 7, respData)
+            return
+        }
+        if (cid.startsWith("pilot_ns_file:")) {
+            val p = cid.removePrefix("pilot_ns_file:").split(":", limit = 2)
+            if (p.size < 2 || !p[0].equals(myCloud, ignoreCase = true)) return
+            val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, p[1], sel, "All", 0)
+            val respData = JSONObject().put("content", "").put("embeds", JSONArray().put(embed)).put("components", rowsComp)
+            replyInteraction(id, token, 7, respData)
+            return
+        }
+        if (cid.startsWith("pilot_ns_edit:")) {
+            val p = cid.removePrefix("pilot_ns_edit:").split(":", limit = 4)
+            if (p.size < 4 || !p[0].equals(myCloud, ignoreCase = true)) return
+            val targetUser = p[1]
+            val cat = p[2]
+            val page = p[3].toIntOrNull() ?: 0
+            val cfgPath = NousigiConfigManager.ensureDefaultConfig(ctx, targetUser)
+            val entry = NousigiConfigManager.readSettings(cfgPath).firstOrNull { it.key == sel } ?: return
+            if (entry.type == "bool") {
+                NousigiConfigManager.toggleBooleanSetting(ctx, cfgPath, sel)
+                val (embed, rowsComp) = buildNousigiEditorPayload(myCloud, targetUser, cfgPath, cat, page)
+                val respData = JSONObject().put("content", "").put("embeds", JSONArray().put(embed)).put("components", rowsComp)
+                replyInteraction(id, token, 7, respData)
+            } else {
+                openNousigiSettingModal(id, token, myCloud, targetUser, sel, entry.valueStr)
+            }
+            return
+        }
+
         val firstColon = cid.indexOf(':')
         val lastColon = cid.lastIndexOf(':')
         if (firstColon <= 0 || lastColon <= firstColon) return
@@ -2424,6 +2865,23 @@ class DiscordBot(private val ctx: Context) {
                 return
             }
 
+            if (mode == "nousigi_pick") {
+                val list = PilotCore.scanRbx(ctx).filter { it.user != "Empty" }
+                if (list.isEmpty()) {
+                    replyEmbed(id, token, 4, "🎛️ $myCloud", "No accounts found on **$myCloud**.", COLOR_AMBER)
+                    return
+                }
+                val opts = JSONArray()
+                list.take(25).forEach { a ->
+                    opts.put(JSONObject().put("label", "${a.user} [${a.status}] (${a.pkg.removePrefix("com.roblox.")})").put("value", a.user))
+                }
+                val menu = JSONObject().put("type", 3).put("custom_id", "pilot_ns_acc:pick:$myCloud")
+                    .put("placeholder", "Select account on $myCloud...").put("options", opts)
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+                replyEmbed(id, token, 4, "🎛️ Select Account ($myCloud)", PilotCore.fmtAll(list), COLOR_PURPLE, components = row, ephemeral = false)
+                return
+            }
+
             if (mode == "ar") {
                 if (isAll) {
                     val jitter = (abs(myCloud.hashCode()) % 12) * 100L
@@ -2435,9 +2893,9 @@ class DiscordBot(private val ctx: Context) {
             }
 
             if (mode == "arrange") {
-                val n = PilotCore.arrange2x2()
-                if (!isAll) replyEmbed(id, token, 4, "🪟 Arranged 2×2 ($myCloud)", "Snapped **$n** clones into 2×2 grid.", COLOR_GREEN)
-                else sendEmbed(ch, "🪟 Arranged 2×2 ($myCloud)", "Snapped **$n** clones into 2×2 grid.", COLOR_GREEN)
+                val n = PilotCore.arrange2x2(ctx)
+                if (!isAll) replyEmbed(id, token, 4, "🪟 Arranged 2×2 ($myCloud)", "Snapped **$n** logged-in clones into 2×2 grid.", COLOR_GREEN)
+                else sendEmbed(ch, "🪟 Arranged 2×2 ($myCloud)", "Snapped **$n** logged-in clones into 2×2 grid.", COLOR_GREEN)
                 return
             }
 
@@ -2554,7 +3012,7 @@ class DiscordBot(private val ctx: Context) {
                 val menu = JSONObject().put("type", 3).put("custom_id", "pilot_acc:$mode:$myCloud")
                     .put("placeholder", "Select account on $myCloud...").put("options", opts)
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                val label = if (mode == "d") "Select account to **DELETE** (revokes token + wipes vault + history):" else "Select account to **LOGOUT** (revokes token + wipes vault):"
+                val label = if (mode == "d") "Select account to **DELETE** (revokes token + wipes vault + user JSONs + history):" else "Select account to **LOGOUT** (revokes token + wipes vault):"
                 replyEmbed(id, token, 4, if (mode == "d") "🗑️ Delete Slot ($myCloud)" else "🚪 Logout Slot ($myCloud)", "$label\n${PilotCore.fmtAll(list)}", COLOR_AMBER, components = row)
             }
             return
@@ -2573,7 +3031,7 @@ class DiscordBot(private val ctx: Context) {
                 replyEmbed(
                     id, token, 7,
                     "⏳ Transferring Account",
-                    "Packing **$srcUser** on **$srcCloud** (`$srcPkg`) → **$dstCloud** (`$dstPkg`)...",
+                    "Packing **$srcUser** + all Nousigi/cache JSONs on **$srcCloud** (`$srcPkg`) → **$dstCloud** (`$dstPkg`)...",
                     COLOR_BLUE, components = JSONArray()
                 )
             }
@@ -2588,10 +3046,10 @@ class DiscordBot(private val ctx: Context) {
                     }
                     if (dstCloud.equals(myCloud, ignoreCase = true)) {
                         val (ok, restoredFiles) = PilotCore.restoreAccountBundle(ctx, dstPkg, srcUser, bundle)
-                        if (ok) sendEmbed(ch, "✅ Local Slot Move Complete ($myCloud)", "Moved **$srcUser**: `$srcPkg` → `$dstPkg` (`$restoredFiles` file(s)).", COLOR_GREEN)
+                        if (ok) sendEmbed(ch, "✅ Local Slot Move Complete ($myCloud)", "Moved **$srcUser**: `$srcPkg` → `$dstPkg` (`$restoredFiles` JSON/workspace file(s)).", COLOR_GREEN)
                         else sendEmbed(ch, "❌ Local Move Failed ($myCloud)", "Target slot `$dstPkg` not found.", COLOR_RED)
                     } else {
-                        PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount files) -> $dstCloud")
+                        PilotCore.log("[XFER-OUT] Packed $srcUser (+$fileCount JSON/workspace files) -> $dstCloud")
                         val safeName = "pilot_xfer__${srcCloud}__${srcPkg}__${srcUser}__${dstCloud}__${dstPkg}.tar.gz"
                         sendFileEmbed(ch, "📦 Encrypted Transfer Bundle", "Transferring **$srcUser** (`$srcCloud` → **$dstCloud**)...", COLOR_BLUE, bundle, safeName)
                         bundle.delete()
@@ -2617,9 +3075,7 @@ class DiscordBot(private val ctx: Context) {
                 "TOGGLE_RJ" -> Rejoiner.saveConfig(ctx, cfg.copy(enabled = !cfg.enabled))
                 "TOGGLE_FPS" -> Rejoiner.saveConfig(ctx, cfg.copy(fpsOptimization = !cfg.fpsOptimization))
                 "TOGGLE_3D" -> Rejoiner.saveConfig(ctx, cfg.copy(render3dOff = !cfg.render3dOff))
-                "TOGGLE_NOUSIGI" -> Rejoiner.saveConfig(ctx, cfg.copy(autoGetNousigiKey = !cfg.autoGetNousigiKey))
                 "TOGGLE_DELTA" -> Rejoiner.saveConfig(ctx, cfg.copy(autoGetDeltaKey = !cfg.autoGetDeltaKey))
-                "RUN_NOUSIGI" -> KeyAutomator.startNousigiRenewal(ctx)
                 "RUN_DELTA" -> KeyAutomator.startDeltaRenewal(ctx)
                 "REJOIN_ALL" -> ioExec.execute { Rejoiner.killAllAndStaggeredRejoin(ctx, "Discord panel") }
                 "ON_LINK" -> {
@@ -2662,13 +3118,13 @@ class DiscordBot(private val ctx: Context) {
         } else if (kind == "pilot_acc") {
             val isDel = mode == "d"
             if (sel == "ALL") {
-                val msg = if (isDel) "Deleting ALL accounts, revoking tokens & clearing history on **$myCloud**." else "Logging out ALL accounts & revoking tokens on **$myCloud**."
+                val msg = if (isDel) "Deleting ALL accounts, revoking tokens, purging user JSONs & clearing history on **$myCloud**." else "Logging out ALL accounts & revoking tokens on **$myCloud**."
                 replyEmbed(id, token, 7, if (isDel) "🗑️ Deleting All Slots" else "🚪 Logging Out All Slots", msg, COLOR_RED, components = JSONArray())
                 ioExec.execute {
                     PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }.forEach { PilotCore.wipe(ctx, it.pkg, isDel) }
                 }
             } else {
-                val msg = if (isDel) "Deleted `$sel` (server token revoked + vault & history cleared)." else "Logged out `$sel` (server token revoked + vault wiped)."
+                val msg = if (isDel) "Deleted `$sel` (server token revoked + vault, user JSONs & history cleared)." else "Logged out `$sel` (server token revoked + vault wiped)."
                 replyEmbed(id, token, 7, if (isDel) "🗑️ Slot Deleted ($myCloud)" else "🚪 Slot Logged Out ($myCloud)", msg, COLOR_GREEN, components = JSONArray())
                 ioExec.execute { PilotCore.wipe(ctx, sel, isDel) }
             }
@@ -2682,9 +3138,7 @@ class DiscordBot(private val ctx: Context) {
             .put(JSONObject().put("label", "Set Custom Place ID / VIP Link").put("value", "ON_LINK"))
             .put(JSONObject().put("label", "Toggle FPS Optimizer (${if (cfg.fpsOptimization) "ON" else "OFF"})").put("value", "TOGGLE_FPS"))
             .put(JSONObject().put("label", "Toggle 3D Render Off (${if (cfg.render3dOff) "ON" else "OFF"})").put("value", "TOGGLE_3D"))
-            .put(JSONObject().put("label", "Toggle Chrome Nousigi Key Helper (${if (cfg.autoGetNousigiKey) "ON" else "OFF"})").put("value", "TOGGLE_NOUSIGI"))
             .put(JSONObject().put("label", "Toggle Chrome Delta Key Helper (${if (cfg.autoGetDeltaKey) "ON" else "OFF"})").put("value", "TOGGLE_DELTA"))
-            .put(JSONObject().put("label", "Open Nousigi Key in Chrome Now").put("value", "RUN_NOUSIGI"))
             .put(JSONObject().put("label", "Test Baseplate & Open Delta Key Now").put("value", "RUN_DELTA"))
             .put(JSONObject().put("label", "Kill All & Staggered Rejoin Now").put("value", "REJOIN_ALL"))
 
@@ -2704,7 +3158,7 @@ class DiscordBot(private val ctx: Context) {
             "🔁 Rejoiner & Key Control ($targetTag)",
             "• **Rejoiner:** ${if (cfg.enabled) "🟢 ON" else "🔴 OFF"} | **Target:** `${cfg.targetPlaceId.ifEmpty { "Auto" }}`\n" +
             "• **FPS Opt:** `${cfg.fpsOptimization}` | **3D Render Off:** `${cfg.render3dOff}`\n" +
-            "• **Chrome Nousigi Key:** `${cfg.autoGetNousigiKey}` | **Chrome Delta Key:** `${cfg.autoGetDeltaKey}`",
+            "• **Chrome Delta Key:** `${cfg.autoGetDeltaKey}`",
             COLOR_BLUE, components = row
         )
     }
@@ -2728,17 +3182,25 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
-    private fun sendImageEmbed(ch: String, title: String, desc: String, color: Int, file: File) {
+    private fun sendImageEmbed(
+        ch: String,
+        title: String,
+        desc: String,
+        color: Int,
+        file: File,
+        fields: List<Triple<String, String, Boolean>> = emptyList(),
+        components: JSONArray? = null
+    ) {
         runCatching {
-            val isJpg = file.name.endsWith(".jpg")
+            val isJpg = file.name.endsWith(".jpg", true)
             val mime = if (isJpg) "image/jpeg" else "image/png"
             val fname = if (isJpg) "screen.jpg" else "screen.png"
-            val payload = JSONObject()
+            val rootObj = JSONObject()
                 .put("content", "")
-                .put("embeds", JSONArray().put(buildEmbed(title, desc, color, imageFilename = fname)))
-                .toString()
+                .put("embeds", JSONArray().put(buildEmbed(title, desc, color, fields, imageFilename = fname)))
+            if (components != null) rootObj.put("components", components)
             val mp = MultipartBody.Builder().setType(MultipartBody.FORM)
-                .addFormDataPart("payload_json", payload)
+                .addFormDataPart("payload_json", rootObj.toString())
                 .addFormDataPart("files[0]", fname, file.asRequestBody(mime.toMediaType()))
                 .build()
             val req = Request.Builder()
@@ -2769,43 +3231,48 @@ class DiscordBot(private val ctx: Context) {
         }
     }
 
+    private fun executeWithRateLimit(reqBuilder: () -> Request): String {
+        repeat(3) {
+            val resp = runCatching { restClient.newCall(reqBuilder()).execute() }.getOrNull() ?: return ""
+            resp.use { r ->
+                val raw = r.body?.string().orEmpty()
+                if (r.code == 429) {
+                    val retrySec = runCatching { JSONObject(raw).optDouble("retry_after", 1.2) }.getOrDefault(1.2)
+                    runCatching { Thread.sleep(((retrySec * 1000L).toLong() + 150L).coerceIn(300L, 6000L)) }
+                    return@repeat
+                }
+                return raw
+            }
+        }
+        return ""
+    }
+
     private fun apiDelete(url: String) {
-        runCatching {
-            val req = Request.Builder().url(url)
-                .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-                .delete().build()
-            restClient.newCall(req).execute().close()
+        executeWithRateLimit {
+            Request.Builder().url(url).header("Authorization", "Bot ${PilotCore.getToken(ctx)}").delete().build()
         }
     }
 
-    private fun apiGet(url: String): String = runCatching {
-        val req = Request.Builder().url(url)
-            .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-            .get().build()
-        restClient.newCall(req).execute().use { it.body?.string() ?: "" }
-    }.getOrDefault("")
+    private fun apiGet(url: String): String = executeWithRateLimit {
+        Request.Builder().url(url).header("Authorization", "Bot ${PilotCore.getToken(ctx)}").get().build()
+    }
 
-    private fun apiPatch(url: String, json: JSONObject): String = runCatching {
+    private fun apiPatch(url: String, json: JSONObject): String = executeWithRateLimit {
         val body = json.toString().toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url(url)
-            .header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-            .patch(body).build()
-        restClient.newCall(req).execute().use { it.body?.string() ?: "" }
-    }.getOrDefault("")
+        Request.Builder().url(url).header("Authorization", "Bot ${PilotCore.getToken(ctx)}").patch(body).build()
+    }
 
-    private fun apiPatchNoAuth(url: String, json: JSONObject): String = runCatching {
+    private fun apiPatchNoAuth(url: String, json: JSONObject): String = executeWithRateLimit {
         val body = json.toString().toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url(url)
-            .patch(body).build()
-        restClient.newCall(req).execute().use { it.body?.string() ?: "" }
-    }.getOrDefault("")
+        Request.Builder().url(url).patch(body).build()
+    }
 
-    private fun apiPost(url: String, json: JSONObject, auth: Boolean = true): String = runCatching {
+    private fun apiPost(url: String, json: JSONObject, auth: Boolean = true): String = executeWithRateLimit {
         val body = json.toString().toRequestBody("application/json".toMediaType())
         val b = Request.Builder().url(url).post(body)
         if (auth) b.header("Authorization", "Bot ${PilotCore.getToken(ctx)}")
-        restClient.newCall(b.build()).execute().use { it.body?.string() ?: "" }
-    }.getOrDefault("")
+        b.build()
+    }
 }
 
 class PilotService : Service() {
@@ -2824,6 +3291,7 @@ class PilotService : Service() {
         super.onCreate()
         isRunning = true
         PilotCore.tryAutoSeedFromDisk(this)
+        PilotCore.startRootGuardian(this)
 
         val chId = "pilot_svc"
         if (Build.VERSION.SDK_INT >= 26) {
@@ -2832,7 +3300,7 @@ class PilotService : Service() {
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
-            .setContentText("Watchdog, Key Helper & Roblox Bridge Active")
+            .setContentText("Watchdog, Nousigi Editor & Roblox Bridge Active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)
@@ -2900,10 +3368,14 @@ class PilotService : Service() {
                 this,
                 params["user"].orEmpty(),
                 params["placeId"].orEmpty(),
-                params["fps"]?.toIntOrNull() ?: 0
+                params["fps"]?.toIntOrNull() ?: 0,
+                params["ping"]?.toIntOrNull() ?: 0,
+                params["mem"]?.toIntOrNull() ?: 0,
+                params["jobId"].orEmpty(),
+                params["state"].orEmpty()
             )
-            "/keyerr" -> {
-                Rejoiner.onBridgeKeyError(this, params["user"].orEmpty(), params["reason"].orEmpty())
+            "/teleport" -> {
+                Rejoiner.onBridgeTeleport(params["user"].orEmpty())
                 """{"ok":true}"""
             }
             "/kick" -> {
