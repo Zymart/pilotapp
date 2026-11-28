@@ -137,6 +137,34 @@ object Rejoiner {
         return pkgs.mapNotNull { slots[it] }
     }
 
+    /** Immediately rescans a single clone slot (called by RobloxAutoLogin after login/2FA). */
+    fun forceRescanSlot(ctx: Context, pkg: String): CloneSlot {
+        val slot = slots.getOrPut(pkg) { CloneSlot(pkg) }
+        val cookie = SessionVault.extractCookie(pkg)
+        val validUser = if (cookie.length >= 40) {
+            SessionVault.validateCookie(cookie) ?: PilotCore.readDiskUsername(pkg).takeIf { it.isNotEmpty() }
+        } else {
+            null
+        }
+        if (!validUser.isNullOrEmpty()) {
+            slot.username = validUser
+            if (!slot.paused) slot.status = "ACTIVE"
+            ctx.applicationContext.getSharedPreferences("pilot_hist", Context.MODE_PRIVATE)
+                .edit().putString(pkg, validUser).apply()
+            SessionVault.snapshot(ctx, pkg, validUser)
+        } else {
+            val histUser = PilotCore.getSlotHistoryUser(ctx, pkg)
+            if (histUser.isNotEmpty()) {
+                slot.username = histUser
+                if (slot.status != "REVOKED") slot.status = "LOGGED_OUT"
+            } else {
+                slot.username = ""
+                slot.status = "EMPTY"
+            }
+        }
+        return slot
+    }
+
     /**
      * Strict session gate: returns true ONLY if the clone has an active logged-in Roblox account
      * (or recovers one from SessionVault). Never returns true for EMPTY, LOGGED_OUT, or REVOKED slots.
@@ -378,7 +406,6 @@ object Rejoiner {
         val afterComm = stat.substringAfterLast(')', "").trim()
         if (afterComm.isEmpty()) return -1L
         val parts = afterComm.split(Regex("\\s+"))
-        // After ')': index 0=state, 11=utime (field 14), 12=stime (field 15)
         val utime = parts.getOrNull(11)?.toLongOrNull() ?: return -1L
         val stime = parts.getOrNull(12)?.toLongOrNull() ?: return -1L
         return utime + stime
