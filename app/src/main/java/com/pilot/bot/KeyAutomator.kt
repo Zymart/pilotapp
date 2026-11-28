@@ -37,7 +37,7 @@ data class KeyCheckReport(
 
 /**
  * Delta Key Baseplate Tester + Portrait-Locked PlatoRelay & Nousigi Host Key Generator
- * + Always-On-Top Floating Key Watcher Overlay (visible only when outside Pilot app)
+ * + Ctrl+W Safe Ad-Tab Closer (never backs out to Home) + Floating Key Watcher Overlay
  */
 object KeyAutomator {
     const val BASEPLATE_PLACE_ID = "123974602339071"
@@ -74,7 +74,6 @@ object KeyAutomator {
 
     private val DELTA_KEY_RX = Regex("""^KEY_[A-Za-z0-9_-]{12,64}$""")
     private val DELTA_KEY_SEARCH_RX = Regex("""\bKEY_[A-Za-z0-9_-]{12,64}\b""")
-    // Matches 24-64 char alphanumeric Luarmor/Nousigi keys on getkey.nousigi.com
     private val NOUSIGI_KEY_SEARCH_RX = Regex("""\b[A-Za-z0-9]{24,64}\b""")
     private val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
@@ -106,7 +105,6 @@ object KeyAutomator {
         syncOverlayVisibility()
     }
 
-    /** Opens a URL directly in full Chrome (used by Config Host buttons for Discord & Linkvertise login). */
     fun openChromeUrl(url: String) {
         Thread { openInFullChrome(url, lockPortrait = false) }.start()
     }
@@ -639,27 +637,27 @@ object KeyAutomator {
         }
     }
 
+    /** Closes only the active pop-up/task tab (Ctrl+W) and re-focuses PlatoRelay in Chrome without ever backing out to Home. */
     private fun closeChromeTabAndReturnToMain(ctx: Context, stepLabel: String, mainUrl: String) {
         onSponsorTabSinceMs = 0L
         waitingForTaskTimer = false
         lastWebTapSig = ""
         updateStep(stepLabel)
-        SuShell.exec("input keyevent 4")
-        Thread.sleep(1300L)
 
-        val checkXml = dumpUiXmlCompressed()
-        val tabStr = readChromeNewestTabStrings()
-        if (isFakeAdTrap(checkXml) || isFakeAdTrap(tabStr)) {
-            SuShell.exec("input keyevent 4")
-            Thread.sleep(1000L)
+        // Ctrl+W (KEYCODE_W = 51 with --ctrl) closes the current tab in Chrome without exiting Chrome to Home
+        SuShell.exec("input keyevent --ctrl 51")
+        Thread.sleep(700L)
+
+        // Bring the PlatoRelay / Nousigi URL back to front in Chrome
+        val targetUrl = mainUrl.trim().ifBlank {
+            Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
         }
-        val combined = "$checkXml\n$tabStr"
-        val backOnTarget = combined.contains("platorelay.com", ignoreCase = true) ||
-            combined.contains("platoboost.com", ignoreCase = true) ||
-            combined.contains("nousigi", ignoreCase = true) ||
-            combined.contains("Delta Android Keysystem", ignoreCase = true)
-        if (!backOnTarget && combined.isNotBlank() && mainUrl.isNotBlank()) {
-            openInFullChrome(mainUrl, lockPortrait = true)
+        if (targetUrl.isNotBlank()) {
+            openInFullChrome(targetUrl, lockPortrait = false)
+            Thread.sleep(900L)
+        } else {
+            SuShell.exec("monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+            Thread.sleep(700L)
         }
     }
 
@@ -670,7 +668,6 @@ object KeyAutomator {
         val tabStrings = readChromeNewestTabStrings()
         val combined = "$xml\n$tabStrings"
 
-        // Scrape any newly generated Nousigi / Luarmor key from page or clipboard
         val clip = readClipboard(ctx).trim()
         val clipCandidate = if (clip != previousKeySnapshot && NOUSIGI_KEY_SEARCH_RX.matches(clip) && !clip.startsWith("KEY_")) clip else null
         val xmlKeyMatch = Regex("""(?:Key|key|Token)["'\s:>]+([A-Za-z0-9]{24,64})""").find(xml)?.groupValues?.get(1)
@@ -692,7 +689,6 @@ object KeyAutomator {
                 )
                 return
             }
-            // Reload portal to generate the next key in the 5-key pool
             Thread.sleep(1200L)
             openInFullChrome(nousigiPortalUrl, lockPortrait = true)
             return
@@ -1044,7 +1040,6 @@ object KeyAutomator {
         }
     }
 
-    /** Starts automated 5-Key Nousigi Host generation in Chrome (after Discord & Linkvertise login). */
     fun startNousigiKeyGeneration(ctx: Context, portalUrl: String = "https://getkey.nousigi.com/"): Boolean {
         cancel()
         if (!running.compareAndSet(false, true)) return false

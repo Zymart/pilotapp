@@ -322,7 +322,7 @@ object PilotCore {
         Rejoiner.stop()
         runCatching { app.stopService(Intent(app, PilotService::class.java)) }
         PilotService.isRunning = false
-        log("[CORE] Service hard-stopped")
+        log("[CORE] Discord bot service stopped")
     }
 
     fun startRootGuardian(c: Context) {
@@ -1352,7 +1352,7 @@ class DiscordBot(private val ctx: Context) {
     /**
      * Consolidated single-embed OTA updater:
      * All online UGPhones join ONE shared embed ("🔄 Pilot OTA Update — X Cloud(s)"),
-     * then each phone edits its own line inside that single embed when done!
+     * then each phone edits its own line inside that single embed when done.
      */
     private fun runCoordinatedOtaUpdate(ch: String, anchorMsgId: String) {
         val myCloud = PilotCore.getCloud(ctx)
@@ -1701,7 +1701,7 @@ class DiscordBot(private val ctx: Context) {
     private fun formatKeyPoolSummary(hostCloud: String, entries: List<KeyPoolEntry>): String {
         if (entries.isEmpty()) return "Key pool is empty. Run `!addkeys <k1> <k2> <k3> <k4> <k5>` on your Key Host UGPhone."
         return entries.joinToString("\n") { e ->
-            val owner = if (e.assignedCloud.isBlank()) "⚪ *Unassigned (Available)*"
+            val owner = if (e.assignedCloud.isBlank()) "⚪ *Unassigned (Saved for future phone)*"
             else if (e.assignedCloud.equals(hostCloud, true)) "👑 **$hostCloud (Host)**"
             else "📱 **${e.assignedCloud}**"
             val masked = if (e.key.length > 12) "${e.key.take(6)}...${e.key.takeLast(4)}" else e.key
@@ -1897,8 +1897,8 @@ class DiscordBot(private val ctx: Context) {
                 sendEmbed(
                     ch,
                     "👑 5-Key Host Pool Ready ($cl)",
-                    "Loaded **${entries.size}/5** keys onto **$cl** (Slot `1/${entries.size}` applied locally).\n" +
-                    "Run `!distributekeys` to transfer Slots `2–${entries.size}` to your other online UGPhones:\n\n$summary",
+                    "Loaded **${entries.size}/5** keys onto **$cl** (Slot `1/${entries.size}` applied locally; any extra keys stay saved until needed).\n" +
+                    "Run `!distributekeys` to transfer Slots `2–${entries.size}` to online worker UGPhones:\n\n$summary",
                     COLOR_GREEN,
                     customFooter = "PILOT_HOST_CLAIM|$cl"
                 )
@@ -1912,7 +1912,7 @@ class DiscordBot(private val ctx: Context) {
                         sendEmbed(
                             ch,
                             "📡 Distributing Pool Keys from $cl...",
-                            "Assigning remaining keys (`1 key = 1 UGPhone`) to online worker phones, cleaning `.bak` files & rejoining active clones...",
+                            "Assigning remaining keys (`1 key = 1 UGPhone`) to online worker phones (unused keys stay saved in pool)...",
                             COLOR_BLUE
                         )
                     }
@@ -2038,7 +2038,7 @@ class DiscordBot(private val ctx: Context) {
                     if (targetCloud.isEmpty()) {
                         val won = postSingleCoordinatorEmbed(
                             ch, msgId, "🔑 Chrome Key Helper Started",
-                            "Started Delta key helper on **$cl** (portrait-locked + ad bypass)...",
+                            "Started Delta key helper on **$cl** (portrait-locked + safe Ctrl+W ad bypass)...",
                             COLOR_PURPLE, null
                         )
                         if (!won) return@execute
@@ -2605,8 +2605,8 @@ class DiscordBot(private val ctx: Context) {
         val fields = listOf(
             Triple(
                 "👑 5-Key Host Pool (1 Key = 1 UGPhone)",
-                "• `!addkeys [host_cloud] <k1> <k2> <k3> <k4> <k5>` — Load up to 5 keys on Key Host UGPhone (applies `1/5` to Host)\n" +
-                "• `!distributekeys` — Transfer Slots `2–5` to your 4 worker UGPhones, clean `.bak` & rejoin active clones\n" +
+                "• `!addkeys [host_cloud] <k1> <k2> <k3> <k4> <k5>` — Load up to 5 keys on Key Host UGPhone (applies `1/5` to Host; extra keys stay saved)\n" +
+                "• `!distributekeys` — Transfer Slots `2–5` to online worker UGPhones, clean `.bak` & rejoin active clones\n" +
                 "• `!keypool` — View all 5 key slots and device assignments",
                 false
             ),
@@ -2894,6 +2894,7 @@ class DiscordBot(private val ctx: Context) {
                     prev.copy(enabled = true, targetPlaceId = targetLink, privateServerLinks = "")
                 }
                 Rejoiner.saveConfig(ctx, updated)
+                if (!Rejoiner.isRunning() && PilotCore.isRunning) Rejoiner.start(ctx)
                 if (targetCloud != "ALL" || targetCloud.equals(myCloud, true)) {
                     replyEmbed(
                         id, token, 4,
@@ -2947,7 +2948,7 @@ class DiscordBot(private val ctx: Context) {
                 "✅ Full Pilot Sync Code Generated",
                 "• **Allowed IDs (${idList.size}):** `${idList.joinToString(", ")}`\n" +
                 "• **Includes:** Bot Identity + Rejoiner Settings + Delta Key Config\n\n" +
-                "**Paste into Pilot → APPLY CODE (then tap START BOT):**\n```\n$syncCode\n```",
+                "**Paste into Pilot → APPLY CODE (then tap RUN BOT):**\n```\n$syncCode\n```",
                 COLOR_GREEN
             )
 
@@ -3450,7 +3451,11 @@ class DiscordBot(private val ctx: Context) {
         } else if (kind == "pilot_ar_act") {
             val cfg = Rejoiner.loadConfig(ctx)
             when (sel) {
-                "TOGGLE_RJ" -> Rejoiner.saveConfig(ctx, cfg.copy(enabled = !cfg.enabled))
+                "TOGGLE_RJ" -> {
+                    val nextEnabled = !cfg.enabled
+                    Rejoiner.saveConfig(ctx, cfg.copy(enabled = nextEnabled))
+                    if (nextEnabled && PilotCore.isRunning) Rejoiner.start(ctx) else Rejoiner.stop()
+                }
                 "TOGGLE_FPS" -> Rejoiner.saveConfig(ctx, cfg.copy(fpsOptimization = !cfg.fpsOptimization))
                 "TOGGLE_3D" -> Rejoiner.saveConfig(ctx, cfg.copy(render3dOff = !cfg.render3dOff))
                 "TOGGLE_DELTA" -> Rejoiner.saveConfig(ctx, cfg.copy(autoGetDeltaKey = !cfg.autoGetDeltaKey))
@@ -3475,6 +3480,7 @@ class DiscordBot(private val ctx: Context) {
                 else -> if (sel.startsWith("GAME:")) {
                     val pid = sel.removePrefix("GAME:")
                     Rejoiner.saveConfig(ctx, cfg.copy(enabled = true, targetPlaceId = pid, privateServerLinks = ""))
+                    if (!Rejoiner.isRunning() && PilotCore.isRunning) Rejoiner.start(ctx)
                 }
             }
             replyEmbed(
@@ -3678,7 +3684,7 @@ class PilotService : Service() {
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
-            .setContentText("Watchdog, 5-Key Pool & Roblox Bridge Active")
+            .setContentText("Discord Bot, 5-Key Pool & Roblox Bridge Active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)
@@ -3687,7 +3693,11 @@ class PilotService : Service() {
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Pilot::Lock").apply { acquire() }
 
         bot = DiscordBot(this).apply { start() }
-        Rejoiner.start(this)
+        if (Rejoiner.loadConfig(this).enabled) {
+            Rejoiner.start(this)
+        } else {
+            PilotCore.log("[CORE] Bot online — Auto-Rejoiner is OFF (tap RUN AUTO-REJOINER to start)")
+        }
 
         var last: List<AccInfo>? = null
         syncExec.scheduleAtFixedRate({

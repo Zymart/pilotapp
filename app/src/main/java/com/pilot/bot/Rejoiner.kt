@@ -73,6 +73,8 @@ object Rejoiner {
     @Volatile var lastPingUser: String = ""
     @Volatile var lastPingPlaceId: String = ""
 
+    fun isRunning(): Boolean = running.get()
+
     fun loadConfig(ctx: Context): RejoinConfig {
         val p = PilotCore.prefs(ctx)
         return RejoinConfig(
@@ -115,7 +117,6 @@ object Rejoiner {
         return true
     }
 
-    /** Interruptible sleep that aborts within 500ms if STOP BOT is pressed. */
     private fun sleepWhileActive(ms: Long, gen: Long): Boolean {
         val end = System.currentTimeMillis() + ms
         while (System.currentTimeMillis() < end) {
@@ -137,7 +138,6 @@ object Rejoiner {
         return pkgs.mapNotNull { slots[it] }
     }
 
-    /** Immediately rescans a single clone slot (called by RobloxAutoLogin after login/2FA). */
     fun forceRescanSlot(ctx: Context, pkg: String): CloneSlot {
         val slot = slots.getOrPut(pkg) { CloneSlot(pkg) }
         val cookie = SessionVault.extractCookie(pkg)
@@ -165,10 +165,6 @@ object Rejoiner {
         return slot
     }
 
-    /**
-     * Strict session gate: returns true ONLY if the clone has an active logged-in Roblox account
-     * (or recovers one from SessionVault). Never returns true for EMPTY, LOGGED_OUT, or REVOKED slots.
-     */
     fun hasLoggedInAccount(ctx: Context, pkg: String): Boolean {
         val slot = slots.getOrPut(pkg) { CloneSlot(pkg) }
         if (slot.status == "REVOKED") return false
@@ -209,7 +205,6 @@ object Rejoiner {
         }
     }
 
-    /** Picks ONLY a logged-in clone for Baseplate executor testing. Never falls back to empty/logged-out clones. */
     fun pickBestTestClone(ctx: Context): CloneSlot? {
         PilotCore.scanRbx(ctx)
         val all = discoverClones()
@@ -217,7 +212,6 @@ object Rejoiner {
         return eligible.firstOrNull { it.status == "ACTIVE" } ?: eligible.firstOrNull()
     }
 
-    /** Launches a single logged-in clone into a specific Place ID. Refuses to open empty/logged-out clones. */
     fun launchSingleCloneToPlace(ctx: Context, pkg: String, placeId: String): Boolean {
         if (!hasLoggedInAccount(ctx, pkg)) {
             PilotCore.log("[REJOINER] Blocked launch of $pkg (Logged Out / Empty)")
@@ -315,7 +309,7 @@ object Rejoiner {
                 )
             }
             code == "268" -> {
-                slot.cooldownUntilMs = System.currentTimeMillis() + 600_000L // 10 min cooldown
+                slot.cooldownUntilMs = System.currentTimeMillis() + 600_000L
                 slot.status = "COOLDOWN"
                 SuShell.exec("am force-stop ${slot.pkg} && rm -rf /data/data/${slot.pkg}/cache/* 2>/dev/null")
                 PilotCore.onAlert?.invoke(
@@ -364,11 +358,15 @@ object Rejoiner {
     }
 
     fun start(ctx: Context) {
+        val cfg = loadConfig(ctx)
+        if (!cfg.enabled) {
+            PilotCore.log("[REJOINER] Watchdog skipped (disabled in CONFIG)")
+            return
+        }
         forceStopped.set(false)
         val gen = sessionGeneration.incrementAndGet()
         if (!running.compareAndSet(false, true)) return
 
-        val cfg = loadConfig(ctx)
         deployBridgeLua(ctx, cfg)
         restorePausedState(ctx)
         PilotCore.scanRbx(ctx)
@@ -385,11 +383,12 @@ object Rejoiner {
         }.apply { isDaemon = true; start() }
     }
 
-    /** Hard stop: immediately invalidates all queued launches and interrupts the watchdog thread. */
+    /** Hard stop: immediately invalidates all queued launches, key watcher, and watchdog thread. */
     fun stop() {
         forceStopped.set(true)
         sessionGeneration.incrementAndGet()
         running.set(false)
+        KeyAutomator.cancel()
         watchdogThread?.interrupt()
         watchdogThread = null
         PilotCore.log("[REJOINER] Hard-stopped — all queued rejoins cancelled")
@@ -400,7 +399,6 @@ object Rejoiner {
         return out.toIntOrNull() ?: 1024
     }
 
-    /** Reads kernel CPU jiffies (utime + stime) from /proc/<pid>/stat to distinguish script lag from a true deadlock. */
     private fun readProcessCpuTicks(pid: String): Long {
         val stat = SuShell.exec("cat /proc/$pid/stat 2>/dev/null").trim()
         val afterComm = stat.substringAfterLast(')', "").trim()
@@ -411,7 +409,6 @@ object Rejoiner {
         return utime + stime
     }
 
-    /** Returns true if the process is still burning CPU ticks (i.e. executing heavy scripts / lagging, NOT frozen). */
     private fun isProcessActivelyRunningCpu(pid: String, gen: Long): Boolean {
         val t1 = readProcessCpuTicks(pid)
         if (t1 < 0L) return false
@@ -429,7 +426,6 @@ object Rejoiner {
         val list = discoverClones()
         val now = System.currentTimeMillis()
 
-        // Self-heal bridge script & auto-vacuum caches if storage/RAM gets tight
         if (cycle > 0 && cycle % 12 == 0) {
             val bridgeExists = SuShell.exec("[ -f /storage/emulated/0/Delta/Autoexecute/pilot_bridge.lua ] && echo OK").trim()
             if (bridgeExists != "OK") deployBridgeLua(ctx, cfg)
@@ -475,7 +471,6 @@ object Rejoiner {
                 continue
             }
 
-            // Respect teleport and active-script-lag grace windows
             if (now < slot.teleportGraceUntilMs || now < slot.lagGraceUntilMs) continue
 
             val sinceLaunch = now - slot.lastLaunchMs
@@ -499,7 +494,6 @@ object Rejoiner {
                     continue
                 }
 
-                // Check kernel CPU ticks before restarting: if CPU is active, it's executing scripts / lagging, NOT frozen
                 if (isProcessActivelyRunningCpu(pid, gen)) {
                     slot.lagGraceUntilMs = System.currentTimeMillis() + 60_000L
                     slot.gameState = "Script Lag (Grace +60s)"
@@ -517,7 +511,7 @@ object Rejoiner {
     }
 
     private fun isDeltaKeyMissingOnScreen(): Boolean {
-        SuShell.exec("uiautomator dump /sdcard/pilot_ui.xml >/dev/null 2>&1")
+        SuShell.exec("uiautomator dump --compressed /sdcard/pilot_ui.xml >/dev/null 2>&1")
         val xml = SuShell.exec("cat /sdcard/pilot_ui.xml 2>/dev/null").lowercase()
         return xml.contains("receive key") || xml.contains("enter key") || xml.contains("delta key")
     }
@@ -530,7 +524,6 @@ object Rejoiner {
                 return@execute
             }
 
-            // RAM-aware launch check: wait briefly if free RAM is critically low (<280MB)
             var ramChecks = 0
             while (getFreeRamMb() < 280 && ramChecks < 4) {
                 if (!sleepWhileActive(3000L, expectedGen)) return@execute
@@ -555,7 +548,6 @@ object Rejoiner {
             slot.lagGraceUntilMs = 0L
             slot.gameState = "Loading Scripts"
 
-            // Ping-aware stagger: wait minimum staggerDelaySec, and up to 32s until this slot sends its initial /ping
             val minDelayMs = (cfg.staggerDelaySec.coerceIn(10, 30)) * 1000L
             if (!sleepWhileActive(minDelayMs, expectedGen)) return@execute
             val extraDeadline = launchStart + 32_000L
@@ -566,6 +558,7 @@ object Rejoiner {
     }
 
     fun killAllAndStaggeredRejoin(ctx: Context, reason: String = "Manual rejoin") {
+        KeyAutomator.cancel()
         val gen = sessionGeneration.get()
         PilotCore.scanRbx(ctx)
         val eligible = discoverClones().filter { !it.paused && hasLoggedInAccount(ctx, it.pkg) }
@@ -608,7 +601,6 @@ object Rejoiner {
 
             local function enc(s) return HttpService:UrlEncode(tostring(s or "")) end
 
-            -- Immediate handshake ping BEFORE heavy scripts load so Pilot knows this clone booted cleanly
             pcall(function()
                 req({
                     Url = "http://127.0.0.1:8765/ping?user=" .. enc(lp.Name)

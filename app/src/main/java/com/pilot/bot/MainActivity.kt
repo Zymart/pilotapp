@@ -94,6 +94,7 @@ class MainActivity : Activity() {
     private var currentTab = 0 // 0 = FLEET, 1 = CONFIG, 2 = CONSOLE
 
     private lateinit var powerBtn: Button
+    private lateinit var rejoinPowerBtn: Button
     private lateinit var statusPill: TextView
     private lateinit var cloudBadge: TextView
     private lateinit var arcGauge: TelemetryArcView
@@ -268,17 +269,24 @@ class MainActivity : Activity() {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val reactorCard = makeCard("REACTOR POWER & SYSTEM TELEMETRY")
+        val powerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
         powerBtn = Button(this).apply {
-            textSize = 13f
+            textSize = 11.5f
             setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
             setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) }
             setOnClickListener {
                 if (PilotCore.isRunning) {
                     PilotCore.setShouldAutoStart(this@MainActivity, false)
                     autoStartBotSwitch.isChecked = false
-                    Rejoiner.stop()
                     PilotCore.stopService(this@MainActivity)
-                    toast("Bot hard-stopped")
+                    toast("Discord bot stopped")
                 } else {
                     saveFieldsSilent()
                     if (!Settings.canDrawOverlays(this@MainActivity)) {
@@ -288,11 +296,42 @@ class MainActivity : Activity() {
                     }
                     Thread { PilotCore.autoGrantRootAndPerms(this@MainActivity) }.start()
                     PilotCore.startService(this@MainActivity)
+                    toast("Connecting UGPhone to Discord bot...")
                 }
                 syncPowerButton()
             }
         }
-        reactorCard.addView(powerBtn)
+
+        rejoinPowerBtn = Button(this).apply {
+            textSize = 11.5f
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f)
+            setOnClickListener {
+                val curCfg = Rejoiner.loadConfig(this@MainActivity)
+                if (Rejoiner.isRunning() || curCfg.enabled) {
+                    Rejoiner.saveConfig(this@MainActivity, curCfg.copy(enabled = false))
+                    autoRejoinSwitch.isChecked = false
+                    Rejoiner.stop()
+                    toast("Auto-Rejoiner stopped")
+                } else {
+                    saveFieldsSilent()
+                    Rejoiner.saveConfig(this@MainActivity, Rejoiner.loadConfig(this@MainActivity).copy(enabled = true))
+                    autoRejoinSwitch.isChecked = true
+                    if (!PilotCore.isRunning) {
+                        PilotCore.startService(this@MainActivity)
+                    } else {
+                        Rejoiner.start(this@MainActivity)
+                    }
+                    toast("Auto-Rejoiner started!")
+                }
+                syncPowerButton()
+            }
+        }
+
+        powerRow.addView(powerBtn)
+        powerRow.addView(rejoinPowerBtn)
+        reactorCard.addView(powerRow)
 
         arcGauge = TelemetryArcView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(105)).apply {
@@ -389,7 +428,7 @@ class MainActivity : Activity() {
                         if (ok) {
                             loadFieldsFromPrefs()
                             syncPowerButton()
-                            toast("Config applied! Tap START BOT when ready.")
+                            toast("Config applied! Tap RUN BOT when ready.")
                         } else {
                             toast("Invalid sync code")
                         }
@@ -442,7 +481,6 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, dp(6))
         })
 
-        // Row 1: Login Discord + Login Linkvertise
         val loginRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
@@ -459,7 +497,6 @@ class MainActivity : Activity() {
 
         nousigiGetUrlInput = makeInput("Nousigi Key Portal / Discord Link (default: getkey.nousigi.com)")
 
-        // Row 2: Start Get Nousigi Key + Distribute to Other 4 Phones
         val genRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -592,19 +629,31 @@ class MainActivity : Activity() {
     }
 
     private fun syncPowerButton() {
-        val online = PilotCore.isRunning
-        if (online) {
-            powerBtn.text = "■  STOP BOT (HARD STOP)"
+        val botOnline = PilotCore.isRunning
+        if (botOnline) {
+            powerBtn.text = "■ STOP BOT"
             powerBtn.background = cardBg("#B91C1C", "#F87171")
-            statusPill.text = "● ONLINE"
+            statusPill.text = "● BOT ONLINE"
             statusPill.setTextColor(Color.parseColor("#4ADE80"))
             statusPill.background = cardBg("#052E16", "#166534")
         } else {
-            powerBtn.text = "▶  START BOT"
+            powerBtn.text = "▶ RUN BOT"
             powerBtn.background = cardBg("#15803D", "#4ADE80")
             statusPill.text = "○ OFFLINE"
             statusPill.setTextColor(Color.parseColor("#94A3B8"))
             statusPill.background = cardBg("#0F172A", "#334155")
+        }
+
+        val rjActive = Rejoiner.isRunning() || Rejoiner.loadConfig(this).enabled
+        if (rjActive && botOnline) {
+            rejoinPowerBtn.text = "■ STOP REJOINER"
+            rejoinPowerBtn.background = cardBg("#B45309", "#FBBF24")
+        } else if (rjActive) {
+            rejoinPowerBtn.text = "⏳ REJOIN ARMED"
+            rejoinPowerBtn.background = cardBg("#0369A1", "#38BDF8")
+        } else {
+            rejoinPowerBtn.text = "▶ RUN AUTO-REJOINER"
+            rejoinPowerBtn.background = cardBg("#1D4ED8", "#60A5FA")
         }
     }
 
