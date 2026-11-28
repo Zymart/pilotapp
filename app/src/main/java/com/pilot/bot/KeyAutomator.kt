@@ -36,8 +36,8 @@ data class KeyCheckReport(
 )
 
 /**
- * Delta Key Baseplate Tester + Portrait-Locked PlatoRelay & Nousigi Host Key Generator
- * + Ctrl+W Safe Ad-Tab Closer (never backs out to Home) + Floating Key Watcher Overlay
+ * Delta Key Baseplate Tester + Verified Receive-Key -> Chrome Launcher
+ * + Orientation-Agnostic (Landscape & Portrait) Pixel/DOM PlatoRelay & Nousigi Solver
  */
 object KeyAutomator {
     const val BASEPLATE_PLACE_ID = "123974602339071"
@@ -63,10 +63,6 @@ object KeyAutomator {
     @Volatile private var collectedNousigiKeys = mutableListOf<String>()
     @Volatile private var appCtx: Context? = null
     @Volatile private var completionCb: ((Boolean, String) -> Unit)? = null
-
-    @Volatile private var orientationForced = false
-    @Volatile private var savedAccelRotation = "1"
-    @Volatile private var savedUserRotation = "0"
 
     private var overlayRoot: LinearLayout? = null
     private var overlayTitleTv: TextView? = null
@@ -106,45 +102,12 @@ object KeyAutomator {
     }
 
     fun openChromeUrl(url: String) {
-        Thread { openInFullChrome(url, lockPortrait = false) }.start()
-    }
-
-    private fun forcePortraitOrientation() {
-        if (!orientationForced) {
-            val accel = SuShell.exec("settings get system accelerometer_rotation 2>/dev/null").trim()
-            val userRot = SuShell.exec("settings get system user_rotation 2>/dev/null").trim()
-            savedAccelRotation = if (accel == "0" || accel == "1") accel else "1"
-            savedUserRotation = if (userRot in setOf("0", "1", "2", "3")) userRot else "0"
-            orientationForced = true
-        }
-
-        SuShell.exec("settings put system accelerometer_rotation 0 && settings put system user_rotation 0")
-        runCatching { Thread.sleep(450L) }
-
-        val curDims = SuShell.exec("dumpsys window displays 2>/dev/null | grep -oE 'cur=[0-9]+x[0-9]+' | head -n 1")
-        val m = Regex("""cur=(\d+)x(\d+)""").find(curDims)
-        val curW = m?.groupValues?.get(1)?.toIntOrNull() ?: 0
-        val curH = m?.groupValues?.get(2)?.toIntOrNull() ?: 0
-        if (curW > 0 && curH > 0 && curW > curH) {
-            SuShell.exec("settings put system user_rotation 1")
-            runCatching { Thread.sleep(450L) }
-        }
-        PilotCore.log("[KEYAUTO] Forced screen orientation to Portrait")
-    }
-
-    private fun restoreOrientation() {
-        if (!orientationForced) return
-        orientationForced = false
-        val rot = savedUserRotation.ifBlank { "0" }
-        val accel = savedAccelRotation.ifBlank { "1" }
-        SuShell.exec("settings put system user_rotation $rot && settings put system accelerometer_rotation $accel")
-        PilotCore.log("[KEYAUTO] Restored screen orientation (user_rotation=$rot, accel=$accel)")
+        Thread { openInFullChrome(url) }.start()
     }
 
     fun cancel() {
         if (!running.compareAndSet(true, false)) {
             removeFloatingOverlay()
-            restoreOrientation()
             return
         }
         inChromePhase = false
@@ -155,7 +118,6 @@ object KeyAutomator {
         mainHandler.removeCallbacks(keyWatchRunnable)
         completionCb = null
         removeFloatingOverlay()
-        restoreOrientation()
         PilotCore.log("[KEYAUTO] Cancelled active key watcher")
     }
 
@@ -536,30 +498,55 @@ object KeyAutomator {
         return t.startsWith("http") && (t.contains("platorelay.com") || t.contains("platoboost"))
     }
 
-    private fun tapDeltaReceiveKeyInWindow(pkg: String): Boolean {
+    private fun isChromeForeground(): Boolean {
+        val focus = SuShell.exec("dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 3")
+        return focus.contains("com.android.chrome")
+    }
+
+    /**
+     * Brings the Roblox clone to the front, taps Delta's 'Receive Key' button inside its window bounds,
+     * and verifies within 3.5s that Chrome actually opened. If Chrome did NOT open, re-opens Roblox and retries.
+     */
+    private fun ensureReceiveKeyOpensChrome(pkg: String, username: String): Boolean {
         if (pkg.isBlank()) return false
-        var win = PilotCore.findOuterWindowBounds(pkg)
-        if (win == null) {
+
+        for (attempt in 1..4) {
+            if (!running.get()) return false
+            updateStep("Opening $username & tapping 'Receive Key' ($attempt/4)...")
+
+            // Always bring Roblox clone to front first in case it was minimized or behind another app
             SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
-            runCatching { Thread.sleep(650) }
-            win = PilotCore.findOuterWindowBounds(pkg)
+            runCatching { Thread.sleep(1000L) }
+
+            val win = PilotCore.findOuterWindowBounds(pkg)
+            if (win != null) {
+                val titleBarH = 38
+                val contentTop = win.top + titleBarH
+                val contentW = (win.right - win.left).coerceAtLeast(220)
+                val contentH = (win.bottom - contentTop).coerceAtLeast(160)
+
+                val tapX = win.left + (contentW * 0.82f).toInt()
+                val tapY1 = contentTop + (contentH * 0.56f).toInt()
+                val tapY2 = contentTop + (contentH * 0.60f).toInt()
+
+                SuShell.exec("input tap $tapX $tapY1")
+                PilotCore.log("[KEYAUTO] Tapped 'Receive Key' at ($tapX, $tapY1) inside $pkg (attempt $attempt)")
+                runCatching { Thread.sleep(450L) }
+                SuShell.exec("input tap $tapX $tapY2")
+            }
+
+            // Wait up to 3.5s and check if Chrome opened in front
+            val checkDeadline = System.currentTimeMillis() + 3500L
+            while (running.get() && System.currentTimeMillis() < checkDeadline) {
+                runCatching { Thread.sleep(500L) }
+                if (isChromeForeground()) {
+                    PilotCore.log("[KEYAUTO] Confirmed Chrome opened after Receive Key tap!")
+                    return true
+                }
+            }
+            PilotCore.log("[KEYAUTO] Chrome did not open yet — reopening Roblox ($pkg) & retrying Receive Key...")
         }
-        if (win == null) return false
-
-        val titleBarH = 38
-        val contentTop = win.top + titleBarH
-        val contentW = (win.right - win.left).coerceAtLeast(220)
-        val contentH = (win.bottom - contentTop).coerceAtLeast(160)
-
-        val tapX = win.left + (contentW * 0.82f).toInt()
-        val tapY1 = contentTop + (contentH * 0.56f).toInt()
-        val tapY2 = contentTop + (contentH * 0.60f).toInt()
-
-        SuShell.exec("input tap $tapX $tapY1")
-        PilotCore.log("[KEYAUTO] Tapped Delta 'Receive Key' at ($tapX, $tapY1) inside $pkg")
-        runCatching { Thread.sleep(450) }
-        SuShell.exec("input tap $tapX $tapY2")
-        return true
+        return isChromeForeground()
     }
 
     private fun dumpUiXmlCompressed(): String {
@@ -585,6 +572,11 @@ object KeyAutomator {
         return AD_TRAP_KEYWORDS.any { low.contains(it) }
     }
 
+    /**
+     * Orientation-agnostic pixel detector (works in BOTH Landscape 1280x720 and Portrait 720x1280):
+     * Scans the center column (x = w/2) of a screencap PNG for PlatoRelay's pure-white 'Continue' button
+     * (R,G,B > 220) inside PlatoRelay's dark background (R,G,B < 35). Ignores green VPN ads, red Watch tutorial, and blue Visit shop.
+     */
     private fun findWhiteContinueButtonByPixels(ctx: Context): Pair<Int, Int>? {
         val snapPath = File(ctx.cacheDir, "key_scan_${System.nanoTime()}.png").absolutePath
         SuShell.exec("screencap -p '$snapPath' && chmod 666 '$snapPath'")
@@ -606,8 +598,9 @@ object KeyAutomator {
                 return null
             }
 
-            val yStart = (h * 0.40f).toInt()
-            val yEnd = (h * 0.88f).toInt()
+            // Works in both Landscape (Continue at ~78% H) and Portrait (Continue at ~64% H)
+            val yStart = (h * 0.35f).toInt()
+            val yEnd = (h * 0.94f).toInt()
             var runStart = -1
             var foundCenterY = -1
 
@@ -619,7 +612,7 @@ object KeyAutomator {
                 } else {
                     if (runStart >= 0) {
                         val bandH = y - runStart
-                        if (bandH in 24..115) {
+                        if (bandH in 22..115) {
                             val leftSide = bmp.getPixel((cx - 70).coerceAtLeast(10), (runStart + y) / 2)
                             val rightSide = bmp.getPixel((cx + 70).coerceAtMost(w - 10), (runStart + y) / 2)
                             if (Color.red(leftSide) > 210 && Color.red(rightSide) > 210) {
@@ -644,16 +637,15 @@ object KeyAutomator {
         lastWebTapSig = ""
         updateStep(stepLabel)
 
-        // Ctrl+W (KEYCODE_W = 51 with --ctrl) closes the current tab in Chrome without exiting Chrome to Home
+        // Ctrl+W closes the current tab in Chrome without exiting Chrome to Home
         SuShell.exec("input keyevent --ctrl 51")
         Thread.sleep(700L)
 
-        // Bring the PlatoRelay / Nousigi URL back to front in Chrome
         val targetUrl = mainUrl.trim().ifBlank {
             Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
         }
         if (targetUrl.isNotBlank()) {
-            openInFullChrome(targetUrl, lockPortrait = false)
+            openInFullChrome(targetUrl)
             Thread.sleep(900L)
         } else {
             SuShell.exec("monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
@@ -661,7 +653,6 @@ object KeyAutomator {
         }
     }
 
-    /** Automates Nousigi Host Key Generation (up to 5 keys) in Chrome after Discord & Linkvertise login. */
     private fun processNousigiHostStep(ctx: Context) {
         val now = System.currentTimeMillis()
         val xml = dumpUiXmlCompressed()
@@ -690,7 +681,7 @@ object KeyAutomator {
                 return
             }
             Thread.sleep(1200L)
-            openInFullChrome(nousigiPortalUrl, lockPortrait = true)
+            openInFullChrome(nousigiPortalUrl)
             return
         }
 
@@ -781,12 +772,10 @@ object KeyAutomator {
         val isRobloxInFront = focusInfo.contains("com.roblox.clien") || xml.contains("package=\"com.roblox.clien")
         val isChromeInFront = focusInfo.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || xml.contains("url_bar")
 
-        if (isRobloxInFront && !isChromeInFront && activeTestPkg.isNotEmpty()) {
-            if (now - lastWebTapMs >= 3500L) {
-                lastWebTapMs = now
-                updateStep("Re-tapping 'Receive Key' in Delta...")
-                tapDeltaReceiveKeyInWindow(activeTestPkg)
-            }
+        // If Chrome is NOT in front (e.g., Roblox is still open or bounced back), reopen Roblox and tap Receive Key
+        if (!isChromeInFront && activeTestPkg.isNotEmpty()) {
+            val slotUser = Rejoiner.slots[activeTestPkg]?.username?.ifBlank { "slot" } ?: "slot"
+            ensureReceiveKeyOpensChrome(activeTestPkg, slotUser)
             return null
         }
 
@@ -831,7 +820,7 @@ object KeyAutomator {
             if (whiteBtn != null) {
                 tapNodeIfReady("white_continue_px", whiteBtn.first, whiteBtn.second, "Chrome: Tapping white Continue (${whiteBtn.first}, ${whiteBtn.second})...")
             } else {
-                updateStep("Chrome: Scanning portrait screen for Continue / key...")
+                updateStep("Chrome: Scanning screen for Continue / key...")
             }
             return null
         }
@@ -1059,7 +1048,7 @@ object KeyAutomator {
         Thread {
             previousKeySnapshot = readClipboard(ctx).trim()
             updateStep("Opening Nousigi Key Portal (${collectedNousigiKeys.size}/5)...")
-            openInFullChrome(nousigiPortalUrl, lockPortrait = true)
+            openInFullChrome(nousigiPortalUrl)
             mainHandler.postDelayed(keyWatchRunnable, 2200L)
         }.start()
         return true
@@ -1089,8 +1078,6 @@ object KeyAutomator {
         showFloatingOverlay(ctx.applicationContext)
 
         Thread {
-            forcePortraitOrientation()
-
             val currentClip = readClipboard(ctx).trim()
             previousKeySnapshot = currentClip
 
@@ -1099,8 +1086,8 @@ object KeyAutomator {
             if (directUrl.isNotBlank()) {
                 Rejoiner.saveConfig(ctx, Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = directUrl))
                 inChromePhase = true
-                updateStep("Chrome (Portrait): Scanning PlatoRelay...")
-                openInFullChrome(directUrl, lockPortrait = true)
+                updateStep("Chrome: Scanning PlatoRelay...")
+                openInFullChrome(directUrl)
                 mainHandler.postDelayed(keyWatchRunnable, 1800L)
                 return@Thread
             }
@@ -1136,11 +1123,10 @@ object KeyAutomator {
             }
             if (!running.get()) return@Thread
 
-            updateStep("Tapping 'Receive Key' on ${testSlot.username}...")
-            tapDeltaReceiveKeyInWindow(testSlot.pkg)
-            Thread.sleep(1500L)
+            // Tap Receive Key inside Roblox and verify Chrome opens (re-opening Roblox & retrying if needed)
+            ensureReceiveKeyOpensChrome(testSlot.pkg, testSlot.username)
             inChromePhase = true
-            updateStep("Chrome (Portrait): Scanning PlatoRelay...")
+            updateStep("Chrome: Scanning PlatoRelay...")
             mainHandler.postDelayed(keyWatchRunnable, 1500L)
         }.start()
         return true
@@ -1191,8 +1177,7 @@ object KeyAutomator {
         }.start()
     }
 
-    private fun openInFullChrome(url: String, lockPortrait: Boolean = true) {
-        if (lockPortrait) forcePortraitOrientation()
+    private fun openInFullChrome(url: String) {
         val safeUrl = url.replace("'", "%27")
         val res = SuShell.exec(
             "am start -a android.intent.action.VIEW -d '$safeUrl' -p com.android.chrome >/dev/null 2>&1 && echo CHROME_OK"
@@ -1244,7 +1229,6 @@ object KeyAutomator {
     private fun finishFlow(ok: Boolean, msg: String) {
         if (!running.compareAndSet(true, false)) {
             removeFloatingOverlay()
-            restoreOrientation()
             return
         }
         inChromePhase = false
@@ -1254,7 +1238,6 @@ object KeyAutomator {
         currentStep = if (ok) "Completed" else "Failed"
         mainHandler.removeCallbacks(keyWatchRunnable)
         removeFloatingOverlay()
-        restoreOrientation()
         PilotCore.log("[KEYAUTO] ${if (ok) "SUCCESS" else "FAIL"}: $msg")
         PilotCore.onAlert?.invoke(if (ok) "🔑 Key Status" else "⚠️ Key Watcher Alert", msg)
         val cb = completionCb
