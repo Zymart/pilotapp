@@ -35,7 +35,7 @@ data class KeyCheckReport(
 )
 
 /**
- * Delta Key Baseplate Tester + Coordinate Receive-Key Tapper + Chrome PlatoRelay Auto-Clicker
+ * Delta Key Baseplate Tester + Coordinate Receive-Key Tapper + Ad-Bypassing PlatoRelay Auto-Completer
  * + Always-On-Top Floating Key Watcher Overlay (visible only when outside Pilot app)
  */
 object KeyAutomator {
@@ -56,6 +56,7 @@ object KeyAutomator {
     @Volatile private var lastWebTapSig = ""
     @Volatile private var tasksCompletedCount = 0
     @Volatile private var fallbackTapCycle = 0
+    @Volatile private var waitingForTaskTimer = false
     @Volatile private var onSponsorTabSinceMs = 0L
     @Volatile private var appCtx: Context? = null
     @Volatile private var completionCb: ((Boolean, String) -> Unit)? = null
@@ -68,6 +69,28 @@ object KeyAutomator {
     private val DELTA_KEY_RX = Regex("""^KEY_[A-Za-z0-9_-]{12,64}$""")
     private val DELTA_KEY_SEARCH_RX = Regex("""\bKEY_[A-Za-z0-9_-]{12,64}\b""")
     private val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+
+    private val AD_TRAP_KEYWORDS = listOf(
+        "vpnapptoggle",
+        "?pbt=",
+        "use vpn",
+        "stream movies",
+        "7-day trial",
+        "3-day trial",
+        "free trial",
+        "€0.00",
+        "$0.00",
+        "taxes may apply",
+        "/ 1 month",
+        "no payment today",
+        "cancel anytime",
+        "phone is infected",
+        "virus detected",
+        "cleaner",
+        "spin to win",
+        "claim your prize",
+        "allow notifications"
+    )
 
     fun isRunning(): Boolean = running.get()
 
@@ -85,6 +108,7 @@ object KeyAutomator {
         }
         inChromePhase = false
         activeTestPkg = ""
+        waitingForTaskTimer = false
         onSponsorTabSinceMs = 0L
         currentStep = "Cancelled"
         mainHandler.removeCallbacks(keyWatchRunnable)
@@ -509,26 +533,67 @@ object KeyAutomator {
         if (!out.contains("UI hierchary dumped", ignoreCase = true) &&
             !out.contains("UI hierarchy dumped", ignoreCase = true)
         ) {
-            // Retry once without --compressed in case older Android build rejects the flag
             SuShell.exec("rm -f /sdcard/pilot_ui.xml && uiautomator dump /sdcard/pilot_ui.xml >/dev/null 2>&1")
         }
         return SuShell.exec("cat /sdcard/pilot_ui.xml 2>/dev/null")
     }
 
+    /** Checks if XML or window title matches a fake pop-up ad trap (e.g. vpnapptoggle.com/?pbt=Continue). */
+    private fun isFakeAdTrap(rawText: String): Boolean {
+        if (rawText.isBlank()) return false
+        val low = rawText.lowercase()
+        return AD_TRAP_KEYWORDS.any { low.contains(it) }
+    }
+
+    /** Closes a pop-up ad or completed task tab via KEYCODE_BACK and verifies we return to PlatoRelay. */
+    private fun closeChromeTabAndReturnToPlato(ctx: Context, stepLabel: String) {
+        onSponsorTabSinceMs = 0L
+        waitingForTaskTimer = false
+        lastWebTapSig = ""
+        updateStep(stepLabel)
+        SuShell.exec("input keyevent 4")
+        Thread.sleep(1300L)
+
+        val checkXml = dumpUiXmlCompressed()
+        if (isFakeAdTrap(checkXml)) {
+            SuShell.exec("input keyevent 4")
+            Thread.sleep(1000L)
+        }
+        val backOnPlato = checkXml.contains("platorelay.com", ignoreCase = true) ||
+            checkXml.contains("platoboost.com", ignoreCase = true) ||
+            checkXml.contains("Delta Android Keysystem", ignoreCase = true)
+        if (!backOnPlato && checkXml.isNotEmpty()) {
+            SuShell.exec("input keyevent 4")
+            Thread.sleep(1000L)
+            val savedUrl = Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
+            if (savedUrl.isNotBlank()) {
+                val check2 = dumpUiXmlCompressed()
+                if (!check2.contains("platorelay.com", ignoreCase = true) &&
+                    !check2.contains("platoboost.com", ignoreCase = true) &&
+                    !check2.contains("Delta Android Keysystem", ignoreCase = true)
+                ) {
+                    openInFullChrome(savedUrl)
+                }
+            }
+        }
+    }
+
     /**
-     * Automates the PlatoRelay / Platoboost flow in Chrome:
-     * 1) Dumps compressed UI XML; if Chrome's web renderer blocks uiautomator, falls back to tapping
-     *    the exact centered white 'Continue' button coordinates (50% X, 78%/83% Y).
-     * 2) Detects sponsor/pop-up tabs, waits 11s, and sends KEYCODE_BACK to return to PlatoRelay.
-     * 3) Scrapes KEY_... directly from the page or taps Copy Key.
+     * Automates PlatoRelay / Platoboost in Chrome with full pop-up ad detection:
+     * 1) Immediately detects fake ad pages (vpnapptoggle.com/?pbt=Continue, 7-day Trial, €0.00, etc.)
+     *    and closes the ad tab with zero wait—never clicking the ad's fake Continue button.
+     * 2) Never blind-taps Continue if uiautomator XML is empty unless window title confirms PlatoRelay.
+     * 3) Waits 11s ONLY when an actual task tab was opened; scrapes KEY_... directly or taps Copy Key.
      */
     private fun processChromePlatoRelayStep(ctx: Context): String? {
         val now = System.currentTimeMillis()
-        val focusWin = SuShell.exec("dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 2")
+        val focusInfo = SuShell.exec(
+            "dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp|Window #' | head -n 8"
+        )
         val xml = dumpUiXmlCompressed()
 
-        val isRobloxInFront = focusWin.contains("com.roblox.clien") || xml.contains("package=\"com.roblox.clien")
-        val isChromeInFront = focusWin.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || xml.contains("url_bar")
+        val isRobloxInFront = focusInfo.contains("com.roblox.clien") || xml.contains("package=\"com.roblox.clien")
+        val isChromeInFront = focusInfo.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || xml.contains("url_bar")
 
         // 1. If Roblox is still in front and Chrome hasn't opened yet, re-tap Receive Key
         if (isRobloxInFront && !isChromeInFront && activeTestPkg.isNotEmpty()) {
@@ -540,16 +605,27 @@ object KeyAutomator {
             return null
         }
 
-        // 2. If uiautomator dump returned empty on Chrome (WebView animation lock), use coordinate fallback on 'Continue'
+        // 2. If uiautomator dump returned empty on Chrome, check window title before tapping anything
         if (xml.isBlank()) {
+            if (isFakeAdTrap(focusInfo)) {
+                closeChromeTabAndReturnToPlato(ctx, "Ad popup detected in window -> closing tab...")
+                return null
+            }
+            val confirmedPlatoWindow = focusInfo.contains("Delta Android Keysystem", ignoreCase = true) ||
+                focusInfo.contains("platorelay", ignoreCase = true) ||
+                focusInfo.contains("platoboost", ignoreCase = true)
+            if (!confirmedPlatoWindow) {
+                // Never blind-tap when we cannot verify we're on PlatoRelay (avoids clicking VPN/ad Continue buttons)
+                updateStep("Chrome: Waiting for page tree (protecting against ad tabs)...")
+                return null
+            }
             val (w, h) = PilotCore.getDisplaySize()
             if (now - lastWebTapMs >= 3500L) {
                 lastWebTapMs = now
                 val tapX = (w * 0.50f).toInt()
-                // Alternate between standard Continue position (78% Y) and post-Turnstile Continue position (83% Y)
                 val tapY = if (fallbackTapCycle % 2 == 0) (h * 0.78f).toInt() else (h * 0.83f).toInt()
                 fallbackTapCycle += 1
-                updateStep("Chrome: Tapping Continue button ($tapX, $tapY)...")
+                updateStep("Chrome: Tapping PlatoRelay Continue ($tapX, $tapY)...")
                 SuShell.exec("input tap $tapX $tapY")
             }
             return null
@@ -559,8 +635,15 @@ object KeyAutomator {
         val directKey = DELTA_KEY_SEARCH_RX.find(xml)?.value
         if (directKey != null && directKey != previousKeySnapshot) {
             onSponsorTabSinceMs = 0L
+            waitingForTaskTimer = false
             updateStep("Scraped $directKey directly from page!")
             return directKey
+        }
+
+        // 4. Immediately detect and close fake pop-up ad traps (e.g. vpnapptoggle.com/?pbt=Continue)
+        if (isFakeAdTrap(xml)) {
+            closeChromeTabAndReturnToPlato(ctx, "Blocked fake ad redirect -> closing tab...")
+            return null
         }
 
         val isOnPlatoHost = xml.contains("platorelay.com", ignoreCase = true) ||
@@ -568,48 +651,33 @@ object KeyAutomator {
             xml.contains("auth.platorelay", ignoreCase = true) ||
             xml.contains("Delta Android Keysystem", ignoreCase = true)
 
-        // 4. Detect if we are currently on an opened sponsor/pop-up tab (Chrome open, NOT on PlatoRelay)
+        // 5. Handle non-PlatoRelay tabs in Chrome
         if (isChromeInFront && !isOnPlatoHost) {
+            // If we did NOT click a task button (e.g. clicking Continue spawned a pop-up ad tab), close it immediately!
+            if (!waitingForTaskTimer) {
+                closeChromeTabAndReturnToPlato(ctx, "Pop-up ad tab opened -> closing immediately...")
+                return null
+            }
+
+            // Otherwise, we clicked a legitimate task -> wait 11 seconds then close the task tab
             if (onSponsorTabSinceMs == 0L) {
                 onSponsorTabSinceMs = now
             }
             val waitedSec = (now - onSponsorTabSinceMs) / 1000L
             if (waitedSec < 11L) {
                 val rem = 11L - waitedSec
-                updateStep("Task #${tasksCompletedCount + 1}: Waiting ${rem}s on pop-up/task tab...")
+                updateStep("Task #${tasksCompletedCount + 1}: Waiting ${rem}s on task tab...")
                 return null
             }
 
-            // 11 seconds elapsed -> close the pop-up/task tab via KEYCODE_BACK and return to PlatoRelay
             tasksCompletedCount += 1
-            onSponsorTabSinceMs = 0L
-            lastWebTapSig = ""
-            updateStep("Tab #$tasksCompletedCount closed -> returning to PlatoRelay...")
-            SuShell.exec("input keyevent 4")
-            Thread.sleep(1400L)
-
-            val checkXml = dumpUiXmlCompressed()
-            val backOnPlato = checkXml.contains("platorelay", ignoreCase = true) ||
-                checkXml.contains("platoboost", ignoreCase = true) ||
-                checkXml.contains("Delta Android Keysystem", ignoreCase = true)
-            if (!backOnPlato) {
-                SuShell.exec("input keyevent 4")
-                Thread.sleep(1000L)
-                val savedUrl = Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
-                if (savedUrl.isNotBlank()) {
-                    val check2 = dumpUiXmlCompressed()
-                    if (!check2.contains("platorelay", ignoreCase = true) &&
-                        !check2.contains("platoboost", ignoreCase = true) &&
-                        !check2.contains("Delta Android Keysystem", ignoreCase = true)
-                    ) {
-                        openInFullChrome(savedUrl)
-                    }
-                }
-            }
+            closeChromeTabAndReturnToPlato(ctx, "Task #$tasksCompletedCount done! Closing tab -> PlatoRelay...")
             return null
         }
 
+        // Back on PlatoRelay
         onSponsorTabSinceMs = 0L
+        waitingForTaskTimer = false
 
         // Save PlatoRelay URL from Chrome's address bar if visible
         val urlMatch = Regex("""https?://(?:auth\.platorelay\.com|gateway\.platoboost\.com)/[^\s"<']+""").find(xml)
@@ -691,6 +759,7 @@ object KeyAutomator {
                     low.startsWith("task "))
         }
         if (uncompletedTask != null) {
+            waitingForTaskTimer = true
             tapNodeIfReady(
                 uncompletedTask.label,
                 uncompletedTask.cx,
@@ -716,18 +785,20 @@ object KeyAutomator {
                 n.enabled && n.cy > 90 && (low == pat || (pat.length >= 6 && low.contains(pat)))
             }
             if (hit != null) {
+                waitingForTaskTimer = false
                 tapNodeIfReady(hit.label, hit.cx, hit.cy, "Chrome: Tapping '${hit.label.take(24)}' (${hit.cx}, ${hit.cy})...")
                 return null
             }
         }
 
-        // Fallback if Delta Android Keysystem is visible in XML (e.g. 'Completed 0 of 1') but Continue node had no text attribute
+        // Fallback if Delta Android Keysystem is confirmed in XML but Continue node lacked a text label
         if (xml.contains("Delta Android Keysystem", ignoreCase = true) || xml.contains("Completed 0 of", ignoreCase = true)) {
             val (w, h) = PilotCore.getDisplaySize()
             val tapX = (w * 0.50f).toInt()
             val tapY = if (fallbackTapCycle % 2 == 0) (h * 0.78f).toInt() else (h * 0.83f).toInt()
             fallbackTapCycle += 1
-            tapNodeIfReady("continue_coord", tapX, tapY, "Chrome: Tapping Continue ($tapX, $tapY)...")
+            waitingForTaskTimer = false
+            tapNodeIfReady("continue_coord", tapX, tapY, "Chrome: Tapping PlatoRelay Continue ($tapX, $tapY)...")
             return null
         }
 
@@ -786,7 +857,7 @@ object KeyAutomator {
 
     /**
      * Tests Delta key on Baseplate (123974602339071) using ONLY a logged-in clone.
-     * Taps 'Receive Key' inside Roblox (which opens Chrome automatically), clicks Continue / completes tasks,
+     * Taps 'Receive Key' inside Roblox, bypasses pop-up ad tabs immediately, completes tasks,
      * taps Verify Human, and applies KEY_...
      */
     fun startDeltaRenewal(
@@ -806,6 +877,7 @@ object KeyAutomator {
         lastWebTapSig = ""
         tasksCompletedCount = 0
         fallbackTapCycle = 0
+        waitingForTaskTimer = false
         onSponsorTabSinceMs = 0L
         completionCb = onDone
         startedAtMs = System.currentTimeMillis()
@@ -969,6 +1041,7 @@ object KeyAutomator {
         }
         inChromePhase = false
         activeTestPkg = ""
+        waitingForTaskTimer = false
         onSponsorTabSinceMs = 0L
         currentStep = if (ok) "Completed" else "Failed"
         mainHandler.removeCallbacks(keyWatchRunnable)
