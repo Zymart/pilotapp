@@ -584,7 +584,7 @@ object PilotCore {
             echo "LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
             echo "MEM=$(free -m | awk '/Mem:/ {print $2" "$3" "$4}')"
             echo "DISK=$(df -h /storage/emulated/0 2>/dev/null | tail -n 1 | awk '{print $4" free / "$2" ("$5" used)"}')"
-            echo "IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')"
+            echo "IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(k=1;k<=NF;k++) if(${'$'}k=="src") print ${'$'}(k+1)}')"
             echo "WMSIZE=$(wm size 2>/dev/null | tail -n 1)"
             """.trimIndent()
         )
@@ -2328,7 +2328,6 @@ class DiscordBot(private val ctx: Context) {
                 return
             }
 
-            // Defer immediately within <100ms so loaded cloud phones never hit Discord's 3s timeout
             deferInteraction(id, token, ephemeral = (devAction == "ss"))
 
             when (devAction) {
@@ -2415,7 +2414,6 @@ class DiscordBot(private val ctx: Context) {
             }
 
             if (mode == "scan_device") {
-                // Defer immediately (<100ms) so Cloud Phone 30 never hits Discord's 3-second timeout
                 deferInteraction(id, token, ephemeral = false)
                 val (embed, buttons) = buildDeviceScanDashboard(myCloud)
                 val body = JSONObject()
