@@ -437,7 +437,7 @@ object PilotCore {
         return false
     }
 
-    /** Generates an all-in-one XXXXXXX-... sync code containing Discord, Rejoiner & Key Automator settings. */
+    /** Generates an all-in-one XXXXXXX-... sync code containing Discord, Rejoiner & Key Helper settings. */
     fun makeCode(c: Context, autoRoot: Boolean = true): String {
         val letters = (1..7).map { ('A'..'Z').random() }.joinToString("")
         val rj = Rejoiner.loadConfig(c)
@@ -469,7 +469,7 @@ object PilotCore {
         return "$letters-$b64"
     }
 
-    /** Restores Discord identity, Rejoiner rules, and Key Automator credentials/paths from an XXXXXXX-... sync code. */
+    /** Restores Discord identity, Rejoiner rules, and Key Helper credentials/paths from an XXXXXXX-... sync code. */
     fun applyCode(c: Context, code: String, startSvc: Boolean = true): Pair<Boolean, Boolean> {
         val parsed = runCatching {
             val raw = code.trim().substringAfter("-")
@@ -1325,7 +1325,7 @@ class DiscordBot(private val ctx: Context) {
                 if (targetCloud.isNotEmpty() && !targetCloud.equals(cl, true)) return
                 ioExec.execute {
                     if (targetCloud.isEmpty()) {
-                        val won = postSingleCoordinatorMessage(ch, msgId, "🔑 **Key Automator Started**", JSONObject().put("content", "🔑 **Key Automator Started** on **$cl**..."))
+                        val won = postSingleCoordinatorMessage(ch, msgId, "🔑 **Chrome Key Helper Started**", JSONObject().put("content", "🔑 **Chrome Key Helper Started** on **$cl** — complete verification in Chrome and tap Copy..."))
                         if (!won) return@execute
                     }
                     if (url.contains("luarmor", true)) {
@@ -1335,6 +1335,22 @@ class DiscordBot(private val ctx: Context) {
                     } else {
                         KeyAutomator.startDeltaRenewal(ctx, explicitUrl = url)
                     }
+                }
+            }
+            "!setkey" -> {
+                val tokens = arg.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                if (tokens.isEmpty()) {
+                    ioExec.execute {
+                        if (!hasBotRepliedAfter(ch, msgId)) sendMsg(ch, "⚠️ Usage: `!setkey [cloud] <luarmor_or_delta_key>`")
+                    }
+                    return
+                }
+                val targetCloud = if (tokens.size >= 2) tokens[0] else ""
+                val keyVal = if (tokens.size >= 2) tokens[1] else tokens[0]
+                if (targetCloud.isNotEmpty() && !targetCloud.equals(cl, true)) return
+                ioExec.execute {
+                    val (ok, msg) = KeyAutomator.applyManualKey(ctx, keyVal)
+                    sendMsg(ch, "${if (ok) "✅" else "❌"} **$cl** — $msg")
                 }
             }
             "!setconfig" -> {
@@ -1497,7 +1513,7 @@ class DiscordBot(private val ctx: Context) {
             "!config" -> {
                 ioExec.execute {
                     val code = PilotCore.makeCode(ctx, autoRoot = true)
-                    val header = "**📋 Full Pilot Sync Code (Bot + Rejoiner + Key Automator):**"
+                    val header = "**📋 Full Pilot Sync Code (Bot + Rejoiner + Key Helper):**"
                     val won = postSingleCoordinatorMessage(
                         ch,
                         msgId,
@@ -1848,24 +1864,25 @@ class DiscordBot(private val ctx: Context) {
 
             **🔍 Monitoring, Health & Screenshots**
 - `!scan` — Select a cloud phone to list all Roblox instances & statuses
-- `!health` — Show free RAM, active/frozen slot count, live Key Automator status, and uptime
+- `!health` — Show free RAM, active/frozen slot count, live Key Watcher status, and uptime
 - `!search <username>` — Find which cloud & slot has an account
 - `!checkstatus <username>` — Maximize via `[□]`, capture screenshot, and snap back to 2×2
 - `!ss` / `!ss all` — Full-screen screenshot of a cloud (or all clouds)
 - `!sschannel` — Set this channel for key/session alerts & Lua `getgenv().PilotSnap()` triggers
 
             **🔁 Rejoiner, Keys & Fleet Maintenance**
-- `!autorejoin` (or `!ar`) — Control Rejoiner, Game Place ID, FPS Opt, 3D Render Off, Auto Nousigi Key, and Auto Delta Key (single cloud or `ALL ONLINE CLOUDS`)
+- `!autorejoin` (or `!ar`) — Control Rejoiner, Game Place ID, FPS Opt, 3D Render Off, Chrome Key Helper, and Delta Key Helper (single cloud or `ALL ONLINE CLOUDS`)
 - `!rejoin <username>` — Immediately force-restart & rejoin a specific account
 - `!pause <username>` / `!resume <username>` — Pause or resume Rejoiner watchdog on a single slot
-- `!getkey [cloud] <url>` — Trigger background Luarmor (Nousigi) or PlatoRelay (Delta) key automator
+- `!getkey [cloud] <url>` — Open Luarmor or PlatoRelay in Full Chrome and auto-capture copied key
+- `!setkey [cloud] <key>` — Immediately save a Luarmor or Delta key into the existing key file & restart clones
 - `!setconfig <username>` — Upload `message.txt`/`.json` or paste JSON to save Nousigi config for that account
 - `!pushscript` — Attach a `.lua` file to deploy into `Delta/Autoexecute/` across all online clouds
 - `!arrange` / `!logs` / `!killall` / `!reboot` — Grid layout, live telemetry logs, force-stop clones, or reboot cloud
 
             **⚙️ Setup & OTA Updates**
 - `!createconfig` — Build a `XXXXXXX-...` Sync Code (supports `@` token bypass & multiple User/Role IDs)
-- `!config` — Post & DM your full `XXXXXXX-...` Sync Code (Bot + Rejoiner + Key Automator settings)
+- `!config` — Post & DM your full `XXXXXXX-...` Sync Code (Bot + Rejoiner + Key Helper settings)
 - `!rename <new name>` — Remotely rename a cloud phone
 - `!update [drive_url]` / `!version` — OTA APK update & version check
         """.trimIndent()
@@ -2072,7 +2089,7 @@ class DiscordBot(private val ctx: Context) {
                         "content",
                         "✅ **Full Pilot Sync Code Generated!**\n" +
                         "• **Allowed User/Role IDs (${idList.size}):** `${idList.joinToString(", ")}`\n" +
-                        "• **Includes:** Bot Identity + Rejoiner Settings + Key Automator Credentials\n" +
+                        "• **Includes:** Bot Identity + Rejoiner Settings + Key Helper Config\n" +
                         "• **Auto-Setup on Apply:** Root + Battery Whitelist + Autoexec + Auto-Start\n\n" +
                         "**Copy & paste into Pilot → APPLY CODE:**\n```\n$syncCode\n```"
                     )
@@ -2362,10 +2379,10 @@ class DiscordBot(private val ctx: Context) {
             .put(JSONObject().put("label", "Set Custom Place ID / VIP Link").put("value", "ON_LINK"))
             .put(JSONObject().put("label", "Toggle FPS Optimizer (${if (cfg.fpsOptimization) "ON" else "OFF"})").put("value", "TOGGLE_FPS"))
             .put(JSONObject().put("label", "Toggle 3D Render Off (${if (cfg.render3dOff) "ON" else "OFF"})").put("value", "TOGGLE_3D"))
-            .put(JSONObject().put("label", "Toggle Auto Nousigi Key (${if (cfg.autoGetNousigiKey) "ON" else "OFF"})").put("value", "TOGGLE_NOUSIGI"))
-            .put(JSONObject().put("label", "Toggle Auto Delta Key (${if (cfg.autoGetDeltaKey) "ON" else "OFF"})").put("value", "TOGGLE_DELTA"))
-            .put(JSONObject().put("label", "Run Nousigi Key Renewal Now").put("value", "RUN_NOUSIGI"))
-            .put(JSONObject().put("label", "Run Delta Key Renewal Now").put("value", "RUN_DELTA"))
+            .put(JSONObject().put("label", "Toggle Chrome Nousigi Key Helper (${if (cfg.autoGetNousigiKey) "ON" else "OFF"})").put("value", "TOGGLE_NOUSIGI"))
+            .put(JSONObject().put("label", "Toggle Chrome Delta Key Helper (${if (cfg.autoGetDeltaKey) "ON" else "OFF"})").put("value", "TOGGLE_DELTA"))
+            .put(JSONObject().put("label", "Open Nousigi Key in Chrome Now").put("value", "RUN_NOUSIGI"))
+            .put(JSONObject().put("label", "Open Delta Key in Chrome Now").put("value", "RUN_DELTA"))
             .put(JSONObject().put("label", "Kill All & Staggered Rejoin Now").put("value", "REJOIN_ALL"))
 
         Rejoiner.FAMOUS_GAMES.filter { it.placeId.isNotEmpty() && it.placeId != "CUSTOM" }.forEach { g ->
@@ -2384,10 +2401,10 @@ class DiscordBot(private val ctx: Context) {
             JSONObject()
                 .put(
                     "content",
-                    "**🔁 Rejoiner & Key Automator (`$targetTag`)**\n" +
+                    "**🔁 Rejoiner & Key Helper (`$targetTag`)**\n" +
                     "• **Rejoiner:** ${if (cfg.enabled) "🟢 ON" else "🔴 OFF"} | **Target:** `${cfg.targetPlaceId.ifEmpty { "Auto" }}`\n" +
                     "• **FPS Opt:** `${cfg.fpsOptimization}` | **3D Render Off:** `${cfg.render3dOff}`\n" +
-                    "• **Auto Nousigi Key:** `${cfg.autoGetNousigiKey}` | **Auto Delta Key:** `${cfg.autoGetDeltaKey}`"
+                    "• **Chrome Nousigi Key:** `${cfg.autoGetNousigiKey}` | **Chrome Delta Key:** `${cfg.autoGetDeltaKey}`"
                 )
                 .put("components", row)
                 .put("flags", 64)
@@ -2508,7 +2525,7 @@ class PilotService : Service() {
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
-            .setContentText("Watchdog, Key Automator & Roblox Bridge Active")
+            .setContentText("Watchdog, Key Helper & Roblox Bridge Active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)

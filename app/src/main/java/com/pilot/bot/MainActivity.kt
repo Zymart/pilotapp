@@ -23,7 +23,6 @@ import android.widget.*
 class MainActivity : Activity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private lateinit var powerBtn: Button
-    private lateinit var previewToggleBtn: Button
     private lateinit var statusPill: TextView
     private lateinit var keyStatusText: TextView
     private lateinit var slotMonitorText: TextView
@@ -54,7 +53,6 @@ class MainActivity : Activity() {
     private val refreshTick = object : Runnable {
         override fun run() {
             syncPowerButton()
-            syncPreviewButton()
             refreshTelemetry()
             uiHandler.postDelayed(this, 1500L)
         }
@@ -141,7 +139,6 @@ class MainActivity : Activity() {
         root.addView(bodyContainer)
         setContentView(root)
         syncPowerButton()
-        syncPreviewButton()
     }
 
     private fun buildControlsColumn(): LinearLayout {
@@ -185,24 +182,25 @@ class MainActivity : Activity() {
         quickRow.addView(makeSmallBtn("NOUSIGI KEY", "#7C3AED") {
             saveFieldsSilent()
             KeyAutomator.startNousigiRenewal(this)
-            toast("Nousigi key renewal started")
+            toast("Opening Luarmor in Chrome — copy key when done")
         })
         quickRow.addView(makeSmallBtn("DELTA KEY", "#0F766E") {
             saveFieldsSilent()
             KeyAutomator.startDeltaRenewal(this)
-            toast("Delta key renewal started")
+            toast("Opening PlatoRelay in Chrome — copy key when done")
         })
-        previewToggleBtn = makeSmallBtn("PREVIEW: OFF", "#334155") {
-            val next = !KeyAutomator.isPreviewEnabled()
-            KeyAutomator.setPreviewEnabled(next)
-            syncPreviewButton()
-            toast(if (next) "Live WebView preview ON" else "Live WebView preview OFF")
-        }
-        quickRow.addView(previewToggleBtn)
+        quickRow.addView(makeSmallBtn("PASTE KEY", "#B45309") {
+            saveFieldsSilent()
+            Thread {
+                val clip = KeyAutomator.readClipboard(this)
+                val (_, msg) = KeyAutomator.applyManualKey(this, clip)
+                uiHandler.post { toast(msg) }
+            }.start()
+        })
         powerCard.addView(quickRow)
         col.addView(powerCard)
 
-        // 2. Sync Code & Identity Card (Saves & restores ALL settings including Key Automator + Rejoiner)
+        // 2. Sync Code & Identity Card
         val idCard = makeCard("ALL-IN-ONE SYNC CODE & IDENTITY")
         syncCodeInput = makeInput("Paste XXXXXXX-... Sync Code (restores ALL settings)")
         val codeRow = LinearLayout(this).apply {
@@ -283,13 +281,13 @@ class MainActivity : Activity() {
         col.addView(rjCard)
 
         // 4. Key Automator Card
-        val keyCard = makeCard("BACKGROUND KEY AUTOMATOR")
-        nousigiSwitch = makeSwitch("Auto Get & Maximize Nousigi Key (Luarmor)")
+        val keyCard = makeCard("CHROME KEY HELPER & AUTO-CLIPBOARD")
+        nousigiSwitch = makeSwitch("Open Chrome on Blacklisted/Expired Nousigi Key")
         luarmorInput = makeInput("Luarmor URL")
-        lvEmailInput = makeInput("Linkvertise Premium Email (saved in config & sync code)")
-        lvPassInput = makeInput("Linkvertise Premium Password", password = true)
+        lvEmailInput = makeInput("Linkvertise Email (saved in config & sync code)")
+        lvPassInput = makeInput("Linkvertise Password", password = true)
         keyPathInput = makeInput("Existing Key File Path (auto-detected if blank)")
-        deltaSwitch = makeSwitch("Auto Get Delta Key (PlatoRelay + LootLabs)")
+        deltaSwitch = makeSwitch("Open Chrome on Missing Delta Key")
         deltaUrlInput = makeInput("Saved PlatoRelay URL (auto-grabbed if empty)")
 
         keyCard.addView(nousigiSwitch)
@@ -322,7 +320,7 @@ class MainActivity : Activity() {
     private fun buildMonitorColumn(): LinearLayout {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        val keyMonCard = makeCard("KEY AUTOMATOR LIVE STATUS")
+        val keyMonCard = makeCard("KEY WATCHER LIVE STATUS")
         keyStatusText = TextView(this).apply {
             textSize = 11.5f
             setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
@@ -370,15 +368,6 @@ class MainActivity : Activity() {
             statusPill.setTextColor(Color.parseColor("#94A3B8"))
             statusPill.background = cardBg("#1E293B", "#334155")
         }
-    }
-
-    private fun syncPreviewButton() {
-        val on = KeyAutomator.isPreviewEnabled()
-        previewToggleBtn.text = if (on) "PREVIEW: ON" else "PREVIEW: OFF"
-        previewToggleBtn.background = cardBg(
-            if (on) "#B45309" else "#334155",
-            if (on) "#FBBF24" else "#475569"
-        )
     }
 
     private fun refreshTelemetry() {
