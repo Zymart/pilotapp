@@ -249,7 +249,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.4.0"
+    const val APP_VERSION = "v1.4.1"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -366,7 +366,7 @@ object PilotCore {
 
     fun isAuthorized(c: Context, userId: String, roles: JSONArray?): Boolean {
         val allowed = getAllowedIds(c)
-        if (allowed.isEmpty()) return true // Allow if no ID restriction configured yet
+        if (allowed.isEmpty()) return true
         if (userId.isNotEmpty() && userId in allowed) return true
         if (roles != null) {
             for (i in 0 until roles.length()) {
@@ -430,15 +430,32 @@ object PilotCore {
         if (diskCode.contains("-")) {
             val (ok, _) = applyCode(c, diskCode, startSvc = false)
             if (ok) {
-                log("[SYNC] Auto-loaded config from $SHARED_SYNC_PATH")
+                log("[SYNC] Auto-loaded full config from $SHARED_SYNC_PATH")
                 return true
             }
         }
         return false
     }
 
+    /** Generates an all-in-one XXXXXXX-... sync code containing Discord, Rejoiner & Key Automator settings. */
     fun makeCode(c: Context, autoRoot: Boolean = true): String {
         val letters = (1..7).map { ('A'..'Z').random() }.joinToString("")
+        val rj = Rejoiner.loadConfig(c)
+        val rjJson = JSONObject()
+            .put("en", rj.enabled)
+            .put("bt", rj.autoStartOnBoot)
+            .put("pid", rj.targetPlaceId)
+            .put("vip", rj.privateServerLinks)
+            .put("fps", rj.fpsOptimization)
+            .put("r3d", rj.render3dOff)
+            .put("ank", rj.autoGetNousigiKey)
+            .put("lurl", rj.luarmorUrl)
+            .put("lve", rj.lvEmail)
+            .put("lvp", rj.lvPassword)
+            .put("nkp", rj.nousigiKeyPath)
+            .put("adk", rj.autoGetDeltaKey)
+            .put("durl", rj.deltaPlatoUrl)
+
         val payload = JSONObject()
             .put("t", getToken(c))
             .put("u", getPrimaryUserId(c))
@@ -446,11 +463,13 @@ object PilotCore {
             .put("c", getSsChannel(c))
             .put("d", getUpdateUrl(c))
             .put("ar", autoRoot)
+            .put("rj", rjJson)
             .toString()
         val b64 = Base64.encodeToString(payload.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
         return "$letters-$b64"
     }
 
+    /** Restores Discord identity, Rejoiner rules, and Key Automator credentials/paths from an XXXXXXX-... sync code. */
     fun applyCode(c: Context, code: String, startSvc: Boolean = true): Pair<Boolean, Boolean> {
         val parsed = runCatching {
             val raw = code.trim().substringAfter("-")
@@ -479,6 +498,29 @@ object PilotCore {
         val upd = parsed.optString("d", "")
         if (upd.isNotEmpty()) edit.putString("upd_url", upd)
         edit.apply()
+
+        parsed.optJSONObject("rj")?.let { r ->
+            val cur = Rejoiner.loadConfig(c)
+            Rejoiner.saveConfig(
+                c,
+                cur.copy(
+                    enabled = r.optBoolean("en", cur.enabled),
+                    autoStartOnBoot = r.optBoolean("bt", cur.autoStartOnBoot),
+                    targetPlaceId = r.optString("pid", cur.targetPlaceId),
+                    privateServerLinks = r.optString("vip", cur.privateServerLinks),
+                    fpsOptimization = r.optBoolean("fps", cur.fpsOptimization),
+                    render3dOff = r.optBoolean("r3d", cur.render3dOff),
+                    autoGetNousigiKey = r.optBoolean("ank", cur.autoGetNousigiKey),
+                    luarmorUrl = r.optString("lurl", cur.luarmorUrl),
+                    lvEmail = r.optString("lve", cur.lvEmail),
+                    lvPassword = r.optString("lvp", cur.lvPassword),
+                    nousigiKeyPath = r.optString("nkp", cur.nousigiKeyPath),
+                    autoGetDeltaKey = r.optBoolean("adk", cur.autoGetDeltaKey),
+                    deltaPlatoUrl = r.optString("durl", cur.deltaPlatoUrl)
+                )
+            )
+        }
+
         writeSharedBackup(c)
 
         val autoRoot = parsed.optBoolean("ar", true)
@@ -1213,7 +1255,7 @@ class DiscordBot(private val ctx: Context) {
                 val slots = Rejoiner.discoverClones()
                 val active = slots.count { it.status == "ACTIVE" }
                 val upMin = SystemClock.elapsedRealtime() / 60000L
-                sendMsg(ch, "🩺 **$cl** (${PilotCore.APP_VERSION}) | RAM Free: `$mem` | Slots: **$active/${slots.size} ACTIVE** | Uptime: `${upMin}m`")
+                sendMsg(ch, "🩺 **$cl** (${PilotCore.APP_VERSION}) | RAM Free: `$mem` | Slots: **$active/${slots.size} ACTIVE** | Key: `${KeyAutomator.getLiveStatusText()}` | Uptime: `${upMin}m`")
             }
             "!createconfig", "!newconfig" -> ioExec.execute {
                 val btn = JSONObject()
@@ -1455,7 +1497,7 @@ class DiscordBot(private val ctx: Context) {
             "!config" -> {
                 ioExec.execute {
                     val code = PilotCore.makeCode(ctx, autoRoot = true)
-                    val header = "**📋 Your Pilot Sync Code (Auto-Root Enabled):**"
+                    val header = "**📋 Full Pilot Sync Code (Bot + Rejoiner + Key Automator):**"
                     val won = postSingleCoordinatorMessage(
                         ch,
                         msgId,
@@ -1466,7 +1508,7 @@ class DiscordBot(private val ctx: Context) {
                         val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", authorId))
                         val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
                         if (dmCh.isNotEmpty()) {
-                            sendMsg(dmCh, "**Your Pilot Sync Code:**\n`$code`\n```\n$code\n```")
+                            sendMsg(dmCh, "**Your Full Pilot Sync Code:**\n`$code`\n```\n$code\n```")
                         }
                     }
                 }
@@ -1806,7 +1848,7 @@ class DiscordBot(private val ctx: Context) {
 
             **🔍 Monitoring, Health & Screenshots**
 - `!scan` — Select a cloud phone to list all Roblox instances & statuses
-- `!health` — Show free RAM, active/frozen slot count, and uptime across all online clouds
+- `!health` — Show free RAM, active/frozen slot count, live Key Automator status, and uptime
 - `!search <username>` — Find which cloud & slot has an account
 - `!checkstatus <username>` — Maximize via `[□]`, capture screenshot, and snap back to 2×2
 - `!ss` / `!ss all` — Full-screen screenshot of a cloud (or all clouds)
@@ -1823,7 +1865,7 @@ class DiscordBot(private val ctx: Context) {
 
             **⚙️ Setup & OTA Updates**
 - `!createconfig` — Build a `XXXXXXX-...` Sync Code (supports `@` token bypass & multiple User/Role IDs)
-- `!config` — Post & DM your current `XXXXXXX-...` Sync Code
+- `!config` — Post & DM your full `XXXXXXX-...` Sync Code (Bot + Rejoiner + Key Automator settings)
 - `!rename <new name>` — Remotely rename a cloud phone
 - `!update [drive_url]` / `!version` — OTA APK update & version check
         """.trimIndent()
@@ -2028,8 +2070,9 @@ class DiscordBot(private val ctx: Context) {
                 JSONObject()
                     .put(
                         "content",
-                        "✅ **Pilot Sync Code Generated!**\n" +
+                        "✅ **Full Pilot Sync Code Generated!**\n" +
                         "• **Allowed User/Role IDs (${idList.size}):** `${idList.joinToString(", ")}`\n" +
+                        "• **Includes:** Bot Identity + Rejoiner Settings + Key Automator Credentials\n" +
                         "• **Auto-Setup on Apply:** Root + Battery Whitelist + Autoexec + Auto-Start\n\n" +
                         "**Copy & paste into Pilot → APPLY CODE:**\n```\n$syncCode\n```"
                     )
@@ -2041,7 +2084,7 @@ class DiscordBot(private val ctx: Context) {
                 val dmRes = apiPost("https://discord.com/api/v10/users/@me/channels", JSONObject().put("recipient_id", userId))
                 val dmCh = runCatching { JSONObject(dmRes).getString("id") }.getOrDefault("")
                 if (dmCh.isNotEmpty()) {
-                    sendMsg(dmCh, "**Your Pilot Sync Code (Auto-Root Enabled):**\n`$syncCode`\n```\n$syncCode\n```")
+                    sendMsg(dmCh, "**Your Full Pilot Sync Code (Auto-Root Enabled):**\n`$syncCode`\n```\n$syncCode\n```")
                 }
             }
             return
@@ -2079,7 +2122,6 @@ class DiscordBot(private val ctx: Context) {
 
             if (mode == "ar") {
                 if (isAll) {
-                    // Only one cloud posts the shared ALL panel
                     val jitter = (abs(myCloud.hashCode()) % 12) * 100L
                     runCatching { Thread.sleep(jitter) }
                     if (hasBotRepliedAfter(ch, msgId)) return

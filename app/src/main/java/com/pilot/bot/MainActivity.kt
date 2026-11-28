@@ -23,7 +23,9 @@ import android.widget.*
 class MainActivity : Activity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private lateinit var powerBtn: Button
+    private lateinit var previewToggleBtn: Button
     private lateinit var statusPill: TextView
+    private lateinit var keyStatusText: TextView
     private lateinit var slotMonitorText: TextView
     private lateinit var telemetryText: TextView
 
@@ -45,14 +47,16 @@ class MainActivity : Activity() {
     private lateinit var luarmorInput: EditText
     private lateinit var lvEmailInput: EditText
     private lateinit var lvPassInput: EditText
+    private lateinit var keyPathInput: EditText
     private lateinit var deltaSwitch: Switch
     private lateinit var deltaUrlInput: EditText
 
     private val refreshTick = object : Runnable {
         override fun run() {
             syncPowerButton()
+            syncPreviewButton()
             refreshTelemetry()
-            uiHandler.postDelayed(this, 2000L)
+            uiHandler.postDelayed(this, 1500L)
         }
     }
 
@@ -137,12 +141,13 @@ class MainActivity : Activity() {
         root.addView(bodyContainer)
         setContentView(root)
         syncPowerButton()
+        syncPreviewButton()
     }
 
     private fun buildControlsColumn(): LinearLayout {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // 1. Power Card (Single Dynamic START / STOP Button — stays in-app!)
+        // 1. Power Card
         val powerCard = makeCard("BOT CONTROL")
         powerBtn = Button(this).apply {
             textSize = 13f
@@ -180,27 +185,26 @@ class MainActivity : Activity() {
         quickRow.addView(makeSmallBtn("NOUSIGI KEY", "#7C3AED") {
             saveFieldsSilent()
             KeyAutomator.startNousigiRenewal(this)
-            toast("Background Nousigi key renewal started")
+            toast("Nousigi key renewal started")
         })
         quickRow.addView(makeSmallBtn("DELTA KEY", "#0F766E") {
             saveFieldsSilent()
             KeyAutomator.startDeltaRenewal(this)
-            toast("Background Delta key renewal started")
+            toast("Delta key renewal started")
         })
-        quickRow.addView(makeSmallBtn("OTA UPDATE", "#B45309") {
-            saveFieldsSilent()
-            toast("Checking for APK update...")
-            Thread {
-                val res = AppUpdater.checkAndInstall(this, force = true)
-                uiHandler.post { toast(res) }
-            }.start()
-        })
+        previewToggleBtn = makeSmallBtn("PREVIEW: OFF", "#334155") {
+            val next = !KeyAutomator.isPreviewEnabled()
+            KeyAutomator.setPreviewEnabled(next)
+            syncPreviewButton()
+            toast(if (next) "Live WebView preview ON" else "Live WebView preview OFF")
+        }
+        quickRow.addView(previewToggleBtn)
         powerCard.addView(quickRow)
         col.addView(powerCard)
 
-        // 2. Sync Code & Identity Card
-        val idCard = makeCard("SYNC CODE & BOT IDENTITY")
-        syncCodeInput = makeInput("Paste XXXXXXX-... Sync Code")
+        // 2. Sync Code & Identity Card (Saves & restores ALL settings including Key Automator + Rejoiner)
+        val idCard = makeCard("ALL-IN-ONE SYNC CODE & IDENTITY")
+        syncCodeInput = makeInput("Paste XXXXXXX-... Sync Code (restores ALL settings)")
         val codeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -218,7 +222,7 @@ class MainActivity : Activity() {
                         if (ok) {
                             loadFieldsFromPrefs()
                             syncPowerButton()
-                            toast("Sync code applied & bot started!")
+                            toast("All bot, key & rejoiner settings applied!")
                         } else {
                             toast("Invalid sync code")
                         }
@@ -226,12 +230,12 @@ class MainActivity : Activity() {
                 }.start()
             }
         })
-        codeRow.addView(makeSmallBtn("COPY MY CODE", "#334155") {
+        codeRow.addView(makeSmallBtn("COPY FULL CONFIG CODE", "#334155") {
             saveFieldsSilent()
             val code = PilotCore.makeCode(this, autoRoot = true)
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("PilotSync", code))
-            toast("Sync code copied to clipboard")
+            toast("Full config sync code copied!")
         })
 
         tokenInput = makeInput("Discord Bot Token", password = true)
@@ -282,8 +286,9 @@ class MainActivity : Activity() {
         val keyCard = makeCard("BACKGROUND KEY AUTOMATOR")
         nousigiSwitch = makeSwitch("Auto Get & Maximize Nousigi Key (Luarmor)")
         luarmorInput = makeInput("Luarmor URL")
-        lvEmailInput = makeInput("Linkvertise Premium Email (stored locally)")
+        lvEmailInput = makeInput("Linkvertise Premium Email (saved in config & sync code)")
         lvPassInput = makeInput("Linkvertise Premium Password", password = true)
+        keyPathInput = makeInput("Existing Key File Path (auto-detected if blank)")
         deltaSwitch = makeSwitch("Auto Get Delta Key (PlatoRelay + LootLabs)")
         deltaUrlInput = makeInput("Saved PlatoRelay URL (auto-grabbed if empty)")
 
@@ -291,17 +296,21 @@ class MainActivity : Activity() {
         keyCard.addView(luarmorInput)
         keyCard.addView(lvEmailInput)
         keyCard.addView(lvPassInput)
+        keyCard.addView(keyPathInput)
         keyCard.addView(deltaSwitch)
         keyCard.addView(deltaUrlInput)
 
         val saveBtn = Button(this).apply {
-            text = "SAVE ALL SETTINGS"
+            text = "SAVE ALL SETTINGS & SYNC"
             textSize = 12f
             setTextColor(Color.WHITE)
             background = cardBg("#0284C7", "#38BDF8")
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
             setOnClickListener {
                 saveFieldsSilent()
-                toast("Saved & synced pilot_bridge.lua")
+                toast("All settings saved & synced!")
             }
         }
         keyCard.addView(saveBtn)
@@ -312,6 +321,16 @@ class MainActivity : Activity() {
 
     private fun buildMonitorColumn(): LinearLayout {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val keyMonCard = makeCard("KEY AUTOMATOR LIVE STATUS")
+        keyStatusText = TextView(this).apply {
+            textSize = 11.5f
+            setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+            setTextColor(Color.parseColor("#38BDF8"))
+            text = "IDLE"
+        }
+        keyMonCard.addView(keyStatusText)
+        col.addView(keyMonCard)
 
         val slotCard = makeCard("LIVE ROBLOX SLOTS (PING WATCHDOG)")
         slotMonitorText = TextView(this).apply {
@@ -353,7 +372,20 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun syncPreviewButton() {
+        val on = KeyAutomator.isPreviewEnabled()
+        previewToggleBtn.text = if (on) "PREVIEW: ON" else "PREVIEW: OFF"
+        previewToggleBtn.background = cardBg(
+            if (on) "#B45309" else "#334155",
+            if (on) "#FBBF24" else "#475569"
+        )
+    }
+
     private fun refreshTelemetry() {
+        val active = KeyAutomator.isRunning()
+        keyStatusText.text = KeyAutomator.getLiveStatusText()
+        keyStatusText.setTextColor(Color.parseColor(if (active) "#FBBF24" else "#38BDF8"))
+
         val now = System.currentTimeMillis()
         val slots = Rejoiner.slots.values.sortedBy { it.pkg }
         slotMonitorText.text = if (slots.isEmpty()) {
@@ -387,6 +419,17 @@ class MainActivity : Activity() {
         deltaSwitch.isChecked = cfg.autoGetDeltaKey
         deltaUrlInput.setText(cfg.deltaPlatoUrl)
 
+        if (cfg.nousigiKeyPath.isNotBlank()) {
+            keyPathInput.setText(cfg.nousigiKeyPath)
+        } else {
+            Thread {
+                val found = KeyAutomator.detectExistingKeyFile(this)
+                if (found.isNotEmpty()) {
+                    uiHandler.post { if (keyPathInput.text.isNullOrBlank()) keyPathInput.setText(found) }
+                }
+            }.start()
+        }
+
         val presetIdx = Rejoiner.FAMOUS_GAMES.indexOfFirst { it.placeId == cfg.targetPlaceId }
             .takeIf { it >= 0 } ?: (Rejoiner.FAMOUS_GAMES.size - 1)
         gameSpinner.setSelection(presetIdx)
@@ -397,7 +440,6 @@ class MainActivity : Activity() {
         val tok = tokenInput.text.toString().trim()
         val ids = allowedIdsInput.text.toString().trim()
         val upd = updateUrlInput.text.toString().trim()
-        PilotCore.saveConfig(this, cloud, tok, ids, PilotCore.getSsChannel(this), upd)
 
         val prev = Rejoiner.loadConfig(this)
         Rejoiner.saveConfig(
@@ -412,10 +454,12 @@ class MainActivity : Activity() {
                 luarmorUrl = luarmorInput.text.toString().trim(),
                 lvEmail = lvEmailInput.text.toString().trim(),
                 lvPassword = lvPassInput.text.toString(),
+                nousigiKeyPath = keyPathInput.text.toString().trim(),
                 autoGetDeltaKey = deltaSwitch.isChecked,
                 deltaPlatoUrl = deltaUrlInput.text.toString().trim()
             )
         )
+        PilotCore.saveConfig(this, cloud, tok, ids, PilotCore.getSsChannel(this), upd)
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

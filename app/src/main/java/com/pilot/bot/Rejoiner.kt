@@ -12,7 +12,7 @@ data class FamousGame(val name: String, val placeId: String)
 data class CloneSlot(
     val pkg: String,
     @Volatile var username: String = "",
-    @Volatile var status: String = "IDLE", // ACTIVE, FROZEN, NO_DELTA_KEY, LOGGED_OUT, PAUSED, REVOKED, EMPTY
+    @Volatile var status: String = "IDLE",
     @Volatile var placeId: String = "",
     @Volatile var fps: Int = 0,
     @Volatile var lastPingMs: Long = 0L,
@@ -32,6 +32,7 @@ data class RejoinConfig(
     val luarmorUrl: String = "https://ads.luarmor.net/get_key?for=-dkAHbyOeBCOT",
     val lvEmail: String = "",
     val lvPassword: String = "",
+    val nousigiKeyPath: String = "",
     val autoGetDeltaKey: Boolean = false,
     val deltaPlatoUrl: String = "",
     val pingTimeoutSec: Int = 95,
@@ -71,6 +72,7 @@ object Rejoiner {
             luarmorUrl = p.getString("rj_luarmor_url", "https://ads.luarmor.net/get_key?for=-dkAHbyOeBCOT").orEmpty(),
             lvEmail = p.getString("rj_lv_email", "").orEmpty(),
             lvPassword = p.getString("rj_lv_pass", "").orEmpty(),
+            nousigiKeyPath = p.getString("rj_nousigi_key_path", "").orEmpty(),
             autoGetDeltaKey = p.getBoolean("rj_auto_delta", false),
             deltaPlatoUrl = p.getString("rj_delta_url", "").orEmpty(),
             pingTimeoutSec = p.getInt("rj_ping_timeout", 95),
@@ -90,6 +92,7 @@ object Rejoiner {
             .putString("rj_luarmor_url", cfg.luarmorUrl.trim())
             .putString("rj_lv_email", cfg.lvEmail.trim())
             .putString("rj_lv_pass", cfg.lvPassword)
+            .putString("rj_nousigi_key_path", cfg.nousigiKeyPath.trim())
             .putBoolean("rj_auto_delta", cfg.autoGetDeltaKey)
             .putString("rj_delta_url", cfg.deltaPlatoUrl.trim())
             .putInt("rj_ping_timeout", cfg.pingTimeoutSec)
@@ -105,7 +108,6 @@ object Rejoiner {
         return pkgs.mapNotNull { slots[it] }
     }
 
-    /** Called by PilotEngine HTTP server (127.0.0.1:8765/ping) whenever pilot_bridge.lua ticks. */
     fun onBridgePing(ctx: Context, user: String, placeId: String, fps: Int): String {
         val now = System.currentTimeMillis()
         val matched = slots.values.firstOrNull { it.username.equals(user, ignoreCase = true) }
@@ -126,12 +128,10 @@ object Rejoiner {
         return """{"ok":true,"fpsOpt":${cfg.fpsOptimization},"render3dOff":$want3dOff}"""
     }
 
-    /** Temporarily turns 3D rendering ON for clean screenshots when 3D Render Off mode is enabled. */
     fun hold3dRenderForScreenshot(ms: Long = 5000L) {
         screenshot3dHoldUntilMs = System.currentTimeMillis() + ms
     }
 
-    /** Called by PilotEngine HTTP server (/keyerr?reason=blacklisted) from pilot_bridge.lua. */
     fun onBridgeKeyError(ctx: Context, user: String, reason: String) {
         PilotCore.log("[REJOINER] Key error reported by $user: $reason")
         val cfg = loadConfig(ctx)
@@ -142,7 +142,6 @@ object Rejoiner {
         }
     }
 
-    /** Called by PilotEngine HTTP server (/kick?user=...&code=...) from pilot_bridge.lua. */
     fun onBridgeKick(ctx: Context, user: String, code: String, msg: String) {
         val slot = slots.values.firstOrNull { it.username.equals(user, ignoreCase = true) } ?: return
         slot.lastKickReason = "$code: $msg"
@@ -205,7 +204,6 @@ object Rejoiner {
         val list = discoverClones()
         val now = System.currentTimeMillis()
 
-        // Periodic storage & log cleanup every ~30 minutes
         if (cycle > 0 && cycle % 180 == 0) {
             list.forEach { SuShell.exec("rm -rf /data/data/${it.pkg}/files/logs/* /data/data/${it.pkg}/cache/* 2>/dev/null") }
         }
@@ -311,10 +309,9 @@ object Rejoiner {
         } else ""
     }
 
-    /** Writes Pilot's auto-execute Lua bridge into Delta/Autoexecute/. */
     fun deployBridgeLua(ctx: Context, cfg: RejoinConfig) {
         val lua = """
-            -- Pilot v1.4.0 Bridge (Auto-Ping + Blacklist Detection + FPS Optimizer + Anti-AFK + PilotSnap)
+            -- Pilot v1.4.1 Bridge (Auto-Ping + Blacklist Detection + FPS Optimizer + Anti-AFK + PilotSnap)
             if getgenv().__PILOT_BRIDGE_V14 then return end
             getgenv().__PILOT_BRIDGE_V14 = true
 
@@ -340,7 +337,6 @@ object Rejoiner {
                 end)
             end
 
-            -- Anti-AFK (prevents Error 278 idle kicks)
             lp.Idled:Connect(function()
                 pcall(function()
                     VirtualUser:CaptureController()
@@ -348,7 +344,6 @@ object Rejoiner {
                 end)
             end)
 
-            -- FPS Optimizer (ON by default)
             local fpsApplied = false
             local function applyFpsBoost()
                 if fpsApplied then return end
@@ -372,7 +367,6 @@ object Rejoiner {
             end
             if ${cfg.fpsOptimization} then applyFpsBoost() end
 
-            -- Disconnect / Blacklisted Key Hook
             local function checkAuthMessage(msg)
                 local low = string.lower(tostring(msg or ""))
                 if string.find(low, "blacklisted") or string.find(low, "key has been banned") or string.find(low, "invalid key") or string.find(low, "key expired") then
@@ -391,7 +385,6 @@ object Rejoiner {
                 end)
             end)
 
-            -- Watch CoreGui / RobloxPromptGui for Nousigi Authenticate System blacklisted popup
             task.spawn(function()
                 while true do
                     pcall(function()
@@ -408,7 +401,6 @@ object Rejoiner {
                 end
             end)
 
-            -- FPS sampler + /ping heartbeat every 8s
             local frames = 0
             RunService.RenderStepped:Connect(function() frames += 1 end)
 

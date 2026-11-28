@@ -20,8 +20,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Background WebView Key Engine for:
- * 1) Nousigi Hub (Luarmor ads.luarmor.net + Linkvertise Premium auto-login, maximize duration, overwrite existing file)
+ * Background WebView Key Engine with live toggleable preview & step telemetry:
+ * 1) Nousigi Hub (Luarmor + Linkvertise Premium auto-login, maximize duration, overwrite existing file)
  * 2) Delta Executor (PlatoRelay + LootLabs, auto-grab Receive Key link, 4-layer apply)
  */
 object KeyAutomator {
@@ -30,6 +30,7 @@ object KeyAutomator {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val running = AtomicBoolean(false)
 
+    @Volatile private var previewEnabled = false
     @Volatile private var currentMode: Mode? = null
     @Volatile private var forceFreshKey = false
     @Volatile private var activeWebView: WebView? = null
@@ -40,16 +41,57 @@ object KeyAutomator {
     @Volatile private var lastTaskClickMs = 0L
     @Volatile private var lastRenewalClicks = 0
     @Volatile private var capturedKey = ""
+    @Volatile private var currentStep = "Idle"
+    @Volatile private var lastLoggedStep = ""
     @Volatile private var appCtx: Context? = null
     @Volatile private var completionCb: ((Boolean, String) -> Unit)? = null
 
     fun isRunning(): Boolean = running.get()
+    fun isPreviewEnabled(): Boolean = previewEnabled
+
+    fun getLiveStatusText(): String {
+        if (!running.get()) return "IDLE ($currentStep)"
+        val sec = ((System.currentTimeMillis() - startedAtMs) / 1000L).coerceAtLeast(0L)
+        return "RUNNING (${sec}s) — $currentStep"
+    }
+
+    /** Toggles the floating live WebView preview on/off even while a renewal is already running. */
+    fun setPreviewEnabled(enabled: Boolean) {
+        previewEnabled = enabled
+        val ctx = appCtx ?: return
+        val wv = activeWebView ?: return
+        val params = overlayParams ?: return
+        val manager = wm ?: return
+        mainHandler.post {
+            applyOverlayDimensions(ctx, params, largePreview = enabled)
+            runCatching { manager.updateViewLayout(wv, params) }
+        }
+    }
+
+    /** Finds the existing key file in Delta/Workspace/Nousigi Hub (or custom saved path). */
+    fun detectExistingKeyFile(ctx: Context? = null): String {
+        val saved = ctx?.let { Rejoiner.loadConfig(it).nousigiKeyPath.trim() }.orEmpty()
+        if (saved.isNotEmpty() && SuShell.exec("[ -f '$saved' ] && echo OK").trim() == "OK") {
+            return saved
+        }
+        return SuShell.exec(
+            "find '/storage/emulated/0/Delta/Workspace/Nousigi Hub' '/storage/emulated/0/Delta/Workspace' -maxdepth 3 -type f -iname '*key*' 2>/dev/null | head -n 1"
+        ).trim()
+    }
+
+    private fun updateStep(step: String) {
+        currentStep = step
+        if (step != lastLoggedStep) {
+            lastLoggedStep = step
+            PilotCore.log("[KEYAUTO] $step")
+        }
+    }
 
     private val tickRunnable = object : Runnable {
         override fun run() {
             if (!running.get()) return
             if (System.currentTimeMillis() - startedAtMs > 300_000L) {
-                finishFlow(false, "Key automation timed out after 5m.")
+                finishFlow(false, "Key automation timed out after 5m (last step: $currentStep).")
                 return
             }
             when (currentMode) {
@@ -57,7 +99,7 @@ object KeyAutomator {
                 Mode.DELTA_PLATO -> tickDeltaPlatoLootLabs()
                 null -> Unit
             }
-            mainHandler.postDelayed(this, 2600L)
+            mainHandler.postDelayed(this, 2500L)
         }
     }
 
@@ -73,7 +115,7 @@ object KeyAutomator {
             return false
         }
         if (!running.compareAndSet(false, true)) {
-            PilotCore.log("[KEYAUTO] Already running — skipping duplicate Nousigi trigger")
+            PilotCore.log("[KEYAUTO] Already running ($currentStep) — skipping duplicate Nousigi trigger")
             return false
         }
         appCtx = ctx.applicationContext
@@ -81,13 +123,14 @@ object KeyAutomator {
         forceFreshKey = blacklistedReset
         capturedKey = ""
         lastRenewalClicks = 0
+        lastLoggedStep = ""
         completionCb = onDone
         startedAtMs = System.currentTimeMillis()
 
-        PilotCore.log("[KEYAUTO] Starting background Nousigi key flow (reset=$blacklistedReset)")
+        updateStep("Opening Luarmor (${if (blacklistedReset) "fresh key" else "renew/max"})...")
         mainHandler.post {
             mountBackgroundWebView(ctx.applicationContext, cfg.luarmorUrl)
-            mainHandler.postDelayed(tickRunnable, 3000L)
+            mainHandler.postDelayed(tickRunnable, 2800L)
         }
         return true
     }
@@ -99,20 +142,21 @@ object KeyAutomator {
         onDone: ((Boolean, String) -> Unit)? = null
     ): Boolean {
         if (!running.compareAndSet(false, true)) {
-            PilotCore.log("[KEYAUTO] Already running — skipping duplicate Delta trigger")
+            PilotCore.log("[KEYAUTO] Already running ($currentStep) — skipping duplicate Delta trigger")
             return false
         }
         appCtx = ctx.applicationContext
         currentMode = Mode.DELTA_PLATO
         forceFreshKey = false
         capturedKey = ""
+        lastLoggedStep = ""
         completionCb = onDone
         startedAtMs = System.currentTimeMillis()
 
         Thread {
             var url = explicitUrl.trim().ifBlank { Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim() }
             if (url.isBlank()) {
-                PilotCore.log("[KEYAUTO] No saved PlatoRelay URL — attempting auto-grab from Delta Receive Key...")
+                updateStep("Grabbing Receive Key link from Delta...")
                 url = autoGrabDeltaReceiveKeyLink(ctx)
                 if (url.isNotBlank()) {
                     val updated = Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = url)
@@ -124,10 +168,10 @@ object KeyAutomator {
                 finishFlow(false, "No PlatoRelay URL saved and could not grab Receive Key from Delta.")
                 return@Thread
             }
-            PilotCore.log("[KEYAUTO] Starting background Delta key flow")
+            updateStep("Opening PlatoRelay / LootLabs...")
             mainHandler.post {
                 mountBackgroundWebView(ctx.applicationContext, url)
-                mainHandler.postDelayed(tickRunnable, 3000L)
+                mainHandler.postDelayed(tickRunnable, 2800L)
             }
         }.start()
         return true
@@ -172,6 +216,25 @@ object KeyAutomator {
         return result
     }
 
+    private fun applyOverlayDimensions(ctx: Context, params: WindowManager.LayoutParams, largePreview: Boolean) {
+        val d = ctx.resources.displayMetrics.density
+        if (largePreview) {
+            params.width = (360 * d).toInt()
+            params.height = (230 * d).toInt()
+            params.gravity = Gravity.TOP or Gravity.END
+            params.x = (10 * d).toInt()
+            params.y = (36 * d).toInt()
+            params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        } else {
+            params.width = 2
+            params.height = 2
+            params.gravity = Gravity.TOP or Gravity.START
+            params.x = 0
+            params.y = 0
+            params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun mountBackgroundWebView(ctx: Context, startUrl: String) {
         teardownWebView()
@@ -180,7 +243,8 @@ object KeyAutomator {
             addJavascriptInterface(Bridge(), "PilotKeyBridge")
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    PilotCore.log("[KEYAUTO] Loaded: ${url?.take(64)}")
+                    val host = runCatching { android.net.Uri.parse(url).host.orEmpty() }.getOrDefault("")
+                    if (host.isNotEmpty()) updateStep("Loaded page: $host")
                 }
             }
             webChromeClient = object : WebChromeClient() {
@@ -210,10 +274,8 @@ object KeyAutomator {
                 2, 2, type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
                 PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                x = 0; y = 0
-            }
+            )
+            applyOverlayDimensions(ctx, params, largePreview = previewEnabled)
             wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             overlayParams = params
             runCatching { wm?.addView(wv, params) }
@@ -225,7 +287,7 @@ object KeyAutomator {
         wv.loadUrl(startUrl)
     }
 
-    /** Temporarily expands overlay to 360x220 in top-left corner for ~2s so root input tap hits Turnstile cleanly. */
+    /** Temporarily expands overlay for ~2s so root input tap hits Turnstile cleanly, then restores preview state. */
     private fun flashForTurnstileTap(cssX: Float, cssY: Float) {
         val now = System.currentTimeMillis()
         if (now - lastTapMs < 6500L) return
@@ -235,11 +297,10 @@ object KeyAutomator {
         val params = overlayParams ?: return
         val manager = wm ?: return
 
+        updateStep("Cloudflare Turnstile detected — tapping verification...")
         mainHandler.post {
             val d = ctx.resources.displayMetrics.density
-            params.width = (360 * d).toInt()
-            params.height = (220 * d).toInt()
-            params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            applyOverlayDimensions(ctx, params, largePreview = true)
             runCatching { manager.updateViewLayout(wv, params) }
 
             mainHandler.postDelayed({
@@ -248,13 +309,10 @@ object KeyAutomator {
                 val tx = (loc[0] + cssX * d).toInt().coerceAtLeast(16)
                 val ty = (loc[1] + cssY * d).toInt().coerceAtLeast(16)
                 Thread {
-                    PilotCore.log("[KEYAUTO] Root Turnstile tap at ($tx, $ty)")
                     SuShell.exec("input tap $tx $ty")
                     Thread.sleep(1500)
                     mainHandler.post {
-                        params.width = 2
-                        params.height = 2
-                        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        applyOverlayDimensions(ctx, params, largePreview = previewEnabled)
                         runCatching { manager.updateViewLayout(wv, params) }
                     }
                 }.start()
@@ -306,6 +364,7 @@ object KeyAutomator {
                     var emailIn = document.querySelector('input[type="email"], input[name="email"]');
                     var passIn = document.querySelector('input[type="password"]');
                     if (emailIn && passIn && '$emailEsc'.length > 3) {
+                        PilotKeyBridge.reportStep('Linkvertise: auto-filling Premium credentials...');
                         emailIn.value = '$emailEsc';
                         emailIn.dispatchEvent(new Event('input', {bubbles:true}));
                         passIn.value = '$passEsc';
@@ -319,11 +378,26 @@ object KeyAutomator {
                         var el = lvBtns[b];
                         if (el.offsetParent === null) continue;
                         var t = (el.innerText || '').trim().toLowerCase();
-                        if (t.indexOf('get ') === 0 || t.indexOf('continue') !== -1 || t.indexOf('free access') !== -1 || t.indexOf('skip') !== -1 || t.indexOf('i accept') !== -1) {
+                        if (t.indexOf('get ') === 0 || t.indexOf('direct access') !== -1 || t.indexOf('continue') !== -1 || t.indexOf('free access') !== -1 || t.indexOf('skip') !== -1 || t.indexOf('i accept') !== -1) {
+                            PilotKeyBridge.reportStep('Linkvertise: clicking "' + (el.innerText || '').trim().slice(0, 28) + '"');
                             el.click();
                             return;
                         }
                     }
+                    // If not logged in yet and a Login/Sign in link is visible
+                    if ('$emailEsc'.length > 3) {
+                        for (var l = 0; l < lvBtns.length; l++) {
+                            var lel = lvBtns[l];
+                            if (lel.offsetParent === null) continue;
+                            var lt = (lel.innerText || '').trim().toLowerCase();
+                            if (lt === 'login' || lt === 'log in' || lt === 'sign in') {
+                                PilotKeyBridge.reportStep('Linkvertise: opening Login form...');
+                                lel.click();
+                                return;
+                            }
+                        }
+                    }
+                    PilotKeyBridge.reportStep('Waiting on Linkvertise (' + host + ')...');
                     return;
                 }
 
@@ -338,8 +412,16 @@ object KeyAutomator {
                         var btn = btns[k];
                         if (btn.disabled || btn.offsetParent === null) continue;
                         var bt = (btn.innerText || '').trim().toLowerCase();
-                        if (bt.indexOf('i accept') !== -1 || bt === 'accept') { btn.click(); return; }
-                        if (bt.indexOf('get a new key') !== -1 || bt === 'start' || bt === 'next') { btn.click(); return; }
+                        if (bt.indexOf('i accept') !== -1 || bt === 'accept') {
+                            PilotKeyBridge.reportStep('Luarmor: accepting terms...');
+                            btn.click();
+                            return;
+                        }
+                        if (bt.indexOf('get a new key') !== -1 || bt === 'start' || bt === 'next' || bt.indexOf('proceed') !== -1) {
+                            PilotKeyBridge.reportStep('Luarmor: clicking "' + (btn.innerText || '').trim() + '"');
+                            btn.click();
+                            return;
+                        }
                         if (bt.indexOf('renew') !== -1 || bt.indexOf('extend') !== -1) {
                             PilotKeyBridge.noteRenewClick();
                             btn.click();
@@ -348,7 +430,9 @@ object KeyAutomator {
                     }
                     if (foundKey && (text.toLowerCase().indexOf('max') !== -1 || text.toLowerCase().indexOf('active') !== -1 || text.toLowerCase().indexOf('expires') !== -1)) {
                         PilotKeyBridge.onLuarmorComplete(foundKey);
+                        return;
                     }
+                    PilotKeyBridge.reportStep('On Luarmor — waiting for checkpoint/buttons...');
                 }
             })();
         """.trimIndent()
@@ -391,7 +475,11 @@ object KeyAutomator {
                     var t = (el.innerText || el.value || '').trim().toLowerCase();
                     if (!t || t.length > 40) continue;
                     for (var k = 0; k < labels.length; k++) {
-                        if (t === labels[k] || t.indexOf(labels[k]) !== -1) { el.click(); return; }
+                        if (t === labels[k] || t.indexOf(labels[k]) !== -1) {
+                            PilotKeyBridge.reportStep('Delta flow: clicking "' + (el.innerText || el.value || '').trim() + '"');
+                            el.click();
+                            return;
+                        }
                     }
                 }
 
@@ -406,6 +494,7 @@ object KeyAutomator {
                             return;
                         }
                     }
+                    PilotKeyBridge.reportStep('Waiting on LootLabs task timer...');
                 }
             })();
         """.trimIndent()
@@ -413,6 +502,9 @@ object KeyAutomator {
     }
 
     class Bridge {
+        @JavascriptInterface
+        fun reportStep(step: String) = updateStep(step)
+
         @JavascriptInterface
         fun tapTurnstile(x: Float, y: Float) = flashForTurnstileTap(x, y)
 
@@ -424,7 +516,7 @@ object KeyAutomator {
         @JavascriptInterface
         fun noteRenewClick() {
             lastRenewalClicks++
-            PilotCore.log("[KEYAUTO] Extending Luarmor key time (step #$lastRenewalClicks)...")
+            updateStep("Luarmor: extending key duration (step #$lastRenewalClicks)...")
         }
 
         @JavascriptInterface
@@ -433,7 +525,8 @@ object KeyAutomator {
             if (key.isBlank()) return
             Thread {
                 val ctx = appCtx ?: return@Thread
-                val path = overwriteExistingKeyFile("/storage/emulated/0/Delta/Workspace", key, preferSubdir = "Nousigi Hub")
+                updateStep("Saving Nousigi key to existing key file...")
+                val path = overwriteExistingKeyFile(ctx, "/storage/emulated/0/Delta/Workspace", key, preferSubdir = "Nousigi Hub")
                 if (path != null) {
                     PilotCore.log("[KEYAUTO] Nousigi key saved to existing file: $path")
                     Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Nousigi key updated")
@@ -449,6 +542,7 @@ object KeyAutomator {
             val now = System.currentTimeMillis()
             if (now - lastTaskClickMs < 16_000L) return
             lastTaskClickMs = now
+            updateStep("LootLabs: triggering background task #$index...")
             mainHandler.post {
                 activeWebView?.evaluateJavascript(
                     "(function(){var t=document.querySelectorAll('a,button,div[role=\"button\"]')[$index];if(t)t.click();})();",
@@ -463,13 +557,14 @@ object KeyAutomator {
             if (key.isBlank()) return
             Thread {
                 val ctx = appCtx ?: return@Thread
+                updateStep("Applying Delta key (HWID + Clipboard + File + Rejoin)...")
                 mainHandler.post {
                     runCatching {
                         val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         cm.setPrimaryClip(ClipData.newPlainText("DeltaKey", key))
                     }
                 }
-                val cached = overwriteExistingKeyFile("/storage/emulated/0/Delta/Internals", key, preferSubdir = "")
+                val cached = overwriteExistingKeyFile(null, "/storage/emulated/0/Delta/Internals", key, preferSubdir = "")
                 Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key renewed")
                 val extra = if (cached != null) " + updated `$cached`" else ""
                 finishFlow(true, "Delta key `$key` applied (HWID + Clipboard$extra). All clones restarting.")
@@ -477,14 +572,19 @@ object KeyAutomator {
         }
     }
 
-    /** Finds an existing key file and overwrites it in place — never creates a duplicate file. */
-    private fun overwriteExistingKeyFile(baseDir: String, key: String, preferSubdir: String): String? {
-        val searchFirst = if (preferSubdir.isNotBlank()) "'$baseDir/$preferSubdir' '$baseDir'" else "'$baseDir'"
-        val existing = SuShell.exec("find $searchFirst -maxdepth 3 -type f -iname '*key*' 2>/dev/null | head -n 1").trim()
+    /** Overwrites the saved/detected existing key file in place — never creates duplicate files. */
+    private fun overwriteExistingKeyFile(ctx: Context?, baseDir: String, key: String, preferSubdir: String): String? {
+        val explicitPath = ctx?.let { Rejoiner.loadConfig(it).nousigiKeyPath.trim() }.orEmpty()
+        val existing = if (explicitPath.isNotEmpty() && SuShell.exec("[ -f '$explicitPath' ] && echo OK").trim() == "OK") {
+            explicitPath
+        } else {
+            val searchFirst = if (preferSubdir.isNotBlank()) "'$baseDir/$preferSubdir' '$baseDir'" else "'$baseDir'"
+            SuShell.exec("find $searchFirst -maxdepth 3 -type f -iname '*key*' 2>/dev/null | head -n 1").trim()
+        }
         if (existing.isBlank()) return null
 
-        val ctx = appCtx ?: return null
-        val tmp = File(ctx.cacheDir, "key_write_tmp")
+        val c = appCtx ?: return null
+        val tmp = File(c.cacheDir, "key_write_tmp")
         FileOutputStream(tmp).use { it.write(key.toByteArray(Charsets.UTF_8)) }
         SuShell.exec("cp '${tmp.absolutePath}' '$existing' && chmod 666 '$existing'")
         tmp.delete()
@@ -493,6 +593,7 @@ object KeyAutomator {
 
     private fun finishFlow(ok: Boolean, msg: String) {
         if (!running.compareAndSet(true, false)) return
+        currentStep = if (ok) "Completed" else "Failed"
         mainHandler.removeCallbacks(tickRunnable)
         mainHandler.post { teardownWebView() }
         PilotCore.log("[KEYAUTO] ${if (ok) "SUCCESS" else "FAIL"}: $msg")
