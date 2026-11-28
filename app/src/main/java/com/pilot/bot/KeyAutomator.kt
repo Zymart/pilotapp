@@ -28,7 +28,8 @@ data class KeyCheckReport(
 object KeyAutomator {
     enum class Mode { NOUSIGI_LUARMOR, DELTA_PLATO }
 
-    const val BASEPLATE_PLACE_ID = "4483381587"
+    // Baseplate place ID used to verify whether Delta autoexecutes scripts
+    const val BASEPLATE_PLACE_ID = "123974602339071"
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val running = AtomicBoolean(false)
@@ -77,7 +78,7 @@ object KeyAutomator {
 
     /** Inspects Delta/Autoexecute and Delta/Workspace/Nousigi Hub for the active Nousigi key. */
     fun inspectNousigiKey(ctx: Context): KeyCheckReport {
-        val autoKeys = mutableListOf<Triple<String, String, Long>>() // path, key, mtimeSec
+        val autoKeys = mutableListOf<Triple<String, String, Long>>()
         val autoDirs = listOf("/storage/emulated/0/Delta/Autoexecute", "/storage/emulated/0/Delta/AutoExcecute")
         val keyAssignRx = Regex("""(?:getgenv\(\)\s*\.\s*Key|script_key|Key)\s*=\s*["']([^"'\r\n]{8,80})["']""")
 
@@ -192,7 +193,6 @@ object KeyAutomator {
             }
         }
 
-        // If no Autoexecute script existed yet, create nousigi_loader_key.lua in Autoexecute
         if (updatedFiles.isEmpty()) {
             val defaultDir = "/storage/emulated/0/Delta/Autoexecute"
             val targetFile = "$defaultDir/nousigi_key.lua"
@@ -203,7 +203,6 @@ object KeyAutomator {
             updatedFiles.add(targetFile.removePrefix("/storage/emulated/0/"))
         }
 
-        // Also update any existing Nousigi Hub key file in Workspace
         val wsFiles = SuShell.execLines(
             "find '/storage/emulated/0/Delta/Workspace/Nousigi Hub' '/storage/emulated/0/Delta/Workspace' -maxdepth 3 -type f -iname '*key*' 2>/dev/null"
         ).distinct()
@@ -215,7 +214,6 @@ object KeyAutomator {
             updatedFiles.add(wf.removePrefix("/storage/emulated/0/"))
         }
 
-        // Delete any .bak files that popped up when editing
         val deletedBaks = cleanBakFiles()
 
         PilotCore.log("[KEYAUTO] Updated Nousigi key in ${updatedFiles.size} file(s), removed $deletedBaks .bak file(s)")
@@ -261,7 +259,7 @@ object KeyAutomator {
 
         val nowSec = System.currentTimeMillis() / 1000L
         val ageSec = (nowSec - mtimeSec).coerceAtLeast(0L)
-        val totalWindowSec = 24L * 3600L // Delta keys last 24 hours from generation
+        val totalWindowSec = 24L * 3600L
         val remSec = totalWindowSec - ageSec
 
         val savedAtStr = if (mtimeSec > 0L) dateFmt.format(Date(mtimeSec * 1000L)) else "Unknown"
@@ -453,7 +451,7 @@ object KeyAutomator {
             }
 
             waitingForPlatoLink = true
-            updateStep("Baseplate is open — tap 'Receive Key' in Delta now (auto-catching link)...")
+            updateStep("Baseplate ($BASEPLATE_PLACE_ID) is open — tap 'Receive Key' in Delta now (auto-catching link)...")
             mainHandler.postDelayed(clipboardWatchRunnable, 1500L)
         }.start()
         return true

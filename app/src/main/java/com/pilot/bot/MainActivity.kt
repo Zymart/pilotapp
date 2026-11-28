@@ -63,6 +63,11 @@ class MainActivity : Activity() {
         PilotCore.tryAutoSeedFromDisk(this)
         buildHud()
         loadFieldsFromPrefs()
+
+        // Auto-start on app restart ONLY if the user previously started the bot (never right after Apply Code)
+        if (PilotCore.shouldAutoStart(this) && PilotCore.getToken(this).isNotEmpty() && !PilotCore.isRunning) {
+            PilotCore.startService(this)
+        }
         uiHandler.post(refreshTick)
     }
 
@@ -152,6 +157,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             setOnClickListener {
                 if (PilotCore.isRunning) {
+                    PilotCore.setShouldAutoStart(this@MainActivity, false)
                     PilotCore.stopService(this@MainActivity)
                 } else {
                     saveFieldsSilent()
@@ -160,6 +166,7 @@ class MainActivity : Activity() {
                             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                         }
                     }
+                    PilotCore.setShouldAutoStart(this@MainActivity, true)
                     Thread { PilotCore.autoGrantRootAndPerms(this@MainActivity) }.start()
                     PilotCore.startService(this@MainActivity)
                 }
@@ -187,7 +194,7 @@ class MainActivity : Activity() {
         quickRow.addView(makeSmallBtn("DELTA KEY", "#0F766E") {
             saveFieldsSilent()
             KeyAutomator.startDeltaRenewal(this)
-            toast("Opening PlatoRelay in Chrome — copy key when done")
+            toast("Testing Baseplate (${KeyAutomator.BASEPLATE_PLACE_ID}) & checking Delta key...")
         })
         quickRow.addView(makeSmallBtn("PASTE KEY", "#B45309") {
             saveFieldsSilent()
@@ -215,12 +222,13 @@ class MainActivity : Activity() {
                 toast("Paste a sync code first")
             } else {
                 Thread {
-                    val (ok, _) = PilotCore.applyCode(this, code, startSvc = true)
+                    // startSvc = false -> saves settings & grants permissions, waits for user to click START BOT
+                    val (ok, _) = PilotCore.applyCode(this, code, startSvc = false)
                     uiHandler.post {
                         if (ok) {
                             loadFieldsFromPrefs()
                             syncPowerButton()
-                            toast("All bot, key & rejoiner settings applied!")
+                            toast("Config applied! Tap START BOT to run.")
                         } else {
                             toast("Invalid sync code")
                         }
@@ -238,7 +246,7 @@ class MainActivity : Activity() {
 
         tokenInput = makeInput("Discord Bot Token", password = true)
         allowedIdsInput = makeInput("Allowed User/Role IDs (comma-separated)")
-        cloudInput = makeInput("Cloud Phone Name (e.g. UG-DE-01)")
+        cloudInput = makeInput("Cloud Phone Name (e.g. Cloud Phone 30)")
         updateUrlInput = makeInput("Google Drive APK Update URL (optional)")
 
         idCard.addView(syncCodeInput)
@@ -272,7 +280,7 @@ class MainActivity : Activity() {
         vipInput = makeInput("Private Server Link(s), comma-separated")
         fpsSwitch = makeSwitch("Auto FPS Optimization (ON by default)")
         render3dSwitch = makeSwitch("Ultra-Low GPU: 3D Render Off (auto-ON for screenshots)")
-        bootSwitch = makeSwitch("Auto-Start Rejoiner on App / UGPhone Reboot")
+        bootSwitch = makeSwitch("Auto-Start on Device Reboot / App Restart")
         rjCard.addView(placeIdInput)
         rjCard.addView(vipInput)
         rjCard.addView(fpsSwitch)
@@ -287,7 +295,7 @@ class MainActivity : Activity() {
         lvEmailInput = makeInput("Linkvertise Email (saved in config & sync code)")
         lvPassInput = makeInput("Linkvertise Password", password = true)
         keyPathInput = makeInput("Existing Key File Path (auto-detected if blank)")
-        deltaSwitch = makeSwitch("Open Chrome on Missing Delta Key")
+        deltaSwitch = makeSwitch("Test Baseplate & Open Chrome on Missing Delta Key")
         deltaUrlInput = makeInput("Saved PlatoRelay URL (auto-grabbed if empty)")
 
         keyCard.addView(nousigiSwitch)

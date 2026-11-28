@@ -249,7 +249,7 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.4.3"
+    const val APP_VERSION = "v1.4.4"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
@@ -280,6 +280,13 @@ object PilotCore {
 
     private fun histPrefs(c: Context): SharedPreferences =
         c.applicationContext.getSharedPreferences("pilot_hist", Context.MODE_PRIVATE)
+
+    fun setShouldAutoStart(c: Context, shouldStart: Boolean) {
+        prefs(c).edit().putBoolean("bot_should_autostart", shouldStart).apply()
+    }
+
+    fun shouldAutoStart(c: Context): Boolean =
+        prefs(c).getBoolean("bot_should_autostart", false)
 
     fun startService(c: Context) {
         val app = c.applicationContext
@@ -466,7 +473,11 @@ object PilotCore {
         return "$letters-$b64"
     }
 
-    fun applyCode(c: Context, code: String, startSvc: Boolean = true): Pair<Boolean, Boolean> {
+    /**
+     * Applies sync code settings & grants permissions. Does NOT auto-start the service unless startSvc=true,
+     * leaving the bot OFFLINE until the user explicitly taps START BOT.
+     */
+    fun applyCode(c: Context, code: String, startSvc: Boolean = false): Pair<Boolean, Boolean> {
         val parsed = runCatching {
             val raw = code.trim().substringAfter("-")
             JSONObject(String(Base64.decode(raw, Base64.URL_SAFE)))
@@ -488,6 +499,7 @@ object PilotCore {
             .putString("bot_token", tok)
             .putString("allowed_ids", joinedIds)
             .putLong("user_id", primaryUid)
+            .putBoolean("bot_should_autostart", startSvc)
 
         val ch = parsed.optString("c", "")
         if (ch.isNotEmpty()) edit.putString("ss_channel", ch)
@@ -559,18 +571,37 @@ object PilotCore {
         log("[AUTOEXEC] Deployed pilot_bridge.lua")
     }
 
-    /** Collects comprehensive device hardware, OS, memory, storage & network specs for !scan. */
+    /** Single-pass fast device telemetry collector so heavily loaded cloud phones respond well within Discord limits. */
     fun collectDeviceSpecs(c: Context): Map<String, String> {
-        val model = SuShell.exec("getprop ro.product.model").trim().ifEmpty { Build.MODEL }
-        val brand = SuShell.exec("getprop ro.product.manufacturer").trim().ifEmpty { Build.MANUFACTURER }
-        val androidVer = SuShell.exec("getprop ro.build.version.release").trim().ifEmpty { Build.VERSION.RELEASE }
-        val sdkVer = Build.VERSION.SDK_INT
-        val kernel = SuShell.exec("uname -r").trim().ifEmpty { "Linux" }
-        val rootOk = SuShell.exec("id").contains("uid=0")
-        val cores = SuShell.exec("nproc").trim().ifEmpty { Runtime.getRuntime().availableProcessors().toString() }
-        val loadAvg = SuShell.exec("cut -d' ' -f1-3 /proc/loadavg 2>/dev/null").trim().ifEmpty { "N/A" }
+        val raw = SuShell.exec(
+            """
+            echo "MODEL=$(getprop ro.product.model)"
+            echo "BRAND=$(getprop ro.product.manufacturer)"
+            echo "REL=$(getprop ro.build.version.release)"
+            echo "KERN=$(uname -r)"
+            echo "UID=$(id -u)"
+            echo "CORES=$(nproc)"
+            echo "LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+            echo "MEM=$(free -m | awk '/Mem:/ {print $2" "$3" "$4}')"
+            echo "DISK=$(df -h /storage/emulated/0 2>/dev/null | tail -n 1 | awk '{print $4" free / "$2" ("$5" used)"}')"
+            echo "IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')"
+            echo "WMSIZE=$(wm size 2>/dev/null | tail -n 1)"
+            """.trimIndent()
+        )
+        val kv = raw.lines().mapNotNull { line ->
+            val idx = line.indexOf('=')
+            if (idx <= 0) null else line.substring(0, idx).trim() to line.substring(idx + 1).trim()
+        }.toMap()
 
-        val memLine = SuShell.exec("free -m | awk '/Mem:/ {print \$2\" \"\$3\" \"\$4}'").trim().split(Regex("\\s+"))
+        val model = kv["MODEL"]?.ifEmpty { Build.MODEL } ?: Build.MODEL
+        val brand = kv["BRAND"]?.ifEmpty { Build.MANUFACTURER } ?: Build.MANUFACTURER
+        val androidVer = kv["REL"]?.ifEmpty { Build.VERSION.RELEASE } ?: Build.VERSION.RELEASE
+        val kernel = kv["KERN"]?.ifEmpty { "Linux" } ?: "Linux"
+        val rootOk = kv["UID"] == "0"
+        val cores = kv["CORES"]?.ifEmpty { Runtime.getRuntime().availableProcessors().toString() } ?: "4"
+        val loadAvg = kv["LOAD"]?.ifEmpty { "N/A" } ?: "N/A"
+
+        val memLine = kv["MEM"].orEmpty().split(Regex("\\s+"))
         val ramStr = if (memLine.size >= 3) {
             val tot = memLine[0].toIntOrNull() ?: 0
             val used = memLine[1].toIntOrNull() ?: 0
@@ -579,17 +610,18 @@ object PilotCore {
             "${free}MB free / ${tot}MB ($pct% used)"
         } else "N/A"
 
-        val diskLine = SuShell.exec("df -h /storage/emulated/0 2>/dev/null | tail -n 1 | awk '{print \$4\" free / \"\$2\" (\"\$5\" used)\"}'").trim()
-            .ifEmpty { "N/A" }
-        val ipAddr = SuShell.exec("ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i==\"src\") print \$(i+1)}'").trim()
-            .ifEmpty { "Offline" }
-        val (w, h) = getDisplaySize()
+        val diskLine = kv["DISK"]?.ifEmpty { "N/A" } ?: "N/A"
+        val ipAddr = kv["IP"]?.ifEmpty { "Offline" } ?: "Offline"
+        val wmMatch = Regex("""(\d+)x(\d+)""").find(kv["WMSIZE"].orEmpty())
+        val w = wmMatch?.groupValues?.get(1) ?: "1280"
+        val h = wmMatch?.groupValues?.get(2) ?: "720"
+
         val upMin = SystemClock.elapsedRealtime() / 60000L
         val upStr = if (upMin >= 60) "${upMin / 60}h ${upMin % 60}m" else "${upMin}m"
 
         return linkedMapOf(
             "Device" to "$brand $model",
-            "OS & Kernel" to "Android $androidVer (API $sdkVer) • `$kernel`",
+            "OS & Kernel" to "Android $androidVer (API ${Build.VERSION.SDK_INT}) • `$kernel`",
             "Root & Display" to "${if (rootOk) "✅ Rooted (`uid=0`)" else "❌ Unrooted"} • `${w}×${h}`",
             "CPU ($cores cores)" to "Load: `$loadAvg`",
             "RAM" to ramStr,
@@ -1196,6 +1228,32 @@ class DiscordBot(private val ctx: Context) {
         replyInteraction(id, token, type, data)
     }
 
+    /** Immediately defers an interaction (type 5) so slow/loaded cloud phones never hit Discord's 3s timeout. */
+    private fun deferInteraction(id: String, token: String, ephemeral: Boolean = false) {
+        val data = JSONObject()
+        if (ephemeral) data.put("flags", 64)
+        replyInteraction(id, token, 5, data)
+    }
+
+    /** Edits the original deferred interaction response via webhook PATCH. */
+    private fun editDeferredEmbed(
+        appId: String,
+        token: String,
+        title: String,
+        description: String,
+        color: Int = COLOR_BLUE,
+        fields: List<Triple<String, String, Boolean>> = emptyList(),
+        components: JSONArray? = null
+    ) {
+        val targetApp = appId.ifEmpty { botId }
+        if (targetApp.isEmpty()) return
+        val body = JSONObject()
+            .put("content", "")
+            .put("embeds", JSONArray().put(buildEmbed(title, description, color, fields)))
+        if (components != null) body.put("components", components)
+        apiPatchNoAuth("https://discord.com/api/v10/webhooks/$targetApp/$token/messages/@original", body)
+    }
+
     fun captureAndSendAll(ch: String) {
         val cl = PilotCore.getCloud(ctx)
         val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
@@ -1320,7 +1378,6 @@ class DiscordBot(private val ctx: Context) {
         val content = d.optString("content").trim()
         val ch = d.getString("channel_id")
 
-        // Handle silent cross-cloud .tar.gz transfer attachments (no plain-text command spam)
         if (authorId == botId) {
             val atts = d.optJSONArray("attachments")
             if (atts != null && atts.length() > 0) {
@@ -1352,10 +1409,11 @@ class DiscordBot(private val ctx: Context) {
                 val specs = PilotCore.collectDeviceSpecs(ctx)
                 val slots = Rejoiner.discoverClones()
                 val active = slots.count { it.status == "ACTIVE" }
+                val cpuEntry = specs.entries.firstOrNull { it.key.startsWith("CPU") }
                 val fields = listOf(
                     Triple("Slots", "**$active / ${slots.size}** ACTIVE", true),
                     Triple("RAM", specs["RAM"] ?: "N/A", true),
-                    Triple("CPU", specs["CPU (${specs.keys.firstOrNull { it.startsWith("CPU") }?.substringAfter("(")?.removeSuffix(")") ?: "CPU"})"] ?: specs.entries.firstOrNull { it.key.startsWith("CPU") }?.value ?: "N/A", true),
+                    Triple(cpuEntry?.key ?: "CPU", cpuEntry?.value ?: "N/A", true),
                     Triple("Key Watcher", "`${KeyAutomator.getLiveStatusText()}`", false)
                 )
                 sendEmbed(ch, "🩺 $cl — Fleet Health", specs["Network & Uptime"] ?: "", COLOR_GREEN, fields)
@@ -1746,11 +1804,6 @@ class DiscordBot(private val ctx: Context) {
         return pa.size.compareTo(pb.size)
     }
 
-    /**
-     * Silent multi-cloud dropdown builder:
-     * Posts ONE single clean Embed message and silently PATCHes additional clouds into its select menu
-     * with ZERO PILOT_HERE / PILOT_FREE / PILOT_PING messages in chat.
-     */
     private fun collectAndPostSharedCloudMenu(
         ch: String,
         anchorMsgId: String,
@@ -1799,7 +1852,6 @@ class DiscordBot(private val ctx: Context) {
             }
         }
 
-        // Silently PATCH myCloud into the existing canonical embed's dropdown without posting any chat message
         val staggerMs = ((abs(myCloud.hashCode()) % 25) * 190L) + 300L
         runCatching { Thread.sleep(staggerMs) }
 
@@ -1896,7 +1948,6 @@ class DiscordBot(private val ctx: Context) {
     }
 
     private fun handleTransferAttachment(d: JSONObject, filename: String, fileUrl: String) {
-        // Format: pilot_xfer__srcCloud__srcPkg__srcUser__dstCloud__dstPkg.tar.gz
         val stem = filename.removePrefix("pilot_xfer__").removeSuffix(".tar.gz")
         val parts = stem.split("__")
         if (parts.size < 5) return
@@ -2082,6 +2133,7 @@ class DiscordBot(private val ctx: Context) {
 
         val id = d.getString("id")
         val token = d.getString("token")
+        val appId = d.optString("application_id").ifEmpty { botId }
         val user = d.optJSONObject("member")?.optJSONObject("user") ?: d.optJSONObject("user") ?: return
         val userId = user.optString("id")
         val memberRoles = d.optJSONObject("member")?.optJSONArray("roles")
@@ -2243,7 +2295,7 @@ class DiscordBot(private val ctx: Context) {
                 "✅ Full Pilot Sync Code Generated",
                 "• **Allowed IDs (${idList.size}):** `${idList.joinToString(", ")}`\n" +
                 "• **Includes:** Bot Identity + Rejoiner Settings + Key Helper Config\n\n" +
-                "**Paste into Pilot → APPLY CODE:**\n```\n$syncCode\n```",
+                "**Paste into Pilot → APPLY CODE (then tap START BOT):**\n```\n$syncCode\n```",
                 COLOR_GREEN
             )
 
@@ -2271,60 +2323,61 @@ class DiscordBot(private val ctx: Context) {
                 return
             }
 
+            if (devAction == "change_nousigi") {
+                openChangeNousigiKeyModal(id, token, myCloud)
+                return
+            }
+
+            // Defer immediately within <100ms so loaded cloud phones never hit Discord's 3s timeout
+            deferInteraction(id, token, ephemeral = (devAction == "ss"))
+
             when (devAction) {
                 "check_nousigi" -> {
                     val rep = KeyAutomator.inspectNousigiKey(ctx)
-                    replyEmbed(
-                        id, token, 4,
+                    editDeferredEmbed(
+                        appId, token,
                         "${rep.title} ($myCloud)",
                         "${rep.summary}\n\n${rep.details}",
-                        if (rep.isHealthy) COLOR_GREEN else COLOR_AMBER,
-                        ephemeral = false
+                        if (rep.isHealthy) COLOR_GREEN else COLOR_AMBER
                     )
                 }
                 "check_delta" -> {
                     val rep = KeyAutomator.inspectDeltaKey(ctx)
-                    replyEmbed(
-                        id, token, 4,
+                    editDeferredEmbed(
+                        appId, token,
                         "${rep.title} ($myCloud)",
                         "${rep.summary}\n\n${rep.details}",
-                        if (rep.isHealthy) COLOR_GREEN else COLOR_AMBER,
-                        ephemeral = false
+                        if (rep.isHealthy) COLOR_GREEN else COLOR_AMBER
                     )
                 }
-                "change_nousigi" -> {
-                    openChangeNousigiKeyModal(id, token, myCloud)
-                }
                 "rejoin_all" -> {
-                    replyEmbed(id, token, 4, "🔁 Rejoin All Queued ($myCloud)", "Force-stopping and staggered-relaunching all active clones...", COLOR_BLUE, ephemeral = false)
-                    ioExec.execute { Rejoiner.killAllAndStaggeredRejoin(ctx, "!scan Rejoin All button") }
+                    editDeferredEmbed(appId, token, "🔁 Rejoin All Queued ($myCloud)", "Force-stopping and staggered-relaunching all active clones...", COLOR_BLUE)
+                    Rejoiner.killAllAndStaggeredRejoin(ctx, "!scan Rejoin All button")
                 }
                 "kill_all" -> {
                     val list = Rejoiner.discoverClones()
                     list.forEach { SuShell.exec("am force-stop ${it.pkg}") }
-                    replyEmbed(id, token, 4, "🛑 Force-Stopped Clones ($myCloud)", "Stopped **${list.size}** Roblox clone(s).", COLOR_RED, ephemeral = false)
+                    editDeferredEmbed(appId, token, "🛑 Force-Stopped Clones ($myCloud)", "Stopped **${list.size}** Roblox clone(s).", COLOR_RED)
                 }
                 "arrange" -> {
                     val n = PilotCore.arrange2x2()
-                    replyEmbed(id, token, 4, "🪟 Arranged 2×2 Grid ($myCloud)", "Snapped **$n** clone(s) into 2×2 freeform windows.", COLOR_GREEN, ephemeral = false)
+                    editDeferredEmbed(appId, token, "🪟 Arranged 2×2 Grid ($myCloud)", "Snapped **$n** clone(s) into 2×2 freeform windows.", COLOR_GREEN)
                 }
                 "ss" -> {
-                    replyEmbed(id, token, 4, "📸 Capturing Screenshot ($myCloud)", "Uploading full device screen...", COLOR_BLUE)
-                    ioExec.execute { if (ch.isNotEmpty()) captureAndSendAll(ch) }
+                    editDeferredEmbed(appId, token, "📸 Capturing Screenshot ($myCloud)", "Uploading full device screen...", COLOR_BLUE)
+                    if (ch.isNotEmpty()) captureAndSendAll(ch)
                 }
                 "clean" -> {
                     val baks = KeyAutomator.cleanBakFiles()
                     Rejoiner.discoverClones().forEach {
                         SuShell.exec("rm -rf /data/data/${it.pkg}/files/logs/* /data/data/${it.pkg}/cache/* 2>/dev/null")
                     }
-                    replyEmbed(id, token, 4, "🧹 Device Cleaned ($myCloud)", "Deleted **$baks** `.bak` file(s) and cleared Roblox/Delta log caches.", COLOR_GREEN, ephemeral = false)
+                    editDeferredEmbed(appId, token, "🧹 Device Cleaned ($myCloud)", "Deleted **$baks** `.bak` file(s) and cleared Roblox/Delta log caches.", COLOR_GREEN)
                 }
                 "reboot" -> {
-                    replyEmbed(id, token, 4, "🔄 Rebooting Device ($myCloud)", "Rebooting UGPhone now (Rejoiner will auto-start on boot)...", COLOR_RED, ephemeral = false)
-                    ioExec.execute {
-                        Thread.sleep(1200)
-                        SuShell.exec("reboot")
-                    }
+                    editDeferredEmbed(appId, token, "🔄 Rebooting Device ($myCloud)", "Rebooting UGPhone now (Rejoiner will auto-start on boot)...", COLOR_RED)
+                    Thread.sleep(1200)
+                    SuShell.exec("reboot")
                 }
             }
             return
@@ -2362,12 +2415,14 @@ class DiscordBot(private val ctx: Context) {
             }
 
             if (mode == "scan_device") {
+                // Defer immediately (<100ms) so Cloud Phone 30 never hits Discord's 3-second timeout
+                deferInteraction(id, token, ephemeral = false)
                 val (embed, buttons) = buildDeviceScanDashboard(myCloud)
-                val respData = JSONObject()
+                val body = JSONObject()
                     .put("content", "")
                     .put("embeds", JSONArray().put(embed))
                     .put("components", buttons)
-                replyInteraction(id, token, 4, respData)
+                apiPatchNoAuth("https://discord.com/api/v10/webhooks/$appId/$token/messages/@original", body)
                 return
             }
 
@@ -2507,7 +2562,6 @@ class DiscordBot(private val ctx: Context) {
             return
         }
 
-        // --- Second-step Select Menus (broadcasted to all bots; source & destination both see pilot_cs3!) ---
         if (kind == "pilot_cs3") {
             val srcParts = mode.split("|", limit = 3)
             if (srcParts.size < 3) return
@@ -2741,6 +2795,13 @@ class DiscordBot(private val ctx: Context) {
         restClient.newCall(req).execute().use { it.body?.string() ?: "" }
     }.getOrDefault("")
 
+    private fun apiPatchNoAuth(url: String, json: JSONObject): String = runCatching {
+        val body = json.toString().toRequestBody("application/json".toMediaType())
+        val req = Request.Builder().url(url)
+            .patch(body).build()
+        restClient.newCall(req).execute().use { it.body?.string() ?: "" }
+    }.getOrDefault("")
+
     private fun apiPost(url: String, json: JSONObject, auth: Boolean = true): String = runCatching {
         val body = json.toString().toRequestBody("application/json".toMediaType())
         val b = Request.Builder().url(url).post(body)
@@ -2879,7 +2940,9 @@ class PilotService : Service() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         PilotCore.tryAutoSeedFromDisk(context)
-        if (Rejoiner.loadConfig(context).autoStartOnBoot || PilotCore.getToken(context).isNotEmpty()) {
+        if (PilotCore.getToken(context).isNotEmpty() &&
+            (Rejoiner.loadConfig(context).autoStartOnBoot || PilotCore.shouldAutoStart(context))
+        ) {
             PilotCore.startService(context)
         }
     }
