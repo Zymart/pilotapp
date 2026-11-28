@@ -412,7 +412,7 @@ object KeyAutomator {
         runCatching { activeWebView?.evaluateJavascript(js, null) }
     }
 
-    inner class Bridge {
+    class Bridge {
         @JavascriptInterface
         fun tapTurnstile(x: Float, y: Float) = flashForTurnstileTap(x, y)
 
