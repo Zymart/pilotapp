@@ -23,7 +23,8 @@ data class KeyCheckReport(
 )
 
 /**
- * Delta Key Baseplate Tester + Full Chrome PlatoRelay Helper + Nousigi Key Inspector & Autoexecute Updater
+ * Delta Key Baseplate Tester + Coordinate Receive-Key Tapper + Full Chrome PlatoRelay Helper
+ * + Nousigi Key Inspector & Autoexecute Updater
  */
 object KeyAutomator {
     const val BASEPLATE_PLACE_ID = "123974602339071"
@@ -32,6 +33,7 @@ object KeyAutomator {
     private val running = AtomicBoolean(false)
 
     @Volatile private var waitingForPlatoLink = false
+    @Volatile private var activeTestPkg = ""
     @Volatile private var startedAtMs = 0L
     @Volatile private var currentStep = "Idle"
     @Volatile private var lastLoggedStep = ""
@@ -43,6 +45,17 @@ object KeyAutomator {
     private val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
     fun isRunning(): Boolean = running.get()
+
+    /** Immediately aborts any active Baseplate test or clipboard watcher so Rejoiner never stays locked. */
+    fun cancel() {
+        if (!running.compareAndSet(true, false)) return
+        waitingForPlatoLink = false
+        activeTestPkg = ""
+        currentStep = "Cancelled"
+        mainHandler.removeCallbacks(clipboardWatchRunnable)
+        completionCb = null
+        PilotCore.log("[KEYAUTO] Cancelled active key watcher")
+    }
 
     fun getLiveStatusText(): String {
         if (!running.get()) return "IDLE ($currentStep)"
@@ -284,11 +297,49 @@ object KeyAutomator {
         return t.startsWith("http") && (t.contains("platorelay.com") || t.contains("platoboost"))
     }
 
+    /**
+     * Taps Delta's 'Receive Key' button rendered inside Roblox's SurfaceView by computing its exact
+     * position within the clone's outer window bounds (right-side 'Welcome Back!' panel, below 'Continue').
+     */
+    private fun tapDeltaReceiveKeyInWindow(pkg: String): Boolean {
+        if (pkg.isBlank()) return false
+        var win = PilotCore.findOuterWindowBounds(pkg)
+        if (win == null) {
+            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+            runCatching { Thread.sleep(700) }
+            win = PilotCore.findOuterWindowBounds(pkg)
+        }
+        if (win == null) return false
+
+        val titleBarH = 38
+        val contentTop = win.top + titleBarH
+        val contentW = (win.right - win.left).coerceAtLeast(220)
+        val contentH = (win.bottom - contentTop).coerceAtLeast(160)
+
+        // Delta 'Receive Key' sits horizontally centered in the right card (~82% of window width)
+        // and vertically right beneath the blue 'Continue' button (~56% to 60% of content height)
+        val tapX = win.left + (contentW * 0.82f).toInt()
+        val tapY1 = contentTop + (contentH * 0.56f).toInt()
+        val tapY2 = contentTop + (contentH * 0.60f).toInt()
+
+        SuShell.exec("input tap $tapX $tapY1")
+        PilotCore.log("[KEYAUTO] Tapped Delta 'Receive Key' at ($tapX, $tapY1) inside $pkg")
+        runCatching { Thread.sleep(750) }
+
+        val ctx = appCtx
+        if (ctx != null && isPlatoUrl(readClipboard(ctx))) return true
+
+        SuShell.exec("input tap $tapX $tapY2")
+        PilotCore.log("[KEYAUTO] Follow-up tap at ($tapX, $tapY2) inside $pkg")
+        return true
+    }
+
     private val clipboardWatchRunnable = object : Runnable {
         override fun run() {
             if (!running.get()) return
-            if (System.currentTimeMillis() - startedAtMs > 300_000L) {
-                finishFlow(false, "Timed out after 5m (last step: $currentStep).")
+            // Hard 60s timeout so Rejoiner is never locked for minutes
+            if (System.currentTimeMillis() - startedAtMs > 60_000L) {
+                finishFlow(false, "Timed out after 60s (last step: $currentStep) — returning control to Rejoiner.")
                 return
             }
 
@@ -302,10 +353,17 @@ object KeyAutomator {
                         previousKeySnapshot = clip
                         val updated = Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = clip)
                         Rejoiner.saveConfig(ctx, updated)
-                        updateStep("Caught & saved PlatoRelay URL! Opening Chrome — copy KEY_ when done...")
+                        updateStep("Caught PlatoRelay URL! Opening Chrome — copy KEY_ when done...")
                         Thread { openInFullChrome(clip) }.start()
+                        mainHandler.postDelayed(this, 1200L)
+                        return
                     }
-                    mainHandler.postDelayed(this, 1500L)
+                    // Retry tapping Receive Key every ~6 seconds if still waiting
+                    val elapsedSec = (System.currentTimeMillis() - startedAtMs) / 1000L
+                    if (elapsedSec % 6L == 0L && activeTestPkg.isNotEmpty()) {
+                        Thread { tapDeltaReceiveKeyInWindow(activeTestPkg) }.start()
+                    }
+                    mainHandler.postDelayed(this, 1200L)
                     return
                 }
 
@@ -318,13 +376,13 @@ object KeyAutomator {
                 }
             }
 
-            mainHandler.postDelayed(this, 1800L)
+            mainHandler.postDelayed(this, 1200L)
         }
     }
 
     /**
      * Tests Delta key on Baseplate (123974602339071) using ONLY a logged-in clone.
-     * Never opens or launches logged-out or empty (no-account) clones.
+     * Taps 'Receive Key' inside the Roblox window after 11s if no script ping arrives, opens Chrome, and watches clipboard.
      */
     fun startDeltaRenewal(
         ctx: Context,
@@ -337,6 +395,7 @@ object KeyAutomator {
         }
         appCtx = ctx.applicationContext
         waitingForPlatoLink = false
+        activeTestPkg = ""
         lastLoggedStep = ""
         completionCb = onDone
         startedAtMs = System.currentTimeMillis()
@@ -344,20 +403,25 @@ object KeyAutomator {
         Thread {
             val testSlot = Rejoiner.pickBestTestClone(ctx)
             if (testSlot == null) {
-                finishFlow(false, "Skipped Delta Baseplate test — no logged-in Roblox accounts found on this device (all slots are Empty or Logged Out).")
+                finishFlow(false, "Skipped Delta Baseplate test — no logged-in Roblox accounts found on this device.")
                 return@Thread
             }
 
+            activeTestPkg = testSlot.pkg
+            val currentClip = readClipboard(ctx).trim()
+            previousKeySnapshot = currentClip
+
             val testStartMs = System.currentTimeMillis()
-            updateStep("Launching ${testSlot.username} (${testSlot.pkg.removePrefix("com.roblox.")}) into Baseplate ($BASEPLATE_PLACE_ID)...")
+            updateStep("Launching ${testSlot.username} into Baseplate ($BASEPLATE_PLACE_ID)...")
             val launched = Rejoiner.launchSingleCloneToPlace(ctx, testSlot.pkg, BASEPLATE_PLACE_ID)
             if (!launched) {
                 finishFlow(false, "Aborted Baseplate test — `${testSlot.pkg}` has no logged-in account.")
                 return@Thread
             }
 
-            val testDeadline = testStartMs + 28_000L
-            while (running.get() && System.currentTimeMillis() < testDeadline) {
+            // Wait 11s for Baseplate + Delta UI to appear (abort early if /ping succeeds)
+            val bootDeadline = testStartMs + 11_000L
+            while (running.get() && System.currentTimeMillis() < bootDeadline) {
                 Thread.sleep(1500L)
                 if (Rejoiner.lastAnyBridgePingMs > testStartMs) {
                     val pingUser = Rejoiner.lastPingUser.ifBlank { testSlot.username }
@@ -365,37 +429,34 @@ object KeyAutomator {
                     if (Rejoiner.isBotActive()) {
                         Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key verified on Baseplate")
                     }
-                    finishFlow(true, "Baseplate test passed ($pingUser executed script) — Delta key is still valid! Returning to main game.")
+                    finishFlow(true, "Baseplate test passed ($pingUser executed script) — Delta key is still valid!")
                     return@Thread
                 }
             }
             if (!running.get()) return@Thread
-            updateStep("No script ping on Baseplate after 28s — Delta key expired/missing.")
 
-            val currentClip = readClipboard(ctx).trim()
-            previousKeySnapshot = currentClip
-
-            val url = explicitUrl.trim()
+            // If we already have a PlatoRelay URL saved or passed in, open Chrome directly
+            val savedUrl = explicitUrl.trim()
                 .ifBlank { Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim() }
                 .ifBlank { if (isPlatoUrl(currentClip)) currentClip else "" }
                 .ifBlank { scanDeltaFilesForPlatoUrl() }
 
-            if (url.isNotBlank()) {
-                if (Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim() != url) {
-                    val updated = Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = url)
-                    Rejoiner.saveConfig(ctx, updated)
-                    PilotCore.log("[KEYAUTO] Saved PlatoRelay URL for this UGPhone")
+            if (savedUrl.isNotBlank()) {
+                if (Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim() != savedUrl) {
+                    Rejoiner.saveConfig(ctx, Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = savedUrl))
                 }
-                previousKeySnapshot = url
-                updateStep("Opened PlatoRelay in Chrome — complete steps & copy KEY_...")
-                openInFullChrome(url)
-                mainHandler.postDelayed(clipboardWatchRunnable, 2000L)
+                previousKeySnapshot = savedUrl
+                updateStep("Opening PlatoRelay in Chrome — copy KEY_ when done...")
+                openInFullChrome(savedUrl)
+                mainHandler.postDelayed(clipboardWatchRunnable, 1200L)
                 return@Thread
             }
 
+            // Tap Delta's 'Receive Key' button inside the floating Roblox window immediately
             waitingForPlatoLink = true
-            updateStep("Baseplate ($BASEPLATE_PLACE_ID) is open on ${testSlot.username} — tap 'Receive Key' in Delta now...")
-            mainHandler.postDelayed(clipboardWatchRunnable, 1500L)
+            updateStep("Tapping 'Receive Key' on ${testSlot.username}...")
+            tapDeltaReceiveKeyInWindow(testSlot.pkg)
+            mainHandler.postDelayed(clipboardWatchRunnable, 1200L)
         }.start()
         return true
     }
@@ -413,6 +474,7 @@ object KeyAutomator {
         if (trimmed.isEmpty()) return false to "Clipboard/input is empty."
 
         if (isPlatoUrl(trimmed)) {
+            cancel()
             val updated = Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = trimmed)
             Rejoiner.saveConfig(ctx, updated)
             startDeltaRenewal(ctx, explicitUrl = trimmed)
@@ -421,18 +483,10 @@ object KeyAutomator {
 
         val deltaKey = extractDeltaKey(trimmed)
         if (deltaKey != null) {
+            cancel()
             appCtx = ctx.applicationContext
             if (running.compareAndSet(false, true)) {
                 applyDeltaKeyInternal(ctx.applicationContext, deltaKey)
-            } else {
-                Thread {
-                    writeClipboard(ctx, deltaKey)
-                    val cached = overwriteDeltaKeyFile(ctx, deltaKey)
-                    if (Rejoiner.isBotActive()) {
-                        Rejoiner.killAllAndStaggeredRejoin(ctx, reason = "Delta key applied")
-                    }
-                    PilotCore.log("[KEYAUTO] Manual Delta key applied ($deltaKey, cached=$cached)")
-                }.start()
             }
             return true to "Applied Delta key `$deltaKey`."
         }
@@ -512,6 +566,7 @@ object KeyAutomator {
     private fun finishFlow(ok: Boolean, msg: String) {
         if (!running.compareAndSet(true, false)) return
         waitingForPlatoLink = false
+        activeTestPkg = ""
         currentStep = if (ok) "Completed" else "Failed"
         mainHandler.removeCallbacks(clipboardWatchRunnable)
         PilotCore.log("[KEYAUTO] ${if (ok) "SUCCESS" else "FAIL"}: $msg")
