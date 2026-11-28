@@ -40,7 +40,7 @@ data class KeyCheckReport(
 
 /**
  * Delta Key Baseplate Tester + Fixed-Slot Clone Snapper & Verified Receive-Key -> Chrome Launcher
- * + 10s Countdown-Safe, Ad-Bypassing PlatoRelay & Nousigi Solver
+ * + 0s Ad-Bait -> 6s PlatoRelay + Zero-Click 10s Task Runner for LootLabs (links.lootlabs.gg)
  */
 object KeyAutomator {
     const val BASEPLATE_PLACE_ID = "123974602339071"
@@ -62,7 +62,9 @@ object KeyAutomator {
     @Volatile private var tasksCompletedCount = 0
     @Volatile private var waitingForTaskTimer = false
     @Volatile private var onSponsorTabSinceMs = 0L
+    @Volatile private var adBaited = false
     @Volatile private var platoReadyAtMs = 0L
+    @Volatile private var lootLabsSettleUntilMs = 0L
     @Volatile private var nousigiPortalUrl = "https://getkey.nousigi.com/"
     @Volatile private var collectedNousigiKeys = mutableListOf<String>()
     @Volatile private var appCtx: Context? = null
@@ -118,7 +120,9 @@ object KeyAutomator {
         activeTestPkg = ""
         waitingForTaskTimer = false
         onSponsorTabSinceMs = 0L
+        adBaited = false
         platoReadyAtMs = 0L
+        lootLabsSettleUntilMs = 0L
         currentStep = "Cancelled"
         mainHandler.removeCallbacks(keyWatchRunnable)
         completionCb = null
@@ -563,9 +567,9 @@ object KeyAutomator {
             while (running.get() && System.currentTimeMillis() < checkDeadline) {
                 runCatching { Thread.sleep(500L) }
                 if (isChromeForeground()) {
-                    // Give PlatoRelay's 5s countdown 10s to finish before tapping Continue
-                    platoReadyAtMs = System.currentTimeMillis() + 10_000L
-                    PilotCore.log("[KEYAUTO] Confirmed Chrome opened — waiting 10s for PlatoRelay countdown!")
+                    adBaited = false
+                    platoReadyAtMs = 0L
+                    PilotCore.log("[KEYAUTO] Confirmed Chrome opened — baiting first ad click immediately!")
                     return true
                 }
             }
@@ -584,11 +588,24 @@ object KeyAutomator {
         return SuShell.exec("cat /sdcard/pilot_ui.xml 2>/dev/null")
     }
 
-    private fun readChromeNewestTabStrings(): String {
-        return SuShell.exec(
-            "newest=\$(ls -t /data/data/com.android.chrome/app_tabs/0/tab* 2>/dev/null | head -n 1); " +
-            "[ -n \"\$newest\" ] && strings \"\$newest\" 2>/dev/null | tail -n 30"
+    /**
+     * Reads Chrome's active address bar URL from XML or `dumpsys activity top` (works even while YouTube video plays).
+     */
+    private fun getCurrentChromeUrl(xml: String): String {
+        val urlRx = Regex("""https?://[^\s"'<>]+""")
+        val domainRx = Regex(
+            """\b(?:auth\.platorelay\.com|platorelay\.com|platoboost\.com|gateway\.platoboost\.com|links\.lootlabs\.gg|lootlabs\.gg|m\.youtube\.com|www\.youtube\.com|youtube\.com|youtu\.be|vpnapptoggle\.com)[^\s"'<>]*""",
+            RegexOption.IGNORE_CASE
         )
+
+        if (xml.isNotBlank()) {
+            val m1 = urlRx.find(xml)?.value ?: domainRx.find(xml)?.value
+            if (!m1.isNullOrBlank()) return m1.lowercase()
+        }
+
+        val topDump = SuShell.exec("dumpsys activity top 2>/dev/null | grep -E 'url_bar|https?://|lootlabs|platorelay|youtube' | head -n 15")
+        val m2 = urlRx.find(topDump)?.value ?: domainRx.find(topDump)?.value
+        return m2?.lowercase().orEmpty()
     }
 
     private fun isFakeAdTrap(rawText: String): Boolean {
@@ -597,10 +614,29 @@ object KeyAutomator {
         return AD_TRAP_KEYWORDS.any { low.contains(it) }
     }
 
+    private fun isLootLabsPage(url: String, xml: String): Boolean {
+        val lowUrl = url.lowercase()
+        val lowXml = xml.lowercase()
+        return lowUrl.contains("lootlabs.gg") ||
+            lowXml.contains("lootlabs.gg") ||
+            lowXml.contains("complete tasks to continue") ||
+            lowXml.contains("claim reward") ||
+            lowXml.contains("unlockr for android")
+    }
+
+    private fun isPlatoRelayPage(url: String, xml: String): Boolean {
+        val lowUrl = url.lowercase()
+        val lowXml = xml.lowercase()
+        return lowUrl.contains("platorelay.com") ||
+            lowUrl.contains("platoboost.com") ||
+            lowXml.contains("platorelay.com") ||
+            lowXml.contains("platoboost.com") ||
+            lowXml.contains("delta android keysystem")
+    }
+
     /**
-     * Orientation-agnostic pixel detector (works in BOTH Landscape 1280x720 and Portrait 720x1280):
-     * Scans 3 center columns (42%, 50%, 58% width) of a screencap PNG for PlatoRelay's bright white
-     * 'Continue' button (R,G,B > 195) inside PlatoRelay's dark background. Ignores green VPN ads, red Watch tutorial, and blue Visit shop.
+     * Pixel detector ONLY called when confirmed on PlatoRelay:
+     * Finds PlatoRelay's bright white 'Continue' button inside its dark background.
      */
     private fun findWhiteContinueButtonByPixels(ctx: Context): Pair<Int, Int>? {
         val snapPath = File(ctx.cacheDir, "key_scan_${System.nanoTime()}.png").absolutePath
@@ -630,7 +666,6 @@ object KeyAutomator {
 
             for (y in yStart..yEnd) {
                 val p = bmp.getPixel(cx, y)
-                // Accept bright white or slightly dimmed countdown-complete white (R,G,B > 195)
                 val isBright = Color.red(p) > 195 && Color.green(p) > 195 && Color.blue(p) > 195
                 if (isBright) {
                     if (runStart < 0) runStart = y
@@ -656,34 +691,34 @@ object KeyAutomator {
         }
     }
 
-    /**
-     * Closes only the active pop-up/ad tab (Ctrl+W) WITHOUT reloading the PlatoRelay URL
-     * (reloading resets PlatoRelay's 5s countdown!), then waits 10 seconds before tapping Continue again.
-     */
-    private fun closeChromeTabAndWaitCountdown(ctx: Context, stepLabel: String) {
+    private fun closeChromeTab(stepLabel: String, waitPlato6s: Boolean) {
         onSponsorTabSinceMs = 0L
         waitingForTaskTimer = false
         lastWebTapSig = ""
+        adBaited = true
         updateStep(stepLabel)
 
-        // Ctrl+W closes only the pop-up/ad tab and reveals the existing PlatoRelay tab underneath intact
+        // Ctrl+W closes only the active task/ad tab and reveals PlatoRelay / LootLabs underneath
         SuShell.exec("input keyevent --ctrl 51")
-        Thread.sleep(750L)
+        Thread.sleep(650L)
 
         if (!isChromeForeground()) {
             SuShell.exec("monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
-            Thread.sleep(700L)
+            Thread.sleep(600L)
         }
 
-        // Wait 10s after closing ad/task tab so PlatoRelay's 5s countdown finishes completely before clicking Continue
-        platoReadyAtMs = System.currentTimeMillis() + 10_000L
+        if (waitPlato6s) {
+            platoReadyAtMs = System.currentTimeMillis() + 6_000L
+        } else {
+            // Brief 2s settle pause so LootLabs registers the completed task before tapping the next one
+            lootLabsSettleUntilMs = System.currentTimeMillis() + 2_000L
+        }
     }
 
     private fun processNousigiHostStep(ctx: Context) {
         val now = System.currentTimeMillis()
         val xml = dumpUiXmlCompressed()
-        val tabStrings = readChromeNewestTabStrings()
-        val combined = "$xml\n$tabStrings"
+        val curUrl = getCurrentChromeUrl(xml)
 
         val clip = readClipboard(ctx).trim()
         val clipCandidate = if (clip != previousKeySnapshot && NOUSIGI_KEY_SEARCH_RX.matches(clip) && !clip.startsWith("KEY_")) clip else null
@@ -711,12 +746,12 @@ object KeyAutomator {
             return
         }
 
-        if (isFakeAdTrap(combined)) {
-            closeChromeTabAndWaitCountdown(ctx, "Blocked ad redirect -> closing tab...")
+        if (isFakeAdTrap(xml) || isFakeAdTrap(curUrl)) {
+            closeChromeTab("Blocked ad redirect -> closing & waiting 6s...", waitPlato6s = true)
             return
         }
 
-        val isLinkvertise = combined.contains("linkvertise.com", ignoreCase = true)
+        val isLinkvertise = curUrl.contains("linkvertise.com") || xml.contains("linkvertise.com", ignoreCase = true)
         if (isLinkvertise) {
             if (onSponsorTabSinceMs == 0L) onSponsorTabSinceMs = now
             val waited = (now - onSponsorTabSinceMs) / 1000L
@@ -792,20 +827,18 @@ object KeyAutomator {
             "dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 3"
         )
         val xml = dumpUiXmlCompressed()
-        val tabStrings = readChromeNewestTabStrings()
-        val combinedContext = "$xml\n$tabStrings"
+        val curUrl = getCurrentChromeUrl(xml)
 
-        val isChromeInFront = focusInfo.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || xml.contains("url_bar")
+        val isChromeInFront = focusInfo.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || curUrl.isNotEmpty()
 
-        // If Chrome is NOT in front, re-snap Roblox and tap Receive Key
         if (!isChromeInFront && activeTestPkg.isNotEmpty()) {
             val slotUser = Rejoiner.slots[activeTestPkg]?.username?.ifBlank { "slot" } ?: "slot"
             ensureReceiveKeyOpensChrome(activeTestPkg, slotUser)
             return null
         }
 
-        // 1. Always check if KEY_... is already visible on screen
-        val directKey = DELTA_KEY_SEARCH_RX.find(combinedContext)?.value
+        // 1. Check foreground XML for KEY_...
+        val directKey = DELTA_KEY_SEARCH_RX.find(xml)?.value
         if (directKey != null && directKey != previousKeySnapshot) {
             onSponsorTabSinceMs = 0L
             waitingForTaskTimer = false
@@ -813,57 +846,39 @@ object KeyAutomator {
             return directKey
         }
 
-        // 2. Immediately detect and close fake pop-up ad traps (e.g. vpnapptoggle.com/?pbt=Continue)
-        if (isFakeAdTrap(combinedContext)) {
-            closeChromeTabAndWaitCountdown(ctx, "Blocked fake ad -> closing & waiting 10s...")
-            return null
-        }
+        val onPlato = isPlatoRelayPage(curUrl, xml)
+        val onLootLabs = isLootLabsPage(curUrl, xml)
 
-        val isOnPlatoHost = combinedContext.contains("platorelay.com", ignoreCase = true) ||
-            combinedContext.contains("platoboost.com", ignoreCase = true) ||
-            combinedContext.contains("auth.platorelay", ignoreCase = true) ||
-            combinedContext.contains("Delta Android Keysystem", ignoreCase = true)
-
-        // 3. Handle non-PlatoRelay tabs (pop-up ads vs real tasks)
-        if (isChromeInFront && !isOnPlatoHost && tabStrings.isNotBlank()) {
-            if (!waitingForTaskTimer) {
-                closeChromeTabAndWaitCountdown(ctx, "Pop-up ad tab closed -> waiting 10s...")
+        // 2. If we are NOT on PlatoRelay and NOT on LootLabs -> we are on an external task site (e.g. m.youtube.com) or an ad tab!
+        if (isChromeInFront && !onPlato && !onLootLabs) {
+            // Instant ad trap before any task was started -> close immediately & wait 6s for PlatoRelay
+            if (!waitingForTaskTimer && (isFakeAdTrap(curUrl) || isFakeAdTrap(xml))) {
+                closeChromeTab("Ad closed -> waiting 6s...", waitPlato6s = true)
                 return null
             }
 
+            // Otherwise: ZERO CLICKS on task website (m.youtube.com, survey, etc.) -> wait 10s -> Ctrl+W back to LootLabs!
             if (onSponsorTabSinceMs == 0L) {
                 onSponsorTabSinceMs = now
             }
             val waitedSec = (now - onSponsorTabSinceMs) / 1000L
-            if (waitedSec < 11L) {
-                val rem = 11L - waitedSec
-                updateStep("Task #${tasksCompletedCount + 1}: Waiting ${rem}s on task tab...")
+            if (waitedSec < 10L) {
+                val rem = 10L - waitedSec
+                updateStep("Task #${tasksCompletedCount + 1}: Waiting ${rem}s (no clicks)...")
                 return null
             }
 
             tasksCompletedCount += 1
-            closeChromeTabAndWaitCountdown(ctx, "Task #$tasksCompletedCount done -> waiting 10s...")
+            closeChromeTab("Task #$tasksCompletedCount done -> back to LootLabs...", waitPlato6s = false)
             return null
         }
 
-        // Back on PlatoRelay
+        // Foreground IS confirmed on PlatoRelay or LootLabs
         onSponsorTabSinceMs = 0L
         waitingForTaskTimer = false
 
-        // Initialize 10s countdown wait on first arrival if not yet set
-        if (platoReadyAtMs == 0L) {
-            platoReadyAtMs = now + 10_000L
-        }
-
-        // Enforce 10-second countdown wait before clicking Continue so we never click during the 5s button timer
-        if (now < platoReadyAtMs) {
-            val remSec = ((platoReadyAtMs - now) / 1000L) + 1L
-            updateStep("PlatoRelay: Waiting ${remSec}s for 5s countdown...")
-            return null
-        }
-
         // Save PlatoRelay URL from Chrome's address bar if visible
-        val urlMatch = Regex("""https?://(?:auth\.platorelay\.com|gateway\.platoboost\.com)/[^\s"<']+""").find(combinedContext)
+        val urlMatch = Regex("""https?://(?:auth\.platorelay\.com|gateway\.platoboost\.com)/[^\s"<']+""").find("$curUrl\n$xml")
         if (urlMatch != null) {
             val foundUrl = urlMatch.value
             val savedPlato = Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
@@ -872,7 +887,19 @@ object KeyAutomator {
             }
         }
 
-        // Parse XML nodes if dump succeeded
+        // On PlatoRelay: wait 6s after baiting/closing an ad before clicking Continue
+        if (onPlato && !onLootLabs && adBaited && now < platoReadyAtMs) {
+            val remSec = ((platoReadyAtMs - now) / 1000L) + 1L
+            updateStep("PlatoRelay: Waiting ${remSec}s before Continue...")
+            return null
+        }
+
+        // On LootLabs: brief 2s settle pause after returning from a task tab
+        if (onLootLabs && now < lootLabsSettleUntilMs) {
+            updateStep("LootLabs: Checking task #${tasksCompletedCount + 1}...")
+            return null
+        }
+
         data class UiNode(val label: String, val cx: Int, val cy: Int, val enabled: Boolean)
         val nodes = mutableListOf<UiNode>()
         if (xml.isNotBlank()) {
@@ -901,8 +928,8 @@ object KeyAutomator {
             }
         }
 
-        // Priority 1: Copy Key / Create Key / Get Key
-        val finishPatterns = listOf("copy key", "copy", "create key", "get key")
+        // Priority 1: Copy Key / Create Key / Get Key / Claim Reward
+        val finishPatterns = listOf("copy key", "copy", "create key", "get key", "claim reward")
         for (pat in finishPatterns) {
             val hit = nodes.firstOrNull { n ->
                 val low = n.label.lowercase()
@@ -924,16 +951,26 @@ object KeyAutomator {
             }
         }
 
-        // Priority 3: Uncompleted Task buttons (Complete [not Completed], Visit, Read, Watch, Discover, Open, Start)
+        // Priority 3: LootLabs & PlatoRelay Task Rows -> tap task -> wait 10s on task site -> Ctrl+W back
+        val taskKeywords = listOf(
+            "subscribe and watch",
+            "complete and get rewarded",
+            "confirm you are human",
+            "watch a video",
+            "read an article",
+            "complete a quick"
+        )
         val uncompletedTask = nodes.firstOrNull { n ->
             val low = n.label.lowercase()
             n.enabled && n.cy > 110 &&
                 !low.contains("completed") &&
+                !low.contains("complete tasks to continue") &&
                 !low.contains("done") &&
                 !low.contains("verified") &&
                 !low.contains("tutorial") &&
                 !low.contains("shop") &&
-                (low == "complete" ||
+                (taskKeywords.any { low.contains(it) } ||
+                    low == "complete" ||
                     low == "visit" ||
                     low == "read" ||
                     low == "watch" ||
@@ -947,20 +984,40 @@ object KeyAutomator {
         }
         if (uncompletedTask != null) {
             waitingForTaskTimer = true
+            adBaited = true
             tapNodeIfReady(
                 uncompletedTask.label,
                 uncompletedTask.cx,
                 uncompletedTask.cy,
-                "Starting Task #${tasksCompletedCount + 1} ('${uncompletedTask.label.take(20)}')..."
+                "LootLabs: Tapping Task #${tasksCompletedCount + 1} ('${uncompletedTask.label.take(20)}')..."
             )
             return null
         }
 
-        // Priority 4: Cloudflare Turnstile / Human Verification + Continue / Proceed / Unlock
+        // Priority 4: LootLabs Coordinate Fallback when XML omits task row buttons
+        if (onLootLabs) {
+            val (w, h) = PilotCore.getDisplaySize()
+            val tapX = w / 2
+            val tapY = when (tasksCompletedCount) {
+                0 -> (h * 0.665f).toInt()
+                1 -> (h * 0.730f).toInt()
+                2 -> (h * 0.790f).toInt()
+                else -> (h * 0.845f).toInt() // CLAIM REWARD
+            }
+            if (tasksCompletedCount < 3) {
+                waitingForTaskTimer = true
+                tapNodeIfReady("lootlabs_task_$tasksCompletedCount", tapX, tapY, "LootLabs: Tapping Task #${tasksCompletedCount + 1} ($tapX, $tapY)...")
+            } else {
+                waitingForTaskTimer = false
+                tapNodeIfReady("lootlabs_claim", tapX, tapY, "LootLabs: Tapping CLAIM REWARD ($tapX, $tapY)...")
+            }
+            return null
+        }
+
+        // Priority 5: PlatoRelay Human Verification / Continue
         val verifyAndContinuePatterns = listOf(
             "verify you are human",
             "i am human",
-            "confirm you are human",
             "continue",
             "proceed",
             "unlock",
@@ -973,32 +1030,45 @@ object KeyAutomator {
             }
             if (hit != null) {
                 waitingForTaskTimer = false
-                tapNodeIfReady(hit.label, hit.cx, hit.cy, "Chrome: Tapping '${hit.label.take(24)}' (${hit.cx}, ${hit.cy})...")
+                val isFirstBait = !adBaited
+                adBaited = true
+                if (isFirstBait) platoReadyAtMs = now + 6_000L
+                val msg = if (isFirstBait) "Baiting ad on '${hit.label.take(18)}'..." else "Tapping '${hit.label.take(20)}' (${hit.cx}, ${hit.cy})..."
+                tapNodeIfReady(hit.label, hit.cx, hit.cy, msg)
                 return null
             }
         }
 
-        // Priority 5: Pixel-detected white Continue button on PlatoRelay dark page
-        val whiteBtn = findWhiteContinueButtonByPixels(ctx)
-        if (whiteBtn != null) {
-            waitingForTaskTimer = false
-            tapNodeIfReady("white_continue_px", whiteBtn.first, whiteBtn.second, "Chrome: Tapping white Continue (${whiteBtn.first}, ${whiteBtn.second})...")
-            return null
-        }
+        // Priority 6: Pixel-detected white Continue button (ONLY runs when confirmed on PlatoRelay!)
+        if (onPlato) {
+            val whiteBtn = findWhiteContinueButtonByPixels(ctx)
+            if (whiteBtn != null) {
+                waitingForTaskTimer = false
+                val isFirstBait = !adBaited
+                adBaited = true
+                if (isFirstBait) platoReadyAtMs = now + 6_000L
+                val msg = if (isFirstBait) "Baiting ad on Continue (${whiteBtn.first}, ${whiteBtn.second})..." else "Tapping Continue (${whiteBtn.first}, ${whiteBtn.second})..."
+                tapNodeIfReady("white_continue_px", whiteBtn.first, whiteBtn.second, msg)
+                return null
+            }
 
-        // Priority 6: Guaranteed center-card Continue tap once 10s wait has elapsed on PlatoRelay (never gets stuck scanning)
-        val (w, h) = PilotCore.getDisplaySize()
-        val tapX = w / 2
-        val tapY = if (w > h) (h * 0.785f).toInt() else (h * 0.640f).toInt()
-        waitingForTaskTimer = false
-        tapNodeIfReady("plato_center_continue", tapX, tapY, "Chrome: Tapping Continue ($tapX, $tapY)...")
+            val (w, h) = PilotCore.getDisplaySize()
+            val tapX = w / 2
+            val tapY = if (w > h) (h * 0.785f).toInt() else (h * 0.643f).toInt()
+            waitingForTaskTimer = false
+            val isFirstBait = !adBaited
+            adBaited = true
+            if (isFirstBait) platoReadyAtMs = now + 6_000L
+            val msg = if (isFirstBait) "Baiting ad on Continue ($tapX, $tapY)..." else "Tapping Continue ($tapX, $tapY)..."
+            tapNodeIfReady("plato_center_continue", tapX, tapY, msg)
+        }
         return null
     }
 
     private fun tapNodeIfReady(label: String, cx: Int, cy: Int, stepMsg: String) {
         val now = System.currentTimeMillis()
         val sig = "${label.lowercase()}@$cx,$cy"
-        if (sig != lastWebTapSig || (now - lastWebTapMs) >= 4000L) {
+        if (sig != lastWebTapSig || (now - lastWebTapMs) >= 2500L) {
             lastWebTapSig = sig
             lastWebTapMs = now
             updateStep(stepMsg)
@@ -1027,7 +1097,7 @@ object KeyAutomator {
                     Thread {
                         if (running.get()) processNousigiHostStep(ctx)
                     }.start()
-                    mainHandler.postDelayed(this, 2000L)
+                    mainHandler.postDelayed(this, 1800L)
                     return
                 }
 
@@ -1048,7 +1118,7 @@ object KeyAutomator {
                             applyDeltaKeyInternal(ctx, scrapedKey)
                         }
                     }.start()
-                    mainHandler.postDelayed(this, 1600L)
+                    mainHandler.postDelayed(this, 1200L)
                     return
                 }
             }
@@ -1070,7 +1140,9 @@ object KeyAutomator {
         lastWebTapMs = 0L
         lastWebTapSig = ""
         onSponsorTabSinceMs = 0L
+        adBaited = false
         platoReadyAtMs = 0L
+        lootLabsSettleUntilMs = 0L
         startedAtMs = System.currentTimeMillis()
         showFloatingOverlay(ctx.applicationContext)
 
@@ -1078,7 +1150,7 @@ object KeyAutomator {
             previousKeySnapshot = readClipboard(ctx).trim()
             updateStep("Opening Nousigi Key Portal (${collectedNousigiKeys.size}/5)...")
             openInFullChrome(nousigiPortalUrl)
-            mainHandler.postDelayed(keyWatchRunnable, 2200L)
+            mainHandler.postDelayed(keyWatchRunnable, 2000L)
         }.start()
         return true
     }
@@ -1102,7 +1174,9 @@ object KeyAutomator {
         tasksCompletedCount = 0
         waitingForTaskTimer = false
         onSponsorTabSinceMs = 0L
+        adBaited = false
         platoReadyAtMs = 0L
+        lootLabsSettleUntilMs = 0L
         completionCb = onDone
         startedAtMs = System.currentTimeMillis()
         showFloatingOverlay(ctx.applicationContext)
@@ -1116,10 +1190,11 @@ object KeyAutomator {
             if (directUrl.isNotBlank()) {
                 Rejoiner.saveConfig(ctx, Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = directUrl))
                 inChromePhase = true
-                platoReadyAtMs = System.currentTimeMillis() + 10_000L
-                updateStep("PlatoRelay: Waiting 10s for 5s countdown...")
+                adBaited = false
+                platoReadyAtMs = 0L
+                updateStep("Opening PlatoRelay -> baiting first ad click...")
                 openInFullChrome(directUrl)
-                mainHandler.postDelayed(keyWatchRunnable, 1600L)
+                mainHandler.postDelayed(keyWatchRunnable, 1500L)
                 return@Thread
             }
 
@@ -1156,11 +1231,10 @@ object KeyAutomator {
 
             ensureReceiveKeyOpensChrome(testSlot.pkg, testSlot.username)
             inChromePhase = true
-            if (platoReadyAtMs == 0L) {
-                platoReadyAtMs = System.currentTimeMillis() + 10_000L
-            }
-            updateStep("PlatoRelay: Waiting 10s for 5s countdown...")
-            mainHandler.postDelayed(keyWatchRunnable, 1500L)
+            adBaited = false
+            platoReadyAtMs = 0L
+            updateStep("Chrome opened -> baiting first ad click...")
+            mainHandler.postDelayed(keyWatchRunnable, 1200L)
         }.start()
         return true
     }
@@ -1268,7 +1342,9 @@ object KeyAutomator {
         activeTestPkg = ""
         waitingForTaskTimer = false
         onSponsorTabSinceMs = 0L
+        adBaited = false
         platoReadyAtMs = 0L
+        lootLabsSettleUntilMs = 0L
         currentStep = if (ok) "Completed" else "Failed"
         mainHandler.removeCallbacks(keyWatchRunnable)
         removeFloatingOverlay()
