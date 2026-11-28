@@ -38,6 +38,21 @@ data class KeyCheckReport(
     val isHealthy: Boolean
 )
 
+private enum class ChromeScreenKind {
+    PLATO_RELAY,
+    LOOTLABS,
+    VPN_AD,
+    EXTERNAL_OR_TASK,
+    LOADING
+}
+
+private data class ScreenScanResult(
+    val kind: ChromeScreenKind,
+    val continuePoint: Pair<Int, Int>?,
+    val width: Int,
+    val height: Int
+)
+
 /**
  * Delta Key Baseplate Tester + Fixed-Slot Clone Snapper & Verified Receive-Key -> Chrome Launcher
  * + 0s Ad-Bait -> 6s PlatoRelay + Zero-Click 10s Task Runner for LootLabs (links.lootlabs.gg)
@@ -47,6 +62,7 @@ object KeyAutomator {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val running = AtomicBoolean(false)
+    private val stepBusy = AtomicBoolean(false)
 
     @Volatile var isAppInForeground: Boolean = false
 
@@ -54,6 +70,7 @@ object KeyAutomator {
     @Volatile private var inChromePhase = false
     @Volatile private var activeTestPkg = ""
     @Volatile private var startedAtMs = 0L
+    @Volatile private var chromeOpenedAtMs = 0L
     @Volatile private var currentStep = "Idle"
     @Volatile private var lastLoggedStep = ""
     @Volatile private var previousKeySnapshot = ""
@@ -116,6 +133,7 @@ object KeyAutomator {
             removeFloatingOverlay()
             return
         }
+        stepBusy.set(false)
         inChromePhase = false
         activeTestPkg = ""
         waitingForTaskTimer = false
@@ -507,8 +525,12 @@ object KeyAutomator {
         return t.startsWith("http") && (t.contains("platorelay.com") || t.contains("platoboost"))
     }
 
+    /** Works across Android 7 through Android 15 (checks window displays + resumed activities). */
     private fun isChromeForeground(): Boolean {
-        val focus = SuShell.exec("dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 3")
+        val focus = SuShell.exec(
+            "dumpsys window displays 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 3; " +
+            "dumpsys activity activities 2>/dev/null | grep -E 'topResumedActivity|mResumedActivity' | head -n 2"
+        )
         return focus.contains("com.android.chrome")
     }
 
@@ -569,6 +591,7 @@ object KeyAutomator {
                 if (isChromeForeground()) {
                     adBaited = false
                     platoReadyAtMs = 0L
+                    chromeOpenedAtMs = System.currentTimeMillis()
                     PilotCore.log("[KEYAUTO] Confirmed Chrome opened — baiting first ad click immediately!")
                     return true
                 }
@@ -578,34 +601,15 @@ object KeyAutomator {
         return isChromeForeground()
     }
 
-    private fun dumpUiXmlCompressed(): String {
-        val out = SuShell.exec("rm -f /sdcard/pilot_ui.xml && uiautomator dump --compressed /sdcard/pilot_ui.xml 2>&1")
+    /** Hard-capped at 3s so animated Chrome pages or YouTube video playback can never hang SuShell. */
+    private fun dumpUiXmlFast(): String {
+        val out = SuShell.exec("rm -f /sdcard/pilot_ui.xml && timeout 3 uiautomator dump --compressed /sdcard/pilot_ui.xml 2>&1")
         if (!out.contains("UI hierchary dumped", ignoreCase = true) &&
             !out.contains("UI hierarchy dumped", ignoreCase = true)
         ) {
-            SuShell.exec("rm -f /sdcard/pilot_ui.xml && uiautomator dump /sdcard/pilot_ui.xml >/dev/null 2>&1")
+            return ""
         }
         return SuShell.exec("cat /sdcard/pilot_ui.xml 2>/dev/null")
-    }
-
-    /**
-     * Reads Chrome's active address bar URL from XML or `dumpsys activity top` (works even while YouTube video plays).
-     */
-    private fun getCurrentChromeUrl(xml: String): String {
-        val urlRx = Regex("""https?://[^\s"'<>]+""")
-        val domainRx = Regex(
-            """\b(?:auth\.platorelay\.com|platorelay\.com|platoboost\.com|gateway\.platoboost\.com|links\.lootlabs\.gg|lootlabs\.gg|m\.youtube\.com|www\.youtube\.com|youtube\.com|youtu\.be|vpnapptoggle\.com)[^\s"'<>]*""",
-            RegexOption.IGNORE_CASE
-        )
-
-        if (xml.isNotBlank()) {
-            val m1 = urlRx.find(xml)?.value ?: domainRx.find(xml)?.value
-            if (!m1.isNullOrBlank()) return m1.lowercase()
-        }
-
-        val topDump = SuShell.exec("dumpsys activity top 2>/dev/null | grep -E 'url_bar|https?://|lootlabs|platorelay|youtube' | head -n 15")
-        val m2 = urlRx.find(topDump)?.value ?: domainRx.find(topDump)?.value
-        return m2?.lowercase().orEmpty()
     }
 
     private fun isFakeAdTrap(rawText: String): Boolean {
@@ -614,78 +618,130 @@ object KeyAutomator {
         return AD_TRAP_KEYWORDS.any { low.contains(it) }
     }
 
-    private fun isLootLabsPage(url: String, xml: String): Boolean {
-        val lowUrl = url.lowercase()
-        val lowXml = xml.lowercase()
-        return lowUrl.contains("lootlabs.gg") ||
-            lowXml.contains("lootlabs.gg") ||
-            lowXml.contains("complete tasks to continue") ||
-            lowXml.contains("claim reward") ||
-            lowXml.contains("unlockr for android")
-    }
-
-    private fun isPlatoRelayPage(url: String, xml: String): Boolean {
-        val lowUrl = url.lowercase()
-        val lowXml = xml.lowercase()
-        return lowUrl.contains("platorelay.com") ||
-            lowUrl.contains("platoboost.com") ||
-            lowXml.contains("platorelay.com") ||
-            lowXml.contains("platoboost.com") ||
-            lowXml.contains("delta android keysystem")
-    }
-
     /**
-     * Pixel detector ONLY called when confirmed on PlatoRelay:
-     * Finds PlatoRelay's bright white 'Continue' button inside its dark background.
+     * Fast visual screen classifier (works in BOTH Landscape & Portrait even when uiautomator fails):
+     * Samples solid button padding at x = 39% and x = 61% (avoiding centered button text) to classify:
+     * - PLATO_RELAY: pure-black margins + Red ('Watch tutorial') -> Blue ('Visit shop') -> White ('Continue') stack
+     * - LOOTLABS: dark navy-blue margins (B > R + 10) + green Unlockr ring
+     * - VPN_AD: bright neon green button in lower half
+     * - EXTERNAL_OR_TASK: anything else (YouTube, survey, sponsor page)
      */
-    private fun findWhiteContinueButtonByPixels(ctx: Context): Pair<Int, Int>? {
+    private fun analyzeChromeScreen(ctx: Context): ScreenScanResult {
         val snapPath = File(ctx.cacheDir, "key_scan_${System.nanoTime()}.png").absolutePath
         SuShell.exec("screencap -p '$snapPath' && chmod 666 '$snapPath'")
         val file = File(snapPath)
-        if (!file.exists() || file.length() == 0L) return null
+        if (!file.exists() || file.length() == 0L) {
+            val (w, h) = PilotCore.getDisplaySize()
+            return ScreenScanResult(ChromeScreenKind.LOADING, null, w, h)
+        }
 
         return try {
-            val bmp = BitmapFactory.decodeFile(snapPath) ?: return null
+            val bmp = BitmapFactory.decodeFile(snapPath)
+                ?: return ScreenScanResult(ChromeScreenKind.LOADING, null, 1280, 720)
             val w = bmp.width
             val h = bmp.height
             val cx = w / 2
+            val xLeft = (w * 0.39f).toInt().coerceIn(8, w - 9)
+            val xRight = (w * 0.61f).toInt().coerceIn(8, w - 9)
 
-            val leftMarginPx = bmp.getPixel((w * 0.06f).toInt(), (h * 0.55f).toInt())
-            val rightMarginPx = bmp.getPixel((w * 0.94f).toInt(), (h * 0.55f).toInt())
-            val isDarkBg = Color.red(leftMarginPx) < 40 && Color.green(leftMarginPx) < 40 &&
-                Color.red(rightMarginPx) < 40 && Color.green(rightMarginPx) < 40
-            if (!isDarkBg) {
+            // Check left & right page margins below Chrome's toolbar
+            val mL = bmp.getPixel((w * 0.05f).toInt(), (h * 0.55f).toInt())
+            val mR = bmp.getPixel((w * 0.95f).toInt(), (h * 0.55f).toInt())
+            val mL2 = bmp.getPixel((w * 0.05f).toInt(), (h * 0.80f).toInt())
+            val mR2 = bmp.getPixel((w * 0.95f).toInt(), (h * 0.80f).toInt())
+
+            val isPureBlackMargins =
+                Color.red(mL) < 22 && Color.green(mL) < 22 && Color.blue(mL) < 28 &&
+                Color.red(mR) < 22 && Color.green(mR) < 22 && Color.blue(mR) < 28 &&
+                Color.red(mL2) < 22 && Color.green(mL2) < 22 && Color.blue(mL2) < 28 &&
+                Color.red(mR2) < 22 && Color.green(mR2) < 22 && Color.blue(mR2) < 28
+
+            val isNavyMargins =
+                Color.red(mL) < 35 && Color.blue(mL) > Color.red(mL) + 10 && Color.blue(mL) in 25..95 &&
+                Color.red(mR) < 35 && Color.blue(mR) > Color.red(mR) + 10 && Color.blue(mR) in 25..95
+
+            val isAllWhiteLoading =
+                Color.red(mL) > 235 && Color.green(mL) > 235 && Color.blue(mL) > 235 &&
+                Color.red(mR) > 235 && Color.green(mR) > 235 && Color.blue(mR) > 235 &&
+                Color.red(mL2) > 235 && Color.green(mL2) > 235 && Color.blue(mL2) > 235
+
+            if (isAllWhiteLoading) {
                 bmp.recycle()
-                return null
+                return ScreenScanResult(ChromeScreenKind.LOADING, null, w, h)
             }
 
-            val yStart = (h * 0.30f).toInt()
-            val yEnd = (h * 0.95f).toInt()
-            var runStart = -1
-            var foundCenterY = -1
+            // Scan vertically from 25% to 94% height sampling xLeft & xRight (clear of centered text)
+            val yStart = (h * 0.25f).toInt()
+            val yEnd = (h * 0.94f).toInt()
 
-            for (y in yStart..yEnd) {
-                val p = bmp.getPixel(cx, y)
-                val isBright = Color.red(p) > 195 && Color.green(p) > 195 && Color.blue(p) > 195
-                if (isBright) {
-                    if (runStart < 0) runStart = y
-                } else {
-                    if (runStart >= 0) {
-                        val bandH = y - runStart
-                        if (bandH in 20..120) {
-                            val midY = (runStart + y) / 2
-                            val leftSide = bmp.getPixel((w * 0.42f).toInt(), midY)
-                            val rightSide = bmp.getPixel((w * 0.58f).toInt(), midY)
-                            if (Color.red(leftSide) > 190 && Color.red(rightSide) > 190) {
-                                foundCenterY = midY
-                            }
-                        }
-                        runStart = -1
-                    }
+            var redBandY = -1
+            var blueBandY = -1
+            var whiteBandY = -1
+            var greenAdBandY = -1
+
+            var curColor = 0 // 0=other, 1=red, 2=blue, 3=white, 4=neonGreen
+            var runStart = -1
+
+            fun commitRun(colorType: Int, y0: Int, y1: Int) {
+                val bh = y1 - y0
+                if (bh !in 18..125) return
+                val midY = (y0 + y1) / 2
+                when (colorType) {
+                    1 -> if (redBandY < 0) redBandY = midY
+                    2 -> if (blueBandY < 0 || (redBandY > 0 && midY > redBandY)) blueBandY = midY
+                    3 -> whiteBandY = midY // keep lowest white button (Continue sits below Watch tutorial & Visit shop)
+                    4 -> if (midY > (h * 0.65f).toInt()) greenAdBandY = midY
                 }
             }
+
+            for (y in yStart..yEnd step 2) {
+                val p1 = bmp.getPixel(xLeft, y)
+                val p2 = bmp.getPixel(xRight, y)
+
+                val isRed = Color.red(p1) > 150 && Color.green(p1) < 80 && Color.blue(p1) < 80 &&
+                    Color.red(p2) > 150 && Color.green(p2) < 80 && Color.blue(p2) < 80
+                val isBlue = Color.blue(p1) > 150 && Color.red(p1) < 60 && Color.green(p1) > 90 &&
+                    Color.blue(p2) > 150 && Color.red(p2) < 60 && Color.green(p2) > 90
+                val isWhite = Color.red(p1) > 195 && Color.green(p1) > 195 && Color.blue(p1) > 195 &&
+                    Color.red(p2) > 195 && Color.green(p2) > 195 && Color.blue(p2) > 195
+                val isNeonGreen = Color.green(p1) > 175 && Color.red(p1) < 90 && Color.blue(p1) < 90 &&
+                    Color.green(p2) > 175 && Color.red(p2) < 90 && Color.blue(p2) < 90
+
+                val nextColor = when {
+                    isRed -> 1
+                    isBlue -> 2
+                    isWhite -> 3
+                    isNeonGreen -> 4
+                    else -> 0
+                }
+                if (nextColor == curColor) {
+                    if (curColor != 0 && runStart < 0) runStart = y
+                } else {
+                    if (curColor != 0 && runStart >= 0) commitRun(curColor, runStart, y)
+                    curColor = nextColor
+                    runStart = if (nextColor != 0) y else -1
+                }
+            }
+            if (curColor != 0 && runStart >= 0) commitRun(curColor, runStart, yEnd)
+
             bmp.recycle()
-            if (foundCenterY > 0) cx to foundCenterY else null
+
+            // 1. Definite VPN/trial ad trap (bright green Continue button on dark/grey page)
+            if (greenAdBandY > 0 && redBandY < 0 && blueBandY < 0) {
+                return ScreenScanResult(ChromeScreenKind.VPN_AD, null, w, h)
+            }
+
+            // 2. Definite PlatoRelay page: pure-black margins + (Red->Blue->White stack OR centered white Continue button)
+            if (isPureBlackMargins && whiteBandY > 0 && (redBandY > 0 || blueBandY > 0 || whiteBandY > (h * 0.50f).toInt())) {
+                return ScreenScanResult(ChromeScreenKind.PLATO_RELAY, cx to whiteBandY, w, h)
+            }
+
+            // 3. Definite LootLabs page: navy-blue margins (no white Continue button)
+            if (isNavyMargins && redBandY < 0) {
+                return ScreenScanResult(ChromeScreenKind.LOOTLABS, null, w, h)
+            }
+
+            ScreenScanResult(ChromeScreenKind.EXTERNAL_OR_TASK, null, w, h)
         } finally {
             file.delete()
         }
@@ -698,7 +754,6 @@ object KeyAutomator {
         adBaited = true
         updateStep(stepLabel)
 
-        // Ctrl+W closes only the active task/ad tab and reveals PlatoRelay / LootLabs underneath
         SuShell.exec("input keyevent --ctrl 51")
         Thread.sleep(650L)
 
@@ -710,15 +765,13 @@ object KeyAutomator {
         if (waitPlato6s) {
             platoReadyAtMs = System.currentTimeMillis() + 6_000L
         } else {
-            // Brief 2s settle pause so LootLabs registers the completed task before tapping the next one
             lootLabsSettleUntilMs = System.currentTimeMillis() + 2_000L
         }
     }
 
     private fun processNousigiHostStep(ctx: Context) {
         val now = System.currentTimeMillis()
-        val xml = dumpUiXmlCompressed()
-        val curUrl = getCurrentChromeUrl(xml)
+        val xml = dumpUiXmlFast()
 
         val clip = readClipboard(ctx).trim()
         val clipCandidate = if (clip != previousKeySnapshot && NOUSIGI_KEY_SEARCH_RX.matches(clip) && !clip.startsWith("KEY_")) clip else null
@@ -746,12 +799,12 @@ object KeyAutomator {
             return
         }
 
-        if (isFakeAdTrap(xml) || isFakeAdTrap(curUrl)) {
+        if (isFakeAdTrap(xml)) {
             closeChromeTab("Blocked ad redirect -> closing & waiting 6s...", waitPlato6s = true)
             return
         }
 
-        val isLinkvertise = curUrl.contains("linkvertise.com") || xml.contains("linkvertise.com", ignoreCase = true)
+        val isLinkvertise = xml.contains("linkvertise.com", ignoreCase = true)
         if (isLinkvertise) {
             if (onSponsorTabSinceMs == 0L) onSponsorTabSinceMs = now
             val waited = (now - onSponsorTabSinceMs) / 1000L
@@ -823,19 +876,23 @@ object KeyAutomator {
 
     private fun processChromePlatoRelayStep(ctx: Context): String? {
         val now = System.currentTimeMillis()
-        val focusInfo = SuShell.exec(
-            "dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 3"
-        )
-        val xml = dumpUiXmlCompressed()
-        val curUrl = getCurrentChromeUrl(xml)
+        val chromeInFront = isChromeForeground()
 
-        val isChromeInFront = focusInfo.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || curUrl.isNotEmpty()
-
-        if (!isChromeInFront && activeTestPkg.isNotEmpty()) {
-            val slotUser = Rejoiner.slots[activeTestPkg]?.username?.ifBlank { "slot" } ?: "slot"
-            ensureReceiveKeyOpensChrome(activeTestPkg, slotUser)
+        // If Chrome is NOT in front, reopen Roblox & tap Receive Key (or reopen Chrome if direct URL mode)
+        if (!chromeInFront) {
+            if (activeTestPkg.isNotEmpty()) {
+                val slotUser = Rejoiner.slots[activeTestPkg]?.username?.ifBlank { "slot" } ?: "slot"
+                ensureReceiveKeyOpensChrome(activeTestPkg, slotUser)
+            } else {
+                updateStep("Bringing Chrome back to front...")
+                SuShell.exec("monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+                Thread.sleep(700L)
+            }
             return null
         }
+
+        // Fast 3s-capped XML dump + reliable visual screen classification
+        val xml = dumpUiXmlFast()
 
         // 1. Check foreground XML for KEY_...
         val directKey = DELTA_KEY_SEARCH_RX.find(xml)?.value
@@ -846,18 +903,49 @@ object KeyAutomator {
             return directKey
         }
 
-        val onPlato = isPlatoRelayPage(curUrl, xml)
-        val onLootLabs = isLootLabsPage(curUrl, xml)
+        val scan = analyzeChromeScreen(ctx)
 
-        // 2. If we are NOT on PlatoRelay and NOT on LootLabs -> we are on an external task site (e.g. m.youtube.com) or an ad tab!
-        if (isChromeInFront && !onPlato && !onLootLabs) {
-            // Instant ad trap before any task was started -> close immediately & wait 6s for PlatoRelay
-            if (!waitingForTaskTimer && (isFakeAdTrap(curUrl) || isFakeAdTrap(xml))) {
-                closeChromeTab("Ad closed -> waiting 6s...", waitPlato6s = true)
+        val xmlSaysPlato = xml.contains("platorelay.com", true) ||
+            xml.contains("platoboost.com", true) ||
+            xml.contains("Delta Android Keysystem", true)
+        val xmlSaysLootLabs = xml.contains("lootlabs.gg", true) ||
+            xml.contains("Complete Tasks to Continue", true) ||
+            xml.contains("CLAIM REWARD", true) ||
+            xml.contains("Unlockr for Android", true)
+        val xmlSaysAd = isFakeAdTrap(xml)
+
+        val isAd = xmlSaysAd || scan.kind == ChromeScreenKind.VPN_AD
+        val onPlato = !isAd && (xmlSaysPlato || scan.kind == ChromeScreenKind.PLATO_RELAY)
+        val onLootLabs = !isAd && !onPlato && (xmlSaysLootLabs || scan.kind == ChromeScreenKind.LOOTLABS)
+
+        // Wait briefly if Chrome is still painting a blank white page right after opening
+        if (scan.kind == ChromeScreenKind.LOADING && !xmlSaysPlato && !xmlSaysLootLabs && !isAd) {
+            if (now - chromeOpenedAtMs < 5000L) {
+                updateStep("Chrome: Waiting for page to finish loading...")
+                return null
+            }
+        }
+
+        // 2. Instant ad trap -> Ctrl+W immediately -> wait 6s for PlatoRelay
+        if (isAd) {
+            closeChromeTab("Ad closed -> waiting 6s...", waitPlato6s = true)
+            return null
+        }
+
+        // 3. External site (YouTube / Survey / Ad redirect)
+        if (!onPlato && !onLootLabs) {
+            // If we didn't click a task (meaning clicking Continue spawned an ad tab), close immediately & wait 6s
+            if (!waitingForTaskTimer) {
+                // Grace window right after initial open so we don't close the initial tab while loading
+                if (!adBaited && now - chromeOpenedAtMs < 4000L) {
+                    updateStep("Chrome: Loading PlatoRelay...")
+                    return null
+                }
+                closeChromeTab("Pop-up ad closed -> waiting 6s...", waitPlato6s = true)
                 return null
             }
 
-            // Otherwise: ZERO CLICKS on task website (m.youtube.com, survey, etc.) -> wait 10s -> Ctrl+W back to LootLabs!
+            // We clicked a LootLabs task -> ZERO CLICKS on task site -> wait 10s -> Ctrl+W back to LootLabs!
             if (onSponsorTabSinceMs == 0L) {
                 onSponsorTabSinceMs = now
             }
@@ -873,12 +961,11 @@ object KeyAutomator {
             return null
         }
 
-        // Foreground IS confirmed on PlatoRelay or LootLabs
+        // Foreground IS on PlatoRelay or LootLabs
         onSponsorTabSinceMs = 0L
         waitingForTaskTimer = false
 
-        // Save PlatoRelay URL from Chrome's address bar if visible
-        val urlMatch = Regex("""https?://(?:auth\.platorelay\.com|gateway\.platoboost\.com)/[^\s"<']+""").find("$curUrl\n$xml")
+        val urlMatch = Regex("""https?://(?:auth\.platorelay\.com|gateway\.platoboost\.com)/[^\s"<']+""").find(xml)
         if (urlMatch != null) {
             val foundUrl = urlMatch.value
             val savedPlato = Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
@@ -887,8 +974,8 @@ object KeyAutomator {
             }
         }
 
-        // On PlatoRelay: wait 6s after baiting/closing an ad before clicking Continue
-        if (onPlato && !onLootLabs && adBaited && now < platoReadyAtMs) {
+        // On PlatoRelay: first open clicks immediately (0s wait) to bait ad; after ad/first click, waits 6s
+        if (onPlato && adBaited && now < platoReadyAtMs) {
             val remSec = ((platoReadyAtMs - now) / 1000L) + 1L
             updateStep("PlatoRelay: Waiting ${remSec}s before Continue...")
             return null
@@ -896,7 +983,7 @@ object KeyAutomator {
 
         // On LootLabs: brief 2s settle pause after returning from a task tab
         if (onLootLabs && now < lootLabsSettleUntilMs) {
-            updateStep("LootLabs: Checking task #${tasksCompletedCount + 1}...")
+            updateStep("LootLabs: Preparing Task #${tasksCompletedCount + 1}...")
             return null
         }
 
@@ -951,58 +1038,44 @@ object KeyAutomator {
             }
         }
 
-        // Priority 3: LootLabs & PlatoRelay Task Rows -> tap task -> wait 10s on task site -> Ctrl+W back
-        val taskKeywords = listOf(
-            "subscribe and watch",
-            "complete and get rewarded",
-            "confirm you are human",
-            "watch a video",
-            "read an article",
-            "complete a quick"
-        )
-        val uncompletedTask = nodes.firstOrNull { n ->
-            val low = n.label.lowercase()
-            n.enabled && n.cy > 110 &&
-                !low.contains("completed") &&
-                !low.contains("complete tasks to continue") &&
-                !low.contains("done") &&
-                !low.contains("verified") &&
-                !low.contains("tutorial") &&
-                !low.contains("shop") &&
-                (taskKeywords.any { low.contains(it) } ||
-                    low == "complete" ||
-                    low == "visit" ||
-                    low == "read" ||
-                    low == "watch" ||
-                    low == "discover" ||
-                    low == "open" ||
-                    low == "start" ||
-                    low == "go" ||
-                    low.startsWith("complete ") ||
-                    low.startsWith("visit ") ||
-                    low.startsWith("task "))
-        }
-        if (uncompletedTask != null) {
-            waitingForTaskTimer = true
-            adBaited = true
-            tapNodeIfReady(
-                uncompletedTask.label,
-                uncompletedTask.cx,
-                uncompletedTask.cy,
-                "LootLabs: Tapping Task #${tasksCompletedCount + 1} ('${uncompletedTask.label.take(20)}')..."
-            )
-            return null
-        }
-
-        // Priority 4: LootLabs Coordinate Fallback when XML omits task row buttons
+        // Priority 3: LootLabs Task Rows (XML match -> Coordinate fallback)
         if (onLootLabs) {
-            val (w, h) = PilotCore.getDisplaySize()
-            val tapX = w / 2
+            val taskKeywords = listOf(
+                "subscribe and watch",
+                "complete and get rewarded",
+                "confirm you are human",
+                "watch a video",
+                "read an article",
+                "complete a quick"
+            )
+            val uncompletedTask = nodes.firstOrNull { n ->
+                val low = n.label.lowercase()
+                n.enabled && n.cy > 110 &&
+                    !low.contains("completed") &&
+                    !low.contains("complete tasks to continue") &&
+                    !low.contains("done") &&
+                    !low.contains("verified") &&
+                    taskKeywords.any { low.contains(it) }
+            }
+            if (uncompletedTask != null) {
+                waitingForTaskTimer = true
+                adBaited = true
+                tapNodeIfReady(
+                    uncompletedTask.label,
+                    uncompletedTask.cx,
+                    uncompletedTask.cy,
+                    "LootLabs: Tapping Task #${tasksCompletedCount + 1}..."
+                )
+                return null
+            }
+
+            // Coordinate fallback for LootLabs task rows + CLAIM REWARD
+            val tapX = scan.width / 2
             val tapY = when (tasksCompletedCount) {
-                0 -> (h * 0.665f).toInt()
-                1 -> (h * 0.730f).toInt()
-                2 -> (h * 0.790f).toInt()
-                else -> (h * 0.845f).toInt() // CLAIM REWARD
+                0 -> (scan.height * 0.675f).toInt()
+                1 -> (scan.height * 0.735f).toInt()
+                2 -> (scan.height * 0.790f).toInt()
+                else -> (scan.height * 0.845f).toInt()
             }
             if (tasksCompletedCount < 3) {
                 waitingForTaskTimer = true
@@ -1014,7 +1087,7 @@ object KeyAutomator {
             return null
         }
 
-        // Priority 5: PlatoRelay Human Verification / Continue
+        // Priority 4: PlatoRelay XML Continue / Verify Human
         val verifyAndContinuePatterns = listOf(
             "verify you are human",
             "i am human",
@@ -1032,43 +1105,35 @@ object KeyAutomator {
                 waitingForTaskTimer = false
                 val isFirstBait = !adBaited
                 adBaited = true
-                if (isFirstBait) platoReadyAtMs = now + 6_000L
-                val msg = if (isFirstBait) "Baiting ad on '${hit.label.take(18)}'..." else "Tapping '${hit.label.take(20)}' (${hit.cx}, ${hit.cy})..."
+                platoReadyAtMs = now + 6_000L
+                val msg = if (isFirstBait) "Baiting ad on '${hit.label.take(18)}'..." else "Tapping '${hit.label.take(18)}' (${hit.cx}, ${hit.cy})..."
                 tapNodeIfReady(hit.label, hit.cx, hit.cy, msg)
                 return null
             }
         }
 
-        // Priority 6: Pixel-detected white Continue button (ONLY runs when confirmed on PlatoRelay!)
-        if (onPlato) {
-            val whiteBtn = findWhiteContinueButtonByPixels(ctx)
-            if (whiteBtn != null) {
-                waitingForTaskTimer = false
-                val isFirstBait = !adBaited
-                adBaited = true
-                if (isFirstBait) platoReadyAtMs = now + 6_000L
-                val msg = if (isFirstBait) "Baiting ad on Continue (${whiteBtn.first}, ${whiteBtn.second})..." else "Tapping Continue (${whiteBtn.first}, ${whiteBtn.second})..."
-                tapNodeIfReady("white_continue_px", whiteBtn.first, whiteBtn.second, msg)
-                return null
-            }
-
-            val (w, h) = PilotCore.getDisplaySize()
-            val tapX = w / 2
-            val tapY = if (w > h) (h * 0.785f).toInt() else (h * 0.643f).toInt()
-            waitingForTaskTimer = false
-            val isFirstBait = !adBaited
-            adBaited = true
-            if (isFirstBait) platoReadyAtMs = now + 6_000L
-            val msg = if (isFirstBait) "Baiting ad on Continue ($tapX, $tapY)..." else "Tapping Continue ($tapX, $tapY)..."
-            tapNodeIfReady("plato_center_continue", tapX, tapY, msg)
+        // Priority 5: Visual pixel-detected white Continue button on PlatoRelay (exact coordinates!)
+        val btn = scan.continuePoint ?: run {
+            val ty = if (scan.width > scan.height) (scan.height * 0.785f).toInt() else (scan.height * 0.643f).toInt()
+            (scan.width / 2) to ty
         }
+        waitingForTaskTimer = false
+        val isFirstBait = !adBaited
+        adBaited = true
+        platoReadyAtMs = now + 6_000L
+        val msg = if (isFirstBait) {
+            "Baiting ad on Continue (${btn.first}, ${btn.second})..."
+        } else {
+            "Tapping Continue (${btn.first}, ${btn.second})..."
+        }
+        tapNodeIfReady("plato_continue_${if (isFirstBait) "bait" else "go"}", btn.first, btn.second, msg)
         return null
     }
 
     private fun tapNodeIfReady(label: String, cx: Int, cy: Int, stepMsg: String) {
         val now = System.currentTimeMillis()
         val sig = "${label.lowercase()}@$cx,$cy"
-        if (sig != lastWebTapSig || (now - lastWebTapMs) >= 2500L) {
+        if (sig != lastWebTapSig || (now - lastWebTapMs) >= 2200L) {
             lastWebTapSig = sig
             lastWebTapMs = now
             updateStep(stepMsg)
@@ -1094,10 +1159,16 @@ object KeyAutomator {
             val ctx = appCtx
             if (ctx != null) {
                 if (mode == "NOUSIGI_HOST") {
-                    Thread {
-                        if (running.get()) processNousigiHostStep(ctx)
-                    }.start()
-                    mainHandler.postDelayed(this, 1800L)
+                    if (stepBusy.compareAndSet(false, true)) {
+                        Thread {
+                            try {
+                                if (running.get()) processNousigiHostStep(ctx)
+                            } finally {
+                                stepBusy.set(false)
+                            }
+                        }.start()
+                    }
+                    mainHandler.postDelayed(this, 1600L)
                     return
                 }
 
@@ -1111,19 +1182,25 @@ object KeyAutomator {
                 }
 
                 if (inChromePhase) {
-                    Thread {
-                        if (!running.get()) return@Thread
-                        val scrapedKey = processChromePlatoRelayStep(ctx)
-                        if (scrapedKey != null && running.get()) {
-                            applyDeltaKeyInternal(ctx, scrapedKey)
-                        }
-                    }.start()
-                    mainHandler.postDelayed(this, 1200L)
+                    if (stepBusy.compareAndSet(false, true)) {
+                        Thread {
+                            try {
+                                if (!running.get()) return@Thread
+                                val scrapedKey = processChromePlatoRelayStep(ctx)
+                                if (scrapedKey != null && running.get()) {
+                                    applyDeltaKeyInternal(ctx, scrapedKey)
+                                }
+                            } finally {
+                                stepBusy.set(false)
+                            }
+                        }.start()
+                    }
+                    mainHandler.postDelayed(this, 1000L)
                     return
                 }
             }
 
-            mainHandler.postDelayed(this, 1200L)
+            mainHandler.postDelayed(this, 1000L)
         }
     }
 
@@ -1136,6 +1213,7 @@ object KeyAutomator {
         nousigiPortalUrl = portalUrl.trim().ifBlank { "https://getkey.nousigi.com/" }
         collectedNousigiKeys = PilotCore.getKeyPool(ctx).map { it.key }.toMutableList()
         inChromePhase = true
+        stepBusy.set(false)
         lastLoggedStep = ""
         lastWebTapMs = 0L
         lastWebTapSig = ""
@@ -1144,6 +1222,7 @@ object KeyAutomator {
         platoReadyAtMs = 0L
         lootLabsSettleUntilMs = 0L
         startedAtMs = System.currentTimeMillis()
+        chromeOpenedAtMs = startedAtMs
         showFloatingOverlay(ctx.applicationContext)
 
         Thread {
@@ -1167,6 +1246,7 @@ object KeyAutomator {
         mode = "DELTA"
         appCtx = ctx.applicationContext
         inChromePhase = false
+        stepBusy.set(false)
         activeTestPkg = ""
         lastLoggedStep = ""
         lastWebTapMs = 0L
@@ -1192,6 +1272,7 @@ object KeyAutomator {
                 inChromePhase = true
                 adBaited = false
                 platoReadyAtMs = 0L
+                chromeOpenedAtMs = System.currentTimeMillis()
                 updateStep("Opening PlatoRelay -> baiting first ad click...")
                 openInFullChrome(directUrl)
                 mainHandler.postDelayed(keyWatchRunnable, 1500L)
@@ -1233,6 +1314,7 @@ object KeyAutomator {
             inChromePhase = true
             adBaited = false
             platoReadyAtMs = 0L
+            chromeOpenedAtMs = System.currentTimeMillis()
             updateStep("Chrome opened -> baiting first ad click...")
             mainHandler.postDelayed(keyWatchRunnable, 1200L)
         }.start()
@@ -1338,6 +1420,7 @@ object KeyAutomator {
             removeFloatingOverlay()
             return
         }
+        stepBusy.set(false)
         inChromePhase = false
         activeTestPkg = ""
         waitingForTaskTimer = false
