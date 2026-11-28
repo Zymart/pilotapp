@@ -6,6 +6,7 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -26,6 +27,8 @@ import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
+import kotlin.math.min
 
 data class KeyCheckReport(
     val title: String,
@@ -36,7 +39,7 @@ data class KeyCheckReport(
 )
 
 /**
- * Delta Key Baseplate Tester + Verified Receive-Key -> Chrome Launcher
+ * Delta Key Baseplate Tester + Fixed-Slot Clone Snapper & Verified Receive-Key -> Chrome Launcher
  * + Orientation-Agnostic (Landscape & Portrait) Pixel/DOM PlatoRelay & Nousigi Solver
  */
 object KeyAutomator {
@@ -504,38 +507,66 @@ object KeyAutomator {
     }
 
     /**
-     * Brings the Roblox clone to the front, taps Delta's 'Receive Key' button inside its window bounds,
-     * and verifies within 3.5s that Chrome actually opened. If Chrome did NOT open, re-opens Roblox and retries.
+     * Forces the Roblox clone into a fixed, reproducible freeform rectangle on screen
+     * so Delta's 'Receive Key' button is always at the exact same pixel coordinates.
+     */
+    private fun snapCloneToConsistentSpot(pkg: String): Rect? {
+        val (rawW, rawH) = PilotCore.getDisplaySize()
+        val w = max(rawW, rawH)
+        val h = min(rawW, rawH)
+
+        // Consistent centered 1000x600 box on 1280x720 (scaled cleanly to any screen)
+        val left = (w * 0.11f).toInt()
+        val top = (h * 0.08f).toInt()
+        val right = (w * 0.89f).toInt()
+        val bottom = (h * 0.92f).toInt()
+
+        val taskId = PilotCore.findTaskId(pkg)
+        if (taskId != null) {
+            SuShell.exec(
+                "am task set-windowing-mode $taskId 5 >/dev/null 2>&1; " +
+                "am task resize $taskId $left $top $right $bottom >/dev/null 2>&1"
+            )
+            runCatching { Thread.sleep(550L) }
+            val actual = PilotCore.findOuterWindowBounds(pkg)
+            if (actual != null && actual.width() > 300) {
+                PilotCore.log("[KEYAUTO] Snapped $pkg (task #$taskId) to fixed spot $actual")
+                return actual
+            }
+        }
+        return PilotCore.findOuterWindowBounds(pkg) ?: Rect(left, top, right, bottom)
+    }
+
+    /**
+     * Brings the Roblox clone to the front, locks it into a consistent window spot,
+     * taps Delta's 'Receive Key' button, and verifies within 3.5s that Chrome opens.
      */
     private fun ensureReceiveKeyOpensChrome(pkg: String, username: String): Boolean {
         if (pkg.isBlank()) return false
 
         for (attempt in 1..4) {
             if (!running.get()) return false
-            updateStep("Opening $username & tapping 'Receive Key' ($attempt/4)...")
+            updateStep("Snapping $username & tapping 'Receive Key' ($attempt/4)...")
 
-            // Always bring Roblox clone to front first in case it was minimized or behind another app
             SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
-            runCatching { Thread.sleep(1000L) }
+            runCatching { Thread.sleep(900L) }
 
-            val win = PilotCore.findOuterWindowBounds(pkg)
-            if (win != null) {
-                val titleBarH = 38
-                val contentTop = win.top + titleBarH
-                val contentW = (win.right - win.left).coerceAtLeast(220)
-                val contentH = (win.bottom - contentTop).coerceAtLeast(160)
+            val box = snapCloneToConsistentSpot(pkg) ?: continue
+            val titleBarH = 38
+            val contentTop = box.top + titleBarH
+            val contentW = (box.right - box.left).coerceAtLeast(300)
+            val contentH = (box.bottom - contentTop).coerceAtLeast(200)
 
-                val tapX = win.left + (contentW * 0.82f).toInt()
-                val tapY1 = contentTop + (contentH * 0.56f).toInt()
-                val tapY2 = contentTop + (contentH * 0.60f).toInt()
+            // Delta's 'Welcome Back!' right-side card -> 'Receive Key' button directly below 'Continue'
+            val tapX = box.left + (contentW * 0.835f).toInt()
+            val tapY1 = contentTop + (contentH * 0.545f).toInt()
+            val tapY2 = contentTop + (contentH * 0.585f).toInt()
 
-                SuShell.exec("input tap $tapX $tapY1")
-                PilotCore.log("[KEYAUTO] Tapped 'Receive Key' at ($tapX, $tapY1) inside $pkg (attempt $attempt)")
-                runCatching { Thread.sleep(450L) }
-                SuShell.exec("input tap $tapX $tapY2")
-            }
+            SuShell.exec("input tap $tapX $tapY1")
+            PilotCore.log("[KEYAUTO] Tapped 'Receive Key' at ($tapX, $tapY1) inside locked box $box (attempt $attempt)")
+            runCatching { Thread.sleep(450L) }
+            SuShell.exec("input tap $tapX $tapY2")
 
-            // Wait up to 3.5s and check if Chrome opened in front
             val checkDeadline = System.currentTimeMillis() + 3500L
             while (running.get() && System.currentTimeMillis() < checkDeadline) {
                 runCatching { Thread.sleep(500L) }
@@ -544,7 +575,7 @@ object KeyAutomator {
                     return true
                 }
             }
-            PilotCore.log("[KEYAUTO] Chrome did not open yet — reopening Roblox ($pkg) & retrying Receive Key...")
+            PilotCore.log("[KEYAUTO] Chrome did not open yet — re-snapping $pkg & retrying...")
         }
         return isChromeForeground()
     }
@@ -769,10 +800,9 @@ object KeyAutomator {
         val tabStrings = readChromeNewestTabStrings()
         val combinedContext = "$xml\n$tabStrings"
 
-        val isRobloxInFront = focusInfo.contains("com.roblox.clien") || xml.contains("package=\"com.roblox.clien")
         val isChromeInFront = focusInfo.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || xml.contains("url_bar")
 
-        // If Chrome is NOT in front (e.g., Roblox is still open or bounced back), reopen Roblox and tap Receive Key
+        // If Chrome is NOT in front (e.g., Roblox is still open or bounced back), re-snap Roblox and tap Receive Key
         if (!isChromeInFront && activeTestPkg.isNotEmpty()) {
             val slotUser = Rejoiner.slots[activeTestPkg]?.username?.ifBlank { "slot" } ?: "slot"
             ensureReceiveKeyOpensChrome(activeTestPkg, slotUser)
@@ -1123,7 +1153,7 @@ object KeyAutomator {
             }
             if (!running.get()) return@Thread
 
-            // Tap Receive Key inside Roblox and verify Chrome opens (re-opening Roblox & retrying if needed)
+            // Snap clone into fixed box, tap Receive Key, and verify Chrome opens (re-opening Roblox & retrying if needed)
             ensureReceiveKeyOpensChrome(testSlot.pkg, testSlot.username)
             inChromePhase = true
             updateStep("Chrome: Scanning PlatoRelay...")
