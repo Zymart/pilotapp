@@ -3,6 +3,7 @@ package com.pilot.bot
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -35,7 +36,7 @@ data class KeyCheckReport(
 )
 
 /**
- * Delta Key Baseplate Tester + Coordinate Receive-Key Tapper + Ad-Bypassing PlatoRelay Auto-Completer
+ * Delta Key Baseplate Tester + Portrait-Locked PlatoRelay & Nousigi Host Key Generator
  * + Always-On-Top Floating Key Watcher Overlay (visible only when outside Pilot app)
  */
 object KeyAutomator {
@@ -46,6 +47,7 @@ object KeyAutomator {
 
     @Volatile var isAppInForeground: Boolean = false
 
+    @Volatile private var mode = "DELTA" // "DELTA" or "NOUSIGI_HOST"
     @Volatile private var inChromePhase = false
     @Volatile private var activeTestPkg = ""
     @Volatile private var startedAtMs = 0L
@@ -55,19 +57,25 @@ object KeyAutomator {
     @Volatile private var lastWebTapMs = 0L
     @Volatile private var lastWebTapSig = ""
     @Volatile private var tasksCompletedCount = 0
-    @Volatile private var fallbackTapCycle = 0
     @Volatile private var waitingForTaskTimer = false
     @Volatile private var onSponsorTabSinceMs = 0L
+    @Volatile private var nousigiPortalUrl = "https://getkey.nousigi.com/"
+    @Volatile private var collectedNousigiKeys = mutableListOf<String>()
     @Volatile private var appCtx: Context? = null
     @Volatile private var completionCb: ((Boolean, String) -> Unit)? = null
 
-    // Floating Always-On-Top Watcher Overlay views
+    @Volatile private var orientationForced = false
+    @Volatile private var savedAccelRotation = "1"
+    @Volatile private var savedUserRotation = "0"
+
     private var overlayRoot: LinearLayout? = null
     private var overlayTitleTv: TextView? = null
     private var overlayStepTv: TextView? = null
 
     private val DELTA_KEY_RX = Regex("""^KEY_[A-Za-z0-9_-]{12,64}$""")
     private val DELTA_KEY_SEARCH_RX = Regex("""\bKEY_[A-Za-z0-9_-]{12,64}\b""")
+    // Matches 24-64 char alphanumeric Luarmor/Nousigi keys on getkey.nousigi.com
+    private val NOUSIGI_KEY_SEARCH_RX = Regex("""\b[A-Za-z0-9]{24,64}\b""")
     private val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
     private val AD_TRAP_KEYWORDS = listOf(
@@ -86,7 +94,6 @@ object KeyAutomator {
         "cancel anytime",
         "phone is infected",
         "virus detected",
-        "cleaner",
         "spin to win",
         "claim your prize",
         "allow notifications"
@@ -94,16 +101,52 @@ object KeyAutomator {
 
     fun isRunning(): Boolean = running.get()
 
-    /** Called by MainActivity.onResume / onPause so the floating overlay only shows when outside Pilot. */
     fun setAppForeground(inForeground: Boolean) {
         isAppInForeground = inForeground
         syncOverlayVisibility()
     }
 
-    /** Immediately aborts any active Baseplate test or Chrome key watcher. */
+    /** Opens a URL directly in full Chrome (used by Config Host buttons for Discord & Linkvertise login). */
+    fun openChromeUrl(url: String) {
+        Thread { openInFullChrome(url, lockPortrait = false) }.start()
+    }
+
+    private fun forcePortraitOrientation() {
+        if (!orientationForced) {
+            val accel = SuShell.exec("settings get system accelerometer_rotation 2>/dev/null").trim()
+            val userRot = SuShell.exec("settings get system user_rotation 2>/dev/null").trim()
+            savedAccelRotation = if (accel == "0" || accel == "1") accel else "1"
+            savedUserRotation = if (userRot in setOf("0", "1", "2", "3")) userRot else "0"
+            orientationForced = true
+        }
+
+        SuShell.exec("settings put system accelerometer_rotation 0 && settings put system user_rotation 0")
+        runCatching { Thread.sleep(450L) }
+
+        val curDims = SuShell.exec("dumpsys window displays 2>/dev/null | grep -oE 'cur=[0-9]+x[0-9]+' | head -n 1")
+        val m = Regex("""cur=(\d+)x(\d+)""").find(curDims)
+        val curW = m?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val curH = m?.groupValues?.get(2)?.toIntOrNull() ?: 0
+        if (curW > 0 && curH > 0 && curW > curH) {
+            SuShell.exec("settings put system user_rotation 1")
+            runCatching { Thread.sleep(450L) }
+        }
+        PilotCore.log("[KEYAUTO] Forced screen orientation to Portrait")
+    }
+
+    private fun restoreOrientation() {
+        if (!orientationForced) return
+        orientationForced = false
+        val rot = savedUserRotation.ifBlank { "0" }
+        val accel = savedAccelRotation.ifBlank { "1" }
+        SuShell.exec("settings put system user_rotation $rot && settings put system accelerometer_rotation $accel")
+        PilotCore.log("[KEYAUTO] Restored screen orientation (user_rotation=$rot, accel=$accel)")
+    }
+
     fun cancel() {
         if (!running.compareAndSet(true, false)) {
             removeFloatingOverlay()
+            restoreOrientation()
             return
         }
         inChromePhase = false
@@ -114,6 +157,7 @@ object KeyAutomator {
         mainHandler.removeCallbacks(keyWatchRunnable)
         completionCb = null
         removeFloatingOverlay()
+        restoreOrientation()
         PilotCore.log("[KEYAUTO] Cancelled active key watcher")
     }
 
@@ -123,7 +167,6 @@ object KeyAutomator {
         return "ACTIVE (${sec}s) — $currentStep"
     }
 
-    /** Deletes any .bak files left behind in Delta folders. */
     fun cleanBakFiles(): Int {
         val countStr = SuShell.exec(
             "cnt=\$(find /storage/emulated/0/Delta -type f -iname '*.bak' 2>/dev/null | wc -l); " +
@@ -133,7 +176,6 @@ object KeyAutomator {
         return countStr.toIntOrNull() ?: 0
     }
 
-    /** Inspects Delta/Autoexecute and Delta/Workspace/Nousigi Hub for the active Nousigi key. */
     fun inspectNousigiKey(ctx: Context): KeyCheckReport {
         val autoKeys = mutableListOf<Triple<String, String, Long>>()
         val autoDirs = listOf("/storage/emulated/0/Delta/Autoexecute", "/storage/emulated/0/Delta/AutoExcecute")
@@ -211,10 +253,6 @@ object KeyAutomator {
         )
     }
 
-    /**
-     * Updates the Nousigi key inside Delta/Autoexecute scripts AND Delta/Workspace/Nousigi Hub key files,
-     * then deletes any .bak files that pop up during the update.
-     */
     fun updateNousigiKeyEverywhere(ctx: Context, rawNewKey: String): Pair<Boolean, String> {
         val newKey = rawNewKey.trim().replace("\"", "").replace("'", "")
         if (newKey.length < 8) return false to "Invalid key: `$newKey` is too short."
@@ -278,7 +316,6 @@ object KeyAutomator {
         return true to "**New Key:** `$newKey`\n\n**Updated Files:**\n$fileList\n\n🧹 **Cleaned `.bak` files:** `$deletedBaks` removed"
     }
 
-    /** Inspects Delta's saved key in Delta/Internals and calculates its 24h elapsed/remaining time. */
     fun inspectDeltaKey(ctx: Context): KeyCheckReport {
         val candidates = SuShell.execLines(
             "find '/storage/emulated/0/Delta/Internals' '/storage/emulated/0/Delta' -maxdepth 3 -type f \\( -iname '*key*' -o -iname '*auth*' -o -iname '*license*' \\) 2>/dev/null"
@@ -461,7 +498,11 @@ object KeyAutomator {
             val titleTv = overlayTitleTv ?: return@post
             val stepTv = overlayStepTv ?: return@post
             val sec = ((System.currentTimeMillis() - startedAtMs) / 1000L).coerceAtLeast(0L)
-            titleTv.text = "🔑 KEY WATCHER • ${sec}s (Tasks: $tasksCompletedCount)"
+            titleTv.text = if (mode == "NOUSIGI_HOST") {
+                "👑 HOST KEY GEN • ${sec}s (${collectedNousigiKeys.size}/5)"
+            } else {
+                "🔑 KEY WATCHER • ${sec}s (Tasks: $tasksCompletedCount)"
+            }
             stepTv.text = currentStep
             syncOverlayVisibility()
         }
@@ -497,10 +538,6 @@ object KeyAutomator {
         return t.startsWith("http") && (t.contains("platorelay.com") || t.contains("platoboost"))
     }
 
-    /**
-     * Taps Delta's 'Receive Key' button rendered inside Roblox's SurfaceView by computing its exact
-     * position within the clone's outer window bounds (right-side 'Welcome Back!' panel, below 'Continue').
-     */
     private fun tapDeltaReceiveKeyInWindow(pkg: String): Boolean {
         if (pkg.isBlank()) return false
         var win = PilotCore.findOuterWindowBounds(pkg)
@@ -527,7 +564,6 @@ object KeyAutomator {
         return true
     }
 
-    /** Dumps UI XML using --compressed so Chrome web animations don't trigger idle-state timeouts. */
     private fun dumpUiXmlCompressed(): String {
         val out = SuShell.exec("rm -f /sdcard/pilot_ui.xml && uiautomator dump --compressed /sdcard/pilot_ui.xml 2>&1")
         if (!out.contains("UI hierchary dumped", ignoreCase = true) &&
@@ -538,15 +574,72 @@ object KeyAutomator {
         return SuShell.exec("cat /sdcard/pilot_ui.xml 2>/dev/null")
     }
 
-    /** Checks if XML or window title matches a fake pop-up ad trap (e.g. vpnapptoggle.com/?pbt=Continue). */
+    private fun readChromeNewestTabStrings(): String {
+        return SuShell.exec(
+            "newest=\$(ls -t /data/data/com.android.chrome/app_tabs/0/tab* 2>/dev/null | head -n 1); " +
+            "[ -n \"\$newest\" ] && strings \"\$newest\" 2>/dev/null | tail -n 30"
+        )
+    }
+
     private fun isFakeAdTrap(rawText: String): Boolean {
         if (rawText.isBlank()) return false
         val low = rawText.lowercase()
         return AD_TRAP_KEYWORDS.any { low.contains(it) }
     }
 
-    /** Closes a pop-up ad or completed task tab via KEYCODE_BACK and verifies we return to PlatoRelay. */
-    private fun closeChromeTabAndReturnToPlato(ctx: Context, stepLabel: String) {
+    private fun findWhiteContinueButtonByPixels(ctx: Context): Pair<Int, Int>? {
+        val snapPath = File(ctx.cacheDir, "key_scan_${System.nanoTime()}.png").absolutePath
+        SuShell.exec("screencap -p '$snapPath' && chmod 666 '$snapPath'")
+        val file = File(snapPath)
+        if (!file.exists() || file.length() == 0L) return null
+
+        return try {
+            val bmp = BitmapFactory.decodeFile(snapPath) ?: return null
+            val w = bmp.width
+            val h = bmp.height
+            val cx = w / 2
+
+            val leftMarginPx = bmp.getPixel((w * 0.08f).toInt(), (h * 0.50f).toInt())
+            val rightMarginPx = bmp.getPixel((w * 0.92f).toInt(), (h * 0.50f).toInt())
+            val isDarkBg = Color.red(leftMarginPx) < 35 && Color.green(leftMarginPx) < 35 &&
+                Color.red(rightMarginPx) < 35 && Color.green(rightMarginPx) < 35
+            if (!isDarkBg) {
+                bmp.recycle()
+                return null
+            }
+
+            val yStart = (h * 0.40f).toInt()
+            val yEnd = (h * 0.88f).toInt()
+            var runStart = -1
+            var foundCenterY = -1
+
+            for (y in yStart..yEnd) {
+                val p = bmp.getPixel(cx, y)
+                val isWhite = Color.red(p) > 220 && Color.green(p) > 220 && Color.blue(p) > 220
+                if (isWhite) {
+                    if (runStart < 0) runStart = y
+                } else {
+                    if (runStart >= 0) {
+                        val bandH = y - runStart
+                        if (bandH in 24..115) {
+                            val leftSide = bmp.getPixel((cx - 70).coerceAtLeast(10), (runStart + y) / 2)
+                            val rightSide = bmp.getPixel((cx + 70).coerceAtMost(w - 10), (runStart + y) / 2)
+                            if (Color.red(leftSide) > 210 && Color.red(rightSide) > 210) {
+                                foundCenterY = (runStart + y) / 2
+                            }
+                        }
+                        runStart = -1
+                    }
+                }
+            }
+            bmp.recycle()
+            if (foundCenterY > 0) cx to foundCenterY else null
+        } finally {
+            file.delete()
+        }
+    }
+
+    private fun closeChromeTabAndReturnToMain(ctx: Context, stepLabel: String, mainUrl: String) {
         onSponsorTabSinceMs = 0L
         waitingForTaskTimer = false
         lastWebTapSig = ""
@@ -555,47 +648,143 @@ object KeyAutomator {
         Thread.sleep(1300L)
 
         val checkXml = dumpUiXmlCompressed()
-        if (isFakeAdTrap(checkXml)) {
+        val tabStr = readChromeNewestTabStrings()
+        if (isFakeAdTrap(checkXml) || isFakeAdTrap(tabStr)) {
             SuShell.exec("input keyevent 4")
             Thread.sleep(1000L)
         }
-        val backOnPlato = checkXml.contains("platorelay.com", ignoreCase = true) ||
-            checkXml.contains("platoboost.com", ignoreCase = true) ||
-            checkXml.contains("Delta Android Keysystem", ignoreCase = true)
-        if (!backOnPlato && checkXml.isNotEmpty()) {
-            SuShell.exec("input keyevent 4")
-            Thread.sleep(1000L)
-            val savedUrl = Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
-            if (savedUrl.isNotBlank()) {
-                val check2 = dumpUiXmlCompressed()
-                if (!check2.contains("platorelay.com", ignoreCase = true) &&
-                    !check2.contains("platoboost.com", ignoreCase = true) &&
-                    !check2.contains("Delta Android Keysystem", ignoreCase = true)
-                ) {
-                    openInFullChrome(savedUrl)
-                }
-            }
+        val combined = "$checkXml\n$tabStr"
+        val backOnTarget = combined.contains("platorelay.com", ignoreCase = true) ||
+            combined.contains("platoboost.com", ignoreCase = true) ||
+            combined.contains("nousigi", ignoreCase = true) ||
+            combined.contains("Delta Android Keysystem", ignoreCase = true)
+        if (!backOnTarget && combined.isNotBlank() && mainUrl.isNotBlank()) {
+            openInFullChrome(mainUrl, lockPortrait = true)
         }
     }
 
-    /**
-     * Automates PlatoRelay / Platoboost in Chrome with full pop-up ad detection:
-     * 1) Immediately detects fake ad pages (vpnapptoggle.com/?pbt=Continue, 7-day Trial, €0.00, etc.)
-     *    and closes the ad tab with zero wait—never clicking the ad's fake Continue button.
-     * 2) Never blind-taps Continue if uiautomator XML is empty unless window title confirms PlatoRelay.
-     * 3) Waits 11s ONLY when an actual task tab was opened; scrapes KEY_... directly or taps Copy Key.
-     */
+    /** Automates Nousigi Host Key Generation (up to 5 keys) in Chrome after Discord & Linkvertise login. */
+    private fun processNousigiHostStep(ctx: Context) {
+        val now = System.currentTimeMillis()
+        val xml = dumpUiXmlCompressed()
+        val tabStrings = readChromeNewestTabStrings()
+        val combined = "$xml\n$tabStrings"
+
+        // Scrape any newly generated Nousigi / Luarmor key from page or clipboard
+        val clip = readClipboard(ctx).trim()
+        val clipCandidate = if (clip != previousKeySnapshot && NOUSIGI_KEY_SEARCH_RX.matches(clip) && !clip.startsWith("KEY_")) clip else null
+        val xmlKeyMatch = Regex("""(?:Key|key|Token)["'\s:>]+([A-Za-z0-9]{24,64})""").find(xml)?.groupValues?.get(1)
+        val foundKey = clipCandidate ?: xmlKeyMatch
+
+        if (foundKey != null && foundKey !in collectedNousigiKeys && !foundKey.contains("nousigi", true)) {
+            collectedNousigiKeys.add(foundKey)
+            previousKeySnapshot = foundKey
+            val cl = PilotCore.getCloud(ctx)
+            val entries = PilotCore.setKeyHostPool(ctx, cl, collectedNousigiKeys)
+            if (entries.size == 1) {
+                updateNousigiKeyEverywhere(ctx, entries[0].key)
+            }
+            updateStep("Host Key ${collectedNousigiKeys.size}/5 captured!")
+            if (collectedNousigiKeys.size >= 5) {
+                finishFlow(
+                    true,
+                    "👑 Collected **5/5** Nousigi keys on **$cl** (Slot `1/5` applied to Host). Run `!distributekeys` to send Slots `2–5` to your 4 worker phones!"
+                )
+                return
+            }
+            // Reload portal to generate the next key in the 5-key pool
+            Thread.sleep(1200L)
+            openInFullChrome(nousigiPortalUrl, lockPortrait = true)
+            return
+        }
+
+        if (isFakeAdTrap(combined)) {
+            closeChromeTabAndReturnToMain(ctx, "Blocked ad redirect -> returning to Nousigi...", nousigiPortalUrl)
+            return
+        }
+
+        val isLinkvertise = combined.contains("linkvertise.com", ignoreCase = true)
+        if (isLinkvertise) {
+            if (onSponsorTabSinceMs == 0L) onSponsorTabSinceMs = now
+            val waited = (now - onSponsorTabSinceMs) / 1000L
+            if (waited < 10L) {
+                updateStep("Linkvertise (${collectedNousigiKeys.size}/5): Waiting ${10L - waited}s...")
+                return
+            }
+        } else {
+            onSponsorTabSinceMs = 0L
+        }
+
+        if (xml.isBlank()) {
+            updateStep("Chrome (Host ${collectedNousigiKeys.size}/5): Scanning Nousigi portal...")
+            return
+        }
+
+        data class UiNode(val label: String, val cx: Int, val cy: Int, val enabled: Boolean)
+        val nodes = mutableListOf<UiNode>()
+        val nodeRx = Regex("""<node\b([^>]+)>""")
+        val textRx = Regex("""\btext="([^"]*)"""")
+        val descRx = Regex("""\bcontent-desc="([^"]*)"""")
+        val enRx = Regex("""\benabled="(true|false)"""")
+        val boundsRx = Regex("""\bbounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"""")
+
+        for (m in nodeRx.findAll(xml)) {
+            val attrs = m.groupValues[1]
+            val bm = boundsRx.find(attrs) ?: continue
+            val l = bm.groupValues[1].toInt()
+            val t = bm.groupValues[2].toInt()
+            val r = bm.groupValues[3].toInt()
+            val b = bm.groupValues[4].toInt()
+            if (r - l < 18 || b - t < 14) continue
+            val txt = textRx.find(attrs)?.groupValues?.get(1).orEmpty().trim()
+            val desc = descRx.find(attrs)?.groupValues?.get(1).orEmpty().trim()
+            val label = txt.ifEmpty { desc }
+            if (label.isNotEmpty()) {
+                val enabled = enRx.find(attrs)?.groupValues?.get(1) != "false"
+                nodes.add(UiNode(label, (l + r) / 2, (t + b) / 2, enabled))
+            }
+        }
+
+        val patterns = listOf(
+            "copy key",
+            "copy",
+            "get key",
+            "generate key",
+            "create key",
+            "free access",
+            "continue",
+            "authorize",
+            "verify you are human",
+            "i am human",
+            "next",
+            "get started"
+        )
+        for (pat in patterns) {
+            val hit = nodes.firstOrNull { n ->
+                val low = n.label.lowercase()
+                n.enabled && n.cy > 90 && (low == pat || (pat.length >= 6 && low.contains(pat)))
+            }
+            if (hit != null) {
+                tapNodeIfReady(hit.label, hit.cx, hit.cy, "Host (${collectedNousigiKeys.size}/5): Tapping '${hit.label.take(22)}'...")
+                return
+            }
+        }
+
+        updateStep("Host (${collectedNousigiKeys.size}/5): Waiting on Nousigi / Linkvertise...")
+    }
+
     private fun processChromePlatoRelayStep(ctx: Context): String? {
         val now = System.currentTimeMillis()
         val focusInfo = SuShell.exec(
-            "dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp|Window #' | head -n 8"
+            "dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 3"
         )
         val xml = dumpUiXmlCompressed()
+        val tabStrings = readChromeNewestTabStrings()
+        val combinedContext = "$xml\n$tabStrings"
 
         val isRobloxInFront = focusInfo.contains("com.roblox.clien") || xml.contains("package=\"com.roblox.clien")
         val isChromeInFront = focusInfo.contains("com.android.chrome") || xml.contains("package=\"com.android.chrome\"") || xml.contains("url_bar")
 
-        // 1. If Roblox is still in front and Chrome hasn't opened yet, re-tap Receive Key
         if (isRobloxInFront && !isChromeInFront && activeTestPkg.isNotEmpty()) {
             if (now - lastWebTapMs >= 3500L) {
                 lastWebTapMs = now
@@ -605,34 +794,7 @@ object KeyAutomator {
             return null
         }
 
-        // 2. If uiautomator dump returned empty on Chrome, check window title before tapping anything
-        if (xml.isBlank()) {
-            if (isFakeAdTrap(focusInfo)) {
-                closeChromeTabAndReturnToPlato(ctx, "Ad popup detected in window -> closing tab...")
-                return null
-            }
-            val confirmedPlatoWindow = focusInfo.contains("Delta Android Keysystem", ignoreCase = true) ||
-                focusInfo.contains("platorelay", ignoreCase = true) ||
-                focusInfo.contains("platoboost", ignoreCase = true)
-            if (!confirmedPlatoWindow) {
-                // Never blind-tap when we cannot verify we're on PlatoRelay (avoids clicking VPN/ad Continue buttons)
-                updateStep("Chrome: Waiting for page tree (protecting against ad tabs)...")
-                return null
-            }
-            val (w, h) = PilotCore.getDisplaySize()
-            if (now - lastWebTapMs >= 3500L) {
-                lastWebTapMs = now
-                val tapX = (w * 0.50f).toInt()
-                val tapY = if (fallbackTapCycle % 2 == 0) (h * 0.78f).toInt() else (h * 0.83f).toInt()
-                fallbackTapCycle += 1
-                updateStep("Chrome: Tapping PlatoRelay Continue ($tapX, $tapY)...")
-                SuShell.exec("input tap $tapX $tapY")
-            }
-            return null
-        }
-
-        // 3. Check if KEY_... is already displayed anywhere on screen
-        val directKey = DELTA_KEY_SEARCH_RX.find(xml)?.value
+        val directKey = DELTA_KEY_SEARCH_RX.find(combinedContext)?.value
         if (directKey != null && directKey != previousKeySnapshot) {
             onSponsorTabSinceMs = 0L
             waitingForTaskTimer = false
@@ -640,26 +802,50 @@ object KeyAutomator {
             return directKey
         }
 
-        // 4. Immediately detect and close fake pop-up ad traps (e.g. vpnapptoggle.com/?pbt=Continue)
-        if (isFakeAdTrap(xml)) {
-            closeChromeTabAndReturnToPlato(ctx, "Blocked fake ad redirect -> closing tab...")
+        val savedPlato = Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim()
+
+        if (isFakeAdTrap(combinedContext)) {
+            closeChromeTabAndReturnToMain(ctx, "Blocked fake ad redirect -> closing tab...", savedPlato)
             return null
         }
 
-        val isOnPlatoHost = xml.contains("platorelay.com", ignoreCase = true) ||
-            xml.contains("platoboost.com", ignoreCase = true) ||
-            xml.contains("auth.platorelay", ignoreCase = true) ||
-            xml.contains("Delta Android Keysystem", ignoreCase = true)
+        val isOnPlatoHost = combinedContext.contains("platorelay.com", ignoreCase = true) ||
+            combinedContext.contains("platoboost.com", ignoreCase = true) ||
+            combinedContext.contains("auth.platorelay", ignoreCase = true) ||
+            combinedContext.contains("Delta Android Keysystem", ignoreCase = true)
 
-        // 5. Handle non-PlatoRelay tabs in Chrome
-        if (isChromeInFront && !isOnPlatoHost) {
-            // If we did NOT click a task button (e.g. clicking Continue spawned a pop-up ad tab), close it immediately!
-            if (!waitingForTaskTimer) {
-                closeChromeTabAndReturnToPlato(ctx, "Pop-up ad tab opened -> closing immediately...")
+        if (xml.isBlank()) {
+            if (isChromeInFront && !isOnPlatoHost && tabStrings.isNotBlank()) {
+                if (!waitingForTaskTimer) {
+                    closeChromeTabAndReturnToMain(ctx, "Pop-up ad tab opened -> closing immediately...", savedPlato)
+                    return null
+                }
+                if (onSponsorTabSinceMs == 0L) onSponsorTabSinceMs = now
+                val waitedSec = (now - onSponsorTabSinceMs) / 1000L
+                if (waitedSec < 11L) {
+                    updateStep("Task #${tasksCompletedCount + 1}: Waiting ${11L - waitedSec}s on task tab...")
+                    return null
+                }
+                tasksCompletedCount += 1
+                closeChromeTabAndReturnToMain(ctx, "Task #$tasksCompletedCount done! Closing tab...", savedPlato)
                 return null
             }
 
-            // Otherwise, we clicked a legitimate task -> wait 11 seconds then close the task tab
+            val whiteBtn = findWhiteContinueButtonByPixels(ctx)
+            if (whiteBtn != null) {
+                tapNodeIfReady("white_continue_px", whiteBtn.first, whiteBtn.second, "Chrome: Tapping white Continue (${whiteBtn.first}, ${whiteBtn.second})...")
+            } else {
+                updateStep("Chrome: Scanning portrait screen for Continue / key...")
+            }
+            return null
+        }
+
+        if (isChromeInFront && !isOnPlatoHost) {
+            if (!waitingForTaskTimer) {
+                closeChromeTabAndReturnToMain(ctx, "Pop-up ad tab opened -> closing immediately...", savedPlato)
+                return null
+            }
+
             if (onSponsorTabSinceMs == 0L) {
                 onSponsorTabSinceMs = now
             }
@@ -671,19 +857,17 @@ object KeyAutomator {
             }
 
             tasksCompletedCount += 1
-            closeChromeTabAndReturnToPlato(ctx, "Task #$tasksCompletedCount done! Closing tab -> PlatoRelay...")
+            closeChromeTabAndReturnToMain(ctx, "Task #$tasksCompletedCount done! Closing tab -> PlatoRelay...", savedPlato)
             return null
         }
 
-        // Back on PlatoRelay
         onSponsorTabSinceMs = 0L
         waitingForTaskTimer = false
 
-        // Save PlatoRelay URL from Chrome's address bar if visible
-        val urlMatch = Regex("""https?://(?:auth\.platorelay\.com|gateway\.platoboost\.com)/[^\s"<']+""").find(xml)
+        val urlMatch = Regex("""https?://(?:auth\.platorelay\.com|gateway\.platoboost\.com)/[^\s"<']+""").find(combinedContext)
         if (urlMatch != null) {
             val foundUrl = urlMatch.value
-            if (Rejoiner.loadConfig(ctx).deltaPlatoUrl.trim() != foundUrl) {
+            if (savedPlato != foundUrl) {
                 Rejoiner.saveConfig(ctx, Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = foundUrl))
             }
         }
@@ -714,7 +898,6 @@ object KeyAutomator {
             nodes.add(UiNode(label, (l + r) / 2, (t + b) / 2, enabled))
         }
 
-        // Priority 1: Copy Key / Create Key / Get Key
         val finishPatterns = listOf("copy key", "copy", "create key", "get key")
         for (pat in finishPatterns) {
             val hit = nodes.firstOrNull { n ->
@@ -727,7 +910,6 @@ object KeyAutomator {
             }
         }
 
-        // Priority 2: Chrome first-run dialogs
         val chromePrompts = listOf("accept & continue", "use without an account", "no thanks", "got it")
         for (pat in chromePrompts) {
             val hit = nodes.firstOrNull { n -> n.label.lowercase().contains(pat) && n.cy > 90 }
@@ -737,7 +919,6 @@ object KeyAutomator {
             }
         }
 
-        // Priority 3: Uncompleted Task buttons (Complete [not Completed], Visit, Read, Watch, Discover, Open, Start)
         val uncompletedTask = nodes.firstOrNull { n ->
             val low = n.label.lowercase()
             n.enabled && n.cy > 110 &&
@@ -769,7 +950,6 @@ object KeyAutomator {
             return null
         }
 
-        // Priority 4: Cloudflare Turnstile / Human Verification + Continue / Proceed / Unlock
         val verifyAndContinuePatterns = listOf(
             "verify you are human",
             "i am human",
@@ -791,14 +971,10 @@ object KeyAutomator {
             }
         }
 
-        // Fallback if Delta Android Keysystem is confirmed in XML but Continue node lacked a text label
-        if (xml.contains("Delta Android Keysystem", ignoreCase = true) || xml.contains("Completed 0 of", ignoreCase = true)) {
-            val (w, h) = PilotCore.getDisplaySize()
-            val tapX = (w * 0.50f).toInt()
-            val tapY = if (fallbackTapCycle % 2 == 0) (h * 0.78f).toInt() else (h * 0.83f).toInt()
-            fallbackTapCycle += 1
+        val whiteBtn = findWhiteContinueButtonByPixels(ctx)
+        if (whiteBtn != null) {
             waitingForTaskTimer = false
-            tapNodeIfReady("continue_coord", tapX, tapY, "Chrome: Tapping PlatoRelay Continue ($tapX, $tapY)...")
+            tapNodeIfReady("white_continue_px", whiteBtn.first, whiteBtn.second, "Chrome: Tapping white Continue (${whiteBtn.first}, ${whiteBtn.second})...")
             return null
         }
 
@@ -822,13 +998,26 @@ object KeyAutomator {
             if (!running.get()) return
             refreshOverlayText()
 
-            if (System.currentTimeMillis() - startedAtMs > 150_000L) {
-                finishFlow(false, "Timed out after 150s (last step: $currentStep) — returning control to Rejoiner.")
+            val timeoutMs = if (mode == "NOUSIGI_HOST") 300_000L else 150_000L
+            if (System.currentTimeMillis() - startedAtMs > timeoutMs) {
+                if (mode == "NOUSIGI_HOST" && collectedNousigiKeys.isNotEmpty()) {
+                    finishFlow(true, "Saved **${collectedNousigiKeys.size}/5** Nousigi key(s) into Host Pool.")
+                } else {
+                    finishFlow(false, "Timed out (last step: $currentStep) — returning control.")
+                }
                 return
             }
 
             val ctx = appCtx
             if (ctx != null) {
+                if (mode == "NOUSIGI_HOST") {
+                    Thread {
+                        if (running.get()) processNousigiHostStep(ctx)
+                    }.start()
+                    mainHandler.postDelayed(this, 2000L)
+                    return
+                }
+
                 val clip = readClipboard(ctx).trim()
                 if (clip.isNotEmpty() && clip != previousKeySnapshot) {
                     val token = extractDeltaKey(clip)
@@ -855,11 +1044,32 @@ object KeyAutomator {
         }
     }
 
-    /**
-     * Tests Delta key on Baseplate (123974602339071) using ONLY a logged-in clone.
-     * Taps 'Receive Key' inside Roblox, bypasses pop-up ad tabs immediately, completes tasks,
-     * taps Verify Human, and applies KEY_...
-     */
+    /** Starts automated 5-Key Nousigi Host generation in Chrome (after Discord & Linkvertise login). */
+    fun startNousigiKeyGeneration(ctx: Context, portalUrl: String = "https://getkey.nousigi.com/"): Boolean {
+        cancel()
+        if (!running.compareAndSet(false, true)) return false
+
+        mode = "NOUSIGI_HOST"
+        appCtx = ctx.applicationContext
+        nousigiPortalUrl = portalUrl.trim().ifBlank { "https://getkey.nousigi.com/" }
+        collectedNousigiKeys = PilotCore.getKeyPool(ctx).map { it.key }.toMutableList()
+        inChromePhase = true
+        lastLoggedStep = ""
+        lastWebTapMs = 0L
+        lastWebTapSig = ""
+        onSponsorTabSinceMs = 0L
+        startedAtMs = System.currentTimeMillis()
+        showFloatingOverlay(ctx.applicationContext)
+
+        Thread {
+            previousKeySnapshot = readClipboard(ctx).trim()
+            updateStep("Opening Nousigi Key Portal (${collectedNousigiKeys.size}/5)...")
+            openInFullChrome(nousigiPortalUrl, lockPortrait = true)
+            mainHandler.postDelayed(keyWatchRunnable, 2200L)
+        }.start()
+        return true
+    }
+
     fun startDeltaRenewal(
         ctx: Context,
         explicitUrl: String = "",
@@ -869,6 +1079,7 @@ object KeyAutomator {
             PilotCore.log("[KEYAUTO] Already running ($currentStep)...")
             return false
         }
+        mode = "DELTA"
         appCtx = ctx.applicationContext
         inChromePhase = false
         activeTestPkg = ""
@@ -876,7 +1087,6 @@ object KeyAutomator {
         lastWebTapMs = 0L
         lastWebTapSig = ""
         tasksCompletedCount = 0
-        fallbackTapCycle = 0
         waitingForTaskTimer = false
         onSponsorTabSinceMs = 0L
         completionCb = onDone
@@ -884,6 +1094,8 @@ object KeyAutomator {
         showFloatingOverlay(ctx.applicationContext)
 
         Thread {
+            forcePortraitOrientation()
+
             val currentClip = readClipboard(ctx).trim()
             previousKeySnapshot = currentClip
 
@@ -892,8 +1104,8 @@ object KeyAutomator {
             if (directUrl.isNotBlank()) {
                 Rejoiner.saveConfig(ctx, Rejoiner.loadConfig(ctx).copy(deltaPlatoUrl = directUrl))
                 inChromePhase = true
-                updateStep("Chrome: Scanning PlatoRelay...")
-                openInFullChrome(directUrl)
+                updateStep("Chrome (Portrait): Scanning PlatoRelay...")
+                openInFullChrome(directUrl, lockPortrait = true)
                 mainHandler.postDelayed(keyWatchRunnable, 1800L)
                 return@Thread
             }
@@ -933,13 +1145,12 @@ object KeyAutomator {
             tapDeltaReceiveKeyInWindow(testSlot.pkg)
             Thread.sleep(1500L)
             inChromePhase = true
-            updateStep("Chrome: Scanning PlatoRelay...")
+            updateStep("Chrome (Portrait): Scanning PlatoRelay...")
             mainHandler.postDelayed(keyWatchRunnable, 1500L)
         }.start()
         return true
     }
 
-    /** Applies a pasted Delta key, PlatoRelay URL, or Nousigi key. */
     fun applyManualKey(ctx: Context, rawInput: String): Pair<Boolean, String> {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return false to "Clipboard/input is empty."
@@ -985,7 +1196,8 @@ object KeyAutomator {
         }.start()
     }
 
-    private fun openInFullChrome(url: String) {
+    private fun openInFullChrome(url: String, lockPortrait: Boolean = true) {
+        if (lockPortrait) forcePortraitOrientation()
         val safeUrl = url.replace("'", "%27")
         val res = SuShell.exec(
             "am start -a android.intent.action.VIEW -d '$safeUrl' -p com.android.chrome >/dev/null 2>&1 && echo CHROME_OK"
@@ -1037,6 +1249,7 @@ object KeyAutomator {
     private fun finishFlow(ok: Boolean, msg: String) {
         if (!running.compareAndSet(true, false)) {
             removeFloatingOverlay()
+            restoreOrientation()
             return
         }
         inChromePhase = false
@@ -1046,6 +1259,7 @@ object KeyAutomator {
         currentStep = if (ok) "Completed" else "Failed"
         mainHandler.removeCallbacks(keyWatchRunnable)
         removeFloatingOverlay()
+        restoreOrientation()
         PilotCore.log("[KEYAUTO] ${if (ok) "SUCCESS" else "FAIL"}: $msg")
         PilotCore.onAlert?.invoke(if (ok) "🔑 Key Status" else "⚠️ Key Watcher Alert", msg)
         val cb = completionCb

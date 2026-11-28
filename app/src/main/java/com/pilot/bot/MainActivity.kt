@@ -29,7 +29,6 @@ class TelemetryArcView(context: Context) : View(context) {
     var ramPct: Float = 0f
     var activeSlots: Int = 0
     var totalSlots: Int = 4
-    var labelRight: String = "0 MB FREE"
 
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -68,7 +67,6 @@ class TelemetryArcView(context: Context) : View(context) {
         val r = (h * 0.36f).coerceAtMost(48f)
         val cy = h * 0.52f
 
-        // Left Arc: RAM Load
         val cx1 = width * 0.25f
         val rect1 = RectF(cx1 - r, cy - r, cx1 + r, cy + r)
         canvas.drawArc(rect1, 135f, 270f, false, trackPaint)
@@ -81,7 +79,6 @@ class TelemetryArcView(context: Context) : View(context) {
         canvas.drawText("${ramPct.toInt()}%", cx1, cy + 7f, numPaint)
         canvas.drawText("RAM", cx1, cy + r + 14f, subPaint)
 
-        // Right Arc: Active Fleet Slots
         val cx2 = width * 0.75f
         val rect2 = RectF(cx2 - r, cy - r, cx2 + r, cy + r)
         canvas.drawArc(rect2, 135f, 270f, false, trackPaint)
@@ -117,14 +114,21 @@ class MainActivity : Activity() {
     private lateinit var allowedIdsInput: EditText
     private lateinit var cloudInput: EditText
     private lateinit var updateUrlInput: EditText
+    private lateinit var autoStartBotSwitch: Switch
+
+    // 5-Key Host Mode inputs
+    private lateinit var keyHostSwitch: Switch
+    private lateinit var hostActionsContainer: LinearLayout
+    private lateinit var nousigiGetUrlInput: EditText
+    private lateinit var hostPoolSummaryTv: TextView
 
     // Rejoiner & Delta Key inputs
+    private lateinit var autoRejoinSwitch: Switch
     private lateinit var gameSpinner: Spinner
     private lateinit var placeIdInput: EditText
     private lateinit var vipInput: EditText
     private lateinit var fpsSwitch: Switch
     private lateinit var render3dSwitch: Switch
-    private lateinit var bootSwitch: Switch
     private lateinit var keyPathInput: EditText
     private lateinit var deltaSwitch: Switch
     private lateinit var deltaUrlInput: EditText
@@ -143,11 +147,21 @@ class MainActivity : Activity() {
         buildHud()
         loadFieldsFromPrefs()
 
-        // Auto-start ONLY if the user previously started the bot (never immediately after Apply Code)
         if (PilotCore.shouldAutoStart(this) && PilotCore.getToken(this).isNotEmpty() && !PilotCore.isRunning) {
             PilotCore.startService(this)
         }
         uiHandler.post(refreshTick)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        KeyAutomator.setAppForeground(true)
+        refreshHostPoolSummary()
+    }
+
+    override fun onPause() {
+        KeyAutomator.setAppForeground(false)
+        super.onPause()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -169,7 +183,6 @@ class MainActivity : Activity() {
             setPadding(dp(10), dp(8), dp(10), dp(8))
         }
 
-        // Tactical Top Header
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -204,7 +217,6 @@ class MainActivity : Activity() {
         header.addView(statusPill)
         root.addView(header)
 
-        // 3-Tab Tactical Dock
         val dock = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -219,7 +231,6 @@ class MainActivity : Activity() {
         dock.addView(tabConsoleBtn)
         root.addView(dock)
 
-        // Stacked Panes
         val frame = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
@@ -256,7 +267,6 @@ class MainActivity : Activity() {
     private fun buildFleetTab(): LinearLayout {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // Reactor Power + Arc Telemetry Card
         val reactorCard = makeCard("REACTOR POWER & SYSTEM TELEMETRY")
         powerBtn = Button(this).apply {
             textSize = 13f
@@ -265,6 +275,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 if (PilotCore.isRunning) {
                     PilotCore.setShouldAutoStart(this@MainActivity, false)
+                    autoStartBotSwitch.isChecked = false
                     Rejoiner.stop()
                     PilotCore.stopService(this@MainActivity)
                     toast("Bot hard-stopped")
@@ -275,7 +286,6 @@ class MainActivity : Activity() {
                             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                         }
                     }
-                    PilotCore.setShouldAutoStart(this@MainActivity, true)
                     Thread { PilotCore.autoGrantRootAndPerms(this@MainActivity) }.start()
                     PilotCore.startService(this@MainActivity)
                 }
@@ -291,7 +301,6 @@ class MainActivity : Activity() {
         }
         reactorCard.addView(arcGauge)
 
-        // Quick Fleet Controls Row 1
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -317,7 +326,6 @@ class MainActivity : Activity() {
         })
         reactorCard.addView(row1)
 
-        // Quick Key Controls Row 2
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -341,7 +349,6 @@ class MainActivity : Activity() {
         reactorCard.addView(row2)
         col.addView(reactorCard)
 
-        // Key Watcher Live Banner
         val keyCard = makeCard("KEY WATCHER & EXECUTOR STATUS")
         keyStatusText = TextView(this).apply {
             textSize = 11f
@@ -352,7 +359,6 @@ class MainActivity : Activity() {
         keyCard.addView(keyStatusText)
         col.addView(keyCard)
 
-        // Live 4-Slot Matrix
         val matrixCard = makeCard("ROBLOX CLONE SLOT MATRIX")
         slotMatrixContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         matrixCard.addView(slotMatrixContainer)
@@ -378,7 +384,6 @@ class MainActivity : Activity() {
                 toast("Paste a sync code first")
             } else {
                 Thread {
-                    // startSvc = false -> saves settings & permissions, waits for START BOT tap
                     val (ok, _) = PilotCore.applyCode(this, code, startSvc = false)
                     uiHandler.post {
                         if (ok) {
@@ -404,6 +409,7 @@ class MainActivity : Activity() {
         allowedIdsInput = makeInput("Allowed User/Role IDs (comma-separated)")
         cloudInput = makeInput("Cloud Phone Name (e.g. Cloud Phone 30)")
         updateUrlInput = makeInput("Google Drive APK Update URL (optional)")
+        autoStartBotSwitch = makeSwitch("Auto-Start Discord Bot (On App Open & Device Reboot)")
 
         idCard.addView(syncCodeInput)
         idCard.addView(codeRow)
@@ -411,9 +417,89 @@ class MainActivity : Activity() {
         idCard.addView(allowedIdsInput)
         idCard.addView(cloudInput)
         idCard.addView(updateUrlInput)
+        idCard.addView(autoStartBotSwitch)
         col.addView(idCard)
 
+        // 5-Key Host Mode Card
+        val hostCard = makeCard("👑 5-KEY HOST MODE (1 HOST → 5 UGPHONES)")
+        keyHostSwitch = makeSwitch("Turn On as Key Host (Manages 5 Nousigi Keys)")
+        keyHostSwitch.setOnCheckedChangeListener { _, isChecked ->
+            PilotCore.setKeyHostFlag(this, isChecked)
+            hostActionsContainer.visibility = if (isChecked) View.VISIBLE else View.GONE
+            refreshHostPoolSummary()
+        }
+        hostCard.addView(keyHostSwitch)
+
+        hostActionsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = if (PilotCore.isKeyHost(this@MainActivity)) View.VISIBLE else View.GONE
+        }
+
+        hostActionsContainer.addView(TextView(this).apply {
+            text = "1) Login to Discord & Linkvertise in Chrome first, then tap Start Get Nousigi Key:"
+            textSize = 11f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(4), 0, dp(6))
+        })
+
+        // Row 1: Login Discord + Login Linkvertise
+        val loginRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        loginRow.addView(makeSmallBtn("💬 1. LOGIN DISCORD", "#4F46E5") {
+            KeyAutomator.openChromeUrl("https://discord.com/login")
+            toast("Opened Discord login in Chrome")
+        })
+        loginRow.addView(makeSmallBtn("🔗 2. LOGIN LINKVERTISE", "#D97706") {
+            KeyAutomator.openChromeUrl("https://publisher.linkvertise.com/login")
+            toast("Opened Linkvertise login in Chrome")
+        })
+        hostActionsContainer.addView(loginRow)
+
+        nousigiGetUrlInput = makeInput("Nousigi Key Portal / Discord Link (default: getkey.nousigi.com)")
+
+        // Row 2: Start Get Nousigi Key + Distribute to Other 4 Phones
+        val genRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        genRow.addView(makeSmallBtn("🔑 3. START GET NOUSIGI KEY", "#15803D") {
+            saveFieldsSilent()
+            val portalUrl = nousigiGetUrlInput.text.toString().trim().ifBlank { "https://getkey.nousigi.com/" }
+            KeyAutomator.startNousigiKeyGeneration(this, portalUrl)
+            toast("Starting Nousigi Key Generator (5-Key Host Pool)...")
+        })
+        genRow.addView(makeSmallBtn("📡 SEND TO 4 PHONES", "#0284C7") {
+            val ch = PilotCore.getSsChannel(this)
+            if (ch.isEmpty()) {
+                toast("Run !sschannel in Discord first so Host knows the channel")
+            } else {
+                Thread {
+                    PilotCore.triggerDistributeFromHud(this)
+                    uiHandler.post { toast("Triggered !distributekeys in Discord!") }
+                }.start()
+            }
+        })
+
+        hostPoolSummaryTv = TextView(this).apply {
+            textSize = 10.5f
+            setTypeface(Typeface.MONOSPACE)
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setPadding(0, dp(8), 0, 0)
+        }
+
+        hostActionsContainer.addView(nousigiGetUrlInput)
+        hostActionsContainer.addView(genRow)
+        hostActionsContainer.addView(hostPoolSummaryTv)
+        hostCard.addView(hostActionsContainer)
+        col.addView(hostCard)
+
         val rjCard = makeCard("REJOINER & PERFORMANCE")
+        autoRejoinSwitch = makeSwitch("Enable Auto-Rejoin Watchdog (Restart Frozen/Offline Clones)")
+        rjCard.addView(autoRejoinSwitch)
         rjCard.addView(makeLabel("Famous Game Preset"))
         gameSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(
@@ -435,12 +521,10 @@ class MainActivity : Activity() {
         vipInput = makeInput("Private Server Link(s), comma-separated")
         fpsSwitch = makeSwitch("Auto FPS Optimization (ON by default)")
         render3dSwitch = makeSwitch("Ultra-Low GPU: 3D Render Off (auto-ON for screenshots)")
-        bootSwitch = makeSwitch("Auto-Start on Device Reboot / App Restart")
         rjCard.addView(placeIdInput)
         rjCard.addView(vipInput)
         rjCard.addView(fpsSwitch)
         rjCard.addView(render3dSwitch)
-        rjCard.addView(bootSwitch)
         col.addView(rjCard)
 
         val keyCard = makeCard("KEY PATHS & DELTA PLATORELAY")
@@ -524,6 +608,21 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun refreshHostPoolSummary() {
+        if (!::hostPoolSummaryTv.isInitialized) return
+        val pool = PilotCore.getKeyPool(this)
+        if (pool.isEmpty()) {
+            hostPoolSummaryTv.text = "Host Pool: 0/5 keys stored."
+        } else {
+            val lines = pool.joinToString("\n") { e ->
+                val owner = e.assignedCloud.ifBlank { "Free" }
+                val masked = if (e.key.length > 10) "${e.key.take(5)}...${e.key.takeLast(4)}" else e.key
+                "[${e.slot}/5] $masked -> $owner"
+            }
+            hostPoolSummaryTv.text = "Host Pool (${pool.size}/5):\n$lines"
+        }
+    }
+
     private fun refreshTelemetry() {
         val active = KeyAutomator.isRunning()
         keyStatusText.text = KeyAutomator.getLiveStatusText()
@@ -533,7 +632,6 @@ class MainActivity : Activity() {
         val slots = Rejoiner.slots.values.sortedBy { it.pkg }
         val activeCount = slots.count { it.status == "ACTIVE" }
 
-        // Update Arc Gauge
         val memParts = SuShell.exec("free -m | awk '/Mem:/ {print \$2\" \"\$3}'").trim().split(Regex("\\s+"))
         if (memParts.size >= 2) {
             val tot = memParts[0].toFloatOrNull() ?: 1f
@@ -544,7 +642,6 @@ class MainActivity : Activity() {
         arcGauge.totalSlots = slots.size.coerceAtLeast(1)
         arcGauge.invalidate()
 
-        // Rebuild Slot Matrix Cards
         slotMatrixContainer.removeAllViews()
         if (slots.isEmpty()) {
             slotMatrixContainer.addView(TextView(this).apply {
@@ -609,12 +706,19 @@ class MainActivity : Activity() {
         allowedIdsInput.setText(PilotCore.getAllowedIdsRaw(this))
         cloudInput.setText(PilotCore.getCloud(this))
         updateUrlInput.setText(PilotCore.getUpdateUrl(this))
+        autoStartBotSwitch.isChecked = PilotCore.shouldAutoStart(this)
 
+        val isHost = PilotCore.isKeyHost(this)
+        keyHostSwitch.isChecked = isHost
+        hostActionsContainer.visibility = if (isHost) View.VISIBLE else View.GONE
+        nousigiGetUrlInput.setText(PilotCore.prefs(this).getString("nousigi_get_url", "https://getkey.nousigi.com/"))
+        refreshHostPoolSummary()
+
+        autoRejoinSwitch.isChecked = cfg.enabled
         placeIdInput.setText(cfg.targetPlaceId)
         vipInput.setText(cfg.privateServerLinks)
         fpsSwitch.isChecked = cfg.fpsOptimization
         render3dSwitch.isChecked = cfg.render3dOff
-        bootSwitch.isChecked = cfg.autoStartOnBoot
         keyPathInput.setText(cfg.nousigiKeyPath)
         deltaSwitch.isChecked = cfg.autoGetDeltaKey
         deltaUrlInput.setText(cfg.deltaPlatoUrl)
@@ -629,16 +733,24 @@ class MainActivity : Activity() {
         val tok = tokenInput.text.toString().trim()
         val ids = allowedIdsInput.text.toString().trim()
         val upd = updateUrlInput.text.toString().trim()
+        val wantAutoBot = autoStartBotSwitch.isChecked
+
+        PilotCore.setShouldAutoStart(this, wantAutoBot)
+        PilotCore.setKeyHostFlag(this, keyHostSwitch.isChecked)
+        PilotCore.prefs(this).edit()
+            .putString("nousigi_get_url", nousigiGetUrlInput.text.toString().trim())
+            .apply()
 
         val prev = Rejoiner.loadConfig(this)
         Rejoiner.saveConfig(
             this,
             prev.copy(
+                enabled = autoRejoinSwitch.isChecked,
+                autoStartOnBoot = wantAutoBot,
                 targetPlaceId = placeIdInput.text.toString().trim(),
                 privateServerLinks = vipInput.text.toString().trim(),
                 fpsOptimization = fpsSwitch.isChecked,
                 render3dOff = render3dSwitch.isChecked,
-                autoStartOnBoot = bootSwitch.isChecked,
                 nousigiKeyPath = keyPathInput.text.toString().trim(),
                 autoGetDeltaKey = deltaSwitch.isChecked,
                 deltaPlatoUrl = deltaUrlInput.text.toString().trim()
