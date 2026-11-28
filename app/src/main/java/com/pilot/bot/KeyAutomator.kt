@@ -3,6 +3,7 @@ package com.pilot.bot
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -49,13 +50,14 @@ private enum class ChromeScreenKind {
 private data class ScreenScanResult(
     val kind: ChromeScreenKind,
     val continuePoint: Pair<Int, Int>?,
+    val lootLabsRowCentersY: List<Int>,
     val width: Int,
     val height: Int
 )
 
 /**
  * Delta Key Baseplate Tester + Fixed-Slot Clone Snapper & Verified Receive-Key -> Chrome Launcher
- * + 0s Ad-Bait -> 6s PlatoRelay + Zero-Click 10s Task Runner for LootLabs (links.lootlabs.gg)
+ * + 0s Ad-Bait -> 6s PlatoRelay + Dynamic Pixel LootLabs Task Runner (Zero-Click 10s -> Ctrl+W)
  */
 object KeyAutomator {
     const val BASEPLATE_PLACE_ID = "123974602339071"
@@ -82,6 +84,7 @@ object KeyAutomator {
     @Volatile private var adBaited = false
     @Volatile private var platoReadyAtMs = 0L
     @Volatile private var lootLabsSettleUntilMs = 0L
+    @Volatile private var lootLabsScrolled = false
     @Volatile private var nousigiPortalUrl = "https://getkey.nousigi.com/"
     @Volatile private var collectedNousigiKeys = mutableListOf<String>()
     @Volatile private var appCtx: Context? = null
@@ -113,8 +116,7 @@ object KeyAutomator {
         "phone is infected",
         "virus detected",
         "spin to win",
-        "claim your prize",
-        "allow notifications"
+        "claim your prize"
     )
 
     fun isRunning(): Boolean = running.get()
@@ -141,6 +143,7 @@ object KeyAutomator {
         adBaited = false
         platoReadyAtMs = 0L
         lootLabsSettleUntilMs = 0L
+        lootLabsScrolled = false
         currentStep = "Cancelled"
         mainHandler.removeCallbacks(keyWatchRunnable)
         completionCb = null
@@ -525,7 +528,6 @@ object KeyAutomator {
         return t.startsWith("http") && (t.contains("platorelay.com") || t.contains("platoboost"))
     }
 
-    /** Works across Android 7 through Android 15 (checks window displays + resumed activities). */
     private fun isChromeForeground(): Boolean {
         val focus = SuShell.exec(
             "dumpsys window displays 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 3; " +
@@ -591,6 +593,7 @@ object KeyAutomator {
                 if (isChromeForeground()) {
                     adBaited = false
                     platoReadyAtMs = 0L
+                    lootLabsScrolled = false
                     chromeOpenedAtMs = System.currentTimeMillis()
                     PilotCore.log("[KEYAUTO] Confirmed Chrome opened — baiting first ad click immediately!")
                     return true
@@ -601,7 +604,6 @@ object KeyAutomator {
         return isChromeForeground()
     }
 
-    /** Hard-capped at 3s so animated Chrome pages or YouTube video playback can never hang SuShell. */
     private fun dumpUiXmlFast(): String {
         val out = SuShell.exec("rm -f /sdcard/pilot_ui.xml && timeout 3 uiautomator dump --compressed /sdcard/pilot_ui.xml 2>&1")
         if (!out.contains("UI hierchary dumped", ignoreCase = true) &&
@@ -619,32 +621,92 @@ object KeyAutomator {
     }
 
     /**
-     * Fast visual screen classifier (works in BOTH Landscape & Portrait even when uiautomator fails):
-     * Samples solid button padding at x = 39% and x = 61% (avoiding centered button text) to classify:
-     * - PLATO_RELAY: pure-black margins + Red ('Watch tutorial') -> Blue ('Visit shop') -> White ('Continue') stack
-     * - LOOTLABS: dark navy-blue margins (B > R + 10) + green Unlockr ring
-     * - VPN_AD: bright neon green button in lower half
-     * - EXTERNAL_OR_TASK: anything else (YouTube, survey, sponsor page)
+     * Dynamically locates the Y centers of the stacked slate-blue task bars inside LootLabs'
+     * 'Complete Tasks to Continue' card (below the 'OR' gap), with the final entry being 'CLAIM REWARD'.
      */
+    private fun findLootLabsTaskBoxes(bmp: Bitmap): List<Int> {
+        val w = bmp.width
+        val h = bmp.height
+        val sampleXs = if (w > h) {
+            floatArrayOf(0.38f, 0.43f, 0.48f, 0.52f, 0.57f, 0.62f).map { (w * it).toInt() }
+        } else {
+            floatArrayOf(0.28f, 0.36f, 0.44f, 0.52f, 0.60f, 0.68f).map { (w * it).toInt() }
+        }
+
+        val yStart = (h * 0.22f).toInt()
+        val yEnd = (h * 0.99f).toInt()
+        val minBandH = (h * 0.032f).toInt().coerceAtLeast(24)
+        val maxBandH = (h * 0.12f).toInt().coerceAtLeast(110)
+
+        val bands = mutableListOf<Pair<Int, Int>>()
+        var runStart = -1
+
+        for (y in yStart..yEnd step 2) {
+            var cardHits = 0
+            for (x in sampleXs) {
+                val p = bmp.getPixel(x.coerceIn(2, w - 3), y)
+                val r = Color.red(p)
+                val g = Color.green(p)
+                val b = Color.blue(p)
+                // Matches slate-blue task card fill (B >= 48, B >= G) AND white/grey text inside card,
+                // while excluding dark navy background (B < 46) and green Unlockr glow (G > B + 8)
+                val isCardFill = b >= 48 && b >= g - 4 && (r + g + b) >= 92
+                val isLightText = r > 130 && g > 130 && b > 130
+                if (isCardFill || isLightText) cardHits++
+            }
+            if (cardHits >= 4) {
+                if (runStart < 0) runStart = y
+            } else {
+                if (runStart >= 0) {
+                    val bh = y - runStart
+                    if (bh in minBandH..maxBandH) {
+                        bands.add(runStart to y)
+                    }
+                    runStart = -1
+                }
+            }
+        }
+        if (runStart >= 0) {
+            val bh = yEnd - runStart
+            if (bh in minBandH..maxBandH) bands.add(runStart to yEnd)
+        }
+
+        if (bands.isEmpty()) return emptyList()
+
+        // Split bands into groups wherever a vertical gap > 3.0% screen height occurs (separating Unlockr from Tasks)
+        val splitGap = (h * 0.030f).toInt().coerceAtLeast(22)
+        val groups = mutableListOf<MutableList<Pair<Int, Int>>>()
+        for (b in bands) {
+            if (groups.isEmpty() || (b.first - groups.last().last().second) > splitGap) {
+                groups.add(mutableListOf(b))
+            } else {
+                groups.last().add(b)
+            }
+        }
+
+        // The bottom-most multi-bar group is the 'Complete Tasks to Continue' box (Tasks + CLAIM REWARD)
+        val taskGroup = groups.lastOrNull { it.size >= 2 } ?: return emptyList()
+        return taskGroup.map { (it.first + it.second) / 2 }
+    }
+
     private fun analyzeChromeScreen(ctx: Context): ScreenScanResult {
         val snapPath = File(ctx.cacheDir, "key_scan_${System.nanoTime()}.png").absolutePath
         SuShell.exec("screencap -p '$snapPath' && chmod 666 '$snapPath'")
         val file = File(snapPath)
         if (!file.exists() || file.length() == 0L) {
             val (w, h) = PilotCore.getDisplaySize()
-            return ScreenScanResult(ChromeScreenKind.LOADING, null, w, h)
+            return ScreenScanResult(ChromeScreenKind.LOADING, null, emptyList(), w, h)
         }
 
         return try {
             val bmp = BitmapFactory.decodeFile(snapPath)
-                ?: return ScreenScanResult(ChromeScreenKind.LOADING, null, 1280, 720)
+                ?: return ScreenScanResult(ChromeScreenKind.LOADING, null, emptyList(), 1280, 720)
             val w = bmp.width
             val h = bmp.height
             val cx = w / 2
             val xLeft = (w * 0.39f).toInt().coerceIn(8, w - 9)
             val xRight = (w * 0.61f).toInt().coerceIn(8, w - 9)
 
-            // Check left & right page margins below Chrome's toolbar
             val mL = bmp.getPixel((w * 0.05f).toInt(), (h * 0.55f).toInt())
             val mR = bmp.getPixel((w * 0.95f).toInt(), (h * 0.55f).toInt())
             val mL2 = bmp.getPixel((w * 0.05f).toInt(), (h * 0.80f).toInt())
@@ -667,10 +729,9 @@ object KeyAutomator {
 
             if (isAllWhiteLoading) {
                 bmp.recycle()
-                return ScreenScanResult(ChromeScreenKind.LOADING, null, w, h)
+                return ScreenScanResult(ChromeScreenKind.LOADING, null, emptyList(), w, h)
             }
 
-            // Scan vertically from 25% to 94% height sampling xLeft & xRight (clear of centered text)
             val yStart = (h * 0.25f).toInt()
             val yEnd = (h * 0.94f).toInt()
 
@@ -679,7 +740,7 @@ object KeyAutomator {
             var whiteBandY = -1
             var greenAdBandY = -1
 
-            var curColor = 0 // 0=other, 1=red, 2=blue, 3=white, 4=neonGreen
+            var curColor = 0
             var runStart = -1
 
             fun commitRun(colorType: Int, y0: Int, y1: Int) {
@@ -689,7 +750,7 @@ object KeyAutomator {
                 when (colorType) {
                     1 -> if (redBandY < 0) redBandY = midY
                     2 -> if (blueBandY < 0 || (redBandY > 0 && midY > redBandY)) blueBandY = midY
-                    3 -> whiteBandY = midY // keep lowest white button (Continue sits below Watch tutorial & Visit shop)
+                    3 -> whiteBandY = midY
                     4 -> if (midY > (h * 0.65f).toInt()) greenAdBandY = midY
                 }
             }
@@ -724,24 +785,24 @@ object KeyAutomator {
             }
             if (curColor != 0 && runStart >= 0) commitRun(curColor, runStart, yEnd)
 
-            bmp.recycle()
-
-            // 1. Definite VPN/trial ad trap (bright green Continue button on dark/grey page)
             if (greenAdBandY > 0 && redBandY < 0 && blueBandY < 0) {
-                return ScreenScanResult(ChromeScreenKind.VPN_AD, null, w, h)
+                bmp.recycle()
+                return ScreenScanResult(ChromeScreenKind.VPN_AD, null, emptyList(), w, h)
             }
 
-            // 2. Definite PlatoRelay page: pure-black margins + (Red->Blue->White stack OR centered white Continue button)
             if (isPureBlackMargins && whiteBandY > 0 && (redBandY > 0 || blueBandY > 0 || whiteBandY > (h * 0.50f).toInt())) {
-                return ScreenScanResult(ChromeScreenKind.PLATO_RELAY, cx to whiteBandY, w, h)
+                bmp.recycle()
+                return ScreenScanResult(ChromeScreenKind.PLATO_RELAY, cx to whiteBandY, emptyList(), w, h)
             }
 
-            // 3. Definite LootLabs page: navy-blue margins (no white Continue button)
             if (isNavyMargins && redBandY < 0) {
-                return ScreenScanResult(ChromeScreenKind.LOOTLABS, null, w, h)
+                val lootRows = findLootLabsTaskBoxes(bmp)
+                bmp.recycle()
+                return ScreenScanResult(ChromeScreenKind.LOOTLABS, null, lootRows, w, h)
             }
 
-            ScreenScanResult(ChromeScreenKind.EXTERNAL_OR_TASK, null, w, h)
+            bmp.recycle()
+            ScreenScanResult(ChromeScreenKind.EXTERNAL_OR_TASK, null, emptyList(), w, h)
         } finally {
             file.delete()
         }
@@ -878,7 +939,6 @@ object KeyAutomator {
         val now = System.currentTimeMillis()
         val chromeInFront = isChromeForeground()
 
-        // If Chrome is NOT in front, reopen Roblox & tap Receive Key (or reopen Chrome if direct URL mode)
         if (!chromeInFront) {
             if (activeTestPkg.isNotEmpty()) {
                 val slotUser = Rejoiner.slots[activeTestPkg]?.username?.ifBlank { "slot" } ?: "slot"
@@ -891,7 +951,6 @@ object KeyAutomator {
             return null
         }
 
-        // Fast 3s-capped XML dump + reliable visual screen classification
         val xml = dumpUiXmlFast()
 
         // 1. Check foreground XML for KEY_...
@@ -901,6 +960,18 @@ object KeyAutomator {
             waitingForTaskTimer = false
             updateStep("Scraped $directKey directly from page!")
             return directKey
+        }
+
+        // 2. If Chrome popped up a native notification Allow dialog during 'ACCEPT NOTIFICATIONS', tap Allow
+        if (xml.contains("positive_button") || xml.contains("permission_allow_button")) {
+            val allowRx = Regex("""<node[^>]*?(?:resource-id="[^"]*(?:positive_button|permission_allow_button)"|text="Allow")[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"[^>]*?>""")
+            val am = allowRx.find(xml)
+            if (am != null) {
+                val cx = (am.groupValues[1].toInt() + am.groupValues[3].toInt()) / 2
+                val cy = (am.groupValues[2].toInt() + am.groupValues[4].toInt()) / 2
+                tapNodeIfReady("chrome_allow_notif", cx, cy, "Chrome: Tapping 'Allow' notification...")
+                return null
+            }
         }
 
         val scan = analyzeChromeScreen(ctx)
@@ -918,7 +989,6 @@ object KeyAutomator {
         val onPlato = !isAd && (xmlSaysPlato || scan.kind == ChromeScreenKind.PLATO_RELAY)
         val onLootLabs = !isAd && !onPlato && (xmlSaysLootLabs || scan.kind == ChromeScreenKind.LOOTLABS)
 
-        // Wait briefly if Chrome is still painting a blank white page right after opening
         if (scan.kind == ChromeScreenKind.LOADING && !xmlSaysPlato && !xmlSaysLootLabs && !isAd) {
             if (now - chromeOpenedAtMs < 5000L) {
                 updateStep("Chrome: Waiting for page to finish loading...")
@@ -926,17 +996,15 @@ object KeyAutomator {
             }
         }
 
-        // 2. Instant ad trap -> Ctrl+W immediately -> wait 6s for PlatoRelay
+        // 3. Instant ad trap -> Ctrl+W immediately -> wait 6s for PlatoRelay
         if (isAd) {
             closeChromeTab("Ad closed -> waiting 6s...", waitPlato6s = true)
             return null
         }
 
-        // 3. External site (YouTube / Survey / Ad redirect)
+        // 4. External site (YouTube / Survey / Task website / Ad redirect)
         if (!onPlato && !onLootLabs) {
-            // If we didn't click a task (meaning clicking Continue spawned an ad tab), close immediately & wait 6s
             if (!waitingForTaskTimer) {
-                // Grace window right after initial open so we don't close the initial tab while loading
                 if (!adBaited && now - chromeOpenedAtMs < 4000L) {
                     updateStep("Chrome: Loading PlatoRelay...")
                     return null
@@ -945,7 +1013,7 @@ object KeyAutomator {
                 return null
             }
 
-            // We clicked a LootLabs task -> ZERO CLICKS on task site -> wait 10s -> Ctrl+W back to LootLabs!
+            // ZERO CLICKS on task website -> wait 10s -> Ctrl+W back to LootLabs!
             if (onSponsorTabSinceMs == 0L) {
                 onSponsorTabSinceMs = now
             }
@@ -1015,8 +1083,8 @@ object KeyAutomator {
             }
         }
 
-        // Priority 1: Copy Key / Create Key / Get Key / Claim Reward
-        val finishPatterns = listOf("copy key", "copy", "create key", "get key", "claim reward")
+        // Priority 1: Copy Key / Create Key / Get Key / Claim Reward / Verify Human checkbox
+        val finishPatterns = listOf("copy key", "copy", "create key", "get key", "verify you are human", "i am human")
         for (pat in finishPatterns) {
             val hit = nodes.firstOrNull { n ->
                 val low = n.label.lowercase()
@@ -1038,10 +1106,11 @@ object KeyAutomator {
             }
         }
 
-        // Priority 3: LootLabs Task Rows (XML match -> Coordinate fallback)
+        // Priority 3: LootLabs Task Rows (XML match -> Dynamic Pixel Row Centers -> Auto-Scroll -> Calibrated Fallback)
         if (onLootLabs) {
             val taskKeywords = listOf(
                 "subscribe and watch",
+                "accept notifications",
                 "complete and get rewarded",
                 "confirm you are human",
                 "watch a video",
@@ -1069,34 +1138,66 @@ object KeyAutomator {
                 return null
             }
 
-            // Coordinate fallback for LootLabs task rows + CLAIM REWARD
+            // Use dynamically detected slate-blue task bars inside 'Complete Tasks to Continue'
+            val detectedRows = scan.lootLabsRowCentersY
+            if (detectedRows.size >= 2) {
+                val taskRowsCount = (detectedRows.size - 1).coerceAtLeast(1) // last bar is CLAIM REWARD
+                val tapX = scan.width / 2
+                if (tasksCompletedCount < taskRowsCount) {
+                    val tapY = detectedRows[tasksCompletedCount]
+                    waitingForTaskTimer = true
+                    adBaited = true
+                    tapNodeIfReady(
+                        "lootlabs_px_task_$tasksCompletedCount",
+                        tapX,
+                        tapY,
+                        "LootLabs: Tapping Task #${tasksCompletedCount + 1}/${taskRowsCount} ($tapX, $tapY)..."
+                    )
+                } else {
+                    val claimY = detectedRows.last()
+                    waitingForTaskTimer = false
+                    tapNodeIfReady(
+                        "lootlabs_px_claim",
+                        tapX,
+                        claimY,
+                        "LootLabs: Tapping CLAIM REWARD ($tapX, $claimY)..."
+                    )
+                }
+                return null
+            }
+
+            // If task rows are off-screen (e.g. landscape), scroll down once to bring them into view
+            if (!lootLabsScrolled) {
+                lootLabsScrolled = true
+                val cx = scan.width / 2
+                updateStep("LootLabs: Scrolling down to tasks...")
+                SuShell.exec("input swipe $cx ${(scan.height * 0.80f).toInt()} $cx ${(scan.height * 0.22f).toInt()} 350")
+                Thread.sleep(700L)
+                return null
+            }
+
+            // Calibrated portrait fallback matching exact LootLabs layout (77.5%, 83.8%, 90.1%, 95.8%)
             val tapX = scan.width / 2
             val tapY = when (tasksCompletedCount) {
-                0 -> (scan.height * 0.675f).toInt()
-                1 -> (scan.height * 0.735f).toInt()
-                2 -> (scan.height * 0.790f).toInt()
-                else -> (scan.height * 0.845f).toInt()
+                0 -> (scan.height * 0.775f).toInt()
+                1 -> (scan.height * 0.838f).toInt()
+                2 -> (scan.height * 0.901f).toInt()
+                else -> (scan.height * 0.958f).toInt()
             }
             if (tasksCompletedCount < 3) {
                 waitingForTaskTimer = true
-                tapNodeIfReady("lootlabs_task_$tasksCompletedCount", tapX, tapY, "LootLabs: Tapping Task #${tasksCompletedCount + 1} ($tapX, $tapY)...")
+                adBaited = true
+                tapNodeIfReady("lootlabs_fb_task_$tasksCompletedCount", tapX, tapY, "LootLabs: Tapping Task #${tasksCompletedCount + 1} ($tapX, $tapY)...")
             } else {
                 waitingForTaskTimer = false
-                tapNodeIfReady("lootlabs_claim", tapX, tapY, "LootLabs: Tapping CLAIM REWARD ($tapX, $tapY)...")
+                tapNodeIfReady("lootlabs_fb_claim", tapX, tapY, "LootLabs: Tapping CLAIM REWARD ($tapX, $tapY)...")
             }
             return null
         }
 
-        // Priority 4: PlatoRelay XML Continue / Verify Human
-        val verifyAndContinuePatterns = listOf(
-            "verify you are human",
-            "i am human",
-            "continue",
-            "proceed",
-            "unlock",
-            "next"
-        )
-        for (pat in verifyAndContinuePatterns) {
+        // Priority 4: PlatoRelay XML Continue / Proceed / Unlock
+        val continuePatterns = listOf("continue", "proceed", "unlock", "next")
+        for (pat in continuePatterns) {
             val hit = nodes.firstOrNull { n ->
                 val low = n.label.lowercase()
                 n.enabled && n.cy > 90 && (low == pat || (pat.length >= 6 && low.contains(pat)))
@@ -1112,7 +1213,7 @@ object KeyAutomator {
             }
         }
 
-        // Priority 5: Visual pixel-detected white Continue button on PlatoRelay (exact coordinates!)
+        // Priority 5: Visual pixel-detected white Continue button on PlatoRelay
         val btn = scan.continuePoint ?: run {
             val ty = if (scan.width > scan.height) (scan.height * 0.785f).toInt() else (scan.height * 0.643f).toInt()
             (scan.width / 2) to ty
@@ -1221,6 +1322,7 @@ object KeyAutomator {
         adBaited = false
         platoReadyAtMs = 0L
         lootLabsSettleUntilMs = 0L
+        lootLabsScrolled = false
         startedAtMs = System.currentTimeMillis()
         chromeOpenedAtMs = startedAtMs
         showFloatingOverlay(ctx.applicationContext)
@@ -1257,6 +1359,7 @@ object KeyAutomator {
         adBaited = false
         platoReadyAtMs = 0L
         lootLabsSettleUntilMs = 0L
+        lootLabsScrolled = false
         completionCb = onDone
         startedAtMs = System.currentTimeMillis()
         showFloatingOverlay(ctx.applicationContext)
@@ -1428,6 +1531,7 @@ object KeyAutomator {
         adBaited = false
         platoReadyAtMs = 0L
         lootLabsSettleUntilMs = 0L
+        lootLabsScrolled = false
         currentStep = if (ok) "Completed" else "Failed"
         mainHandler.removeCallbacks(keyWatchRunnable)
         removeFloatingOverlay()
