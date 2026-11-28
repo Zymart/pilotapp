@@ -59,6 +59,11 @@ object Rejoiner {
     @Volatile private var vipIndex = 0
     @Volatile private var screenshot3dHoldUntilMs = 0L
 
+    // Global bridge ping markers used by KeyAutomator's Baseplate executor test
+    @Volatile var lastAnyBridgePingMs: Long = 0L
+    @Volatile var lastPingUser: String = ""
+    @Volatile var lastPingPlaceId: String = ""
+
     fun loadConfig(ctx: Context): RejoinConfig {
         val p = PilotCore.prefs(ctx)
         return RejoinConfig(
@@ -108,8 +113,33 @@ object Rejoiner {
         return pkgs.mapNotNull { slots[it] }
     }
 
+    /** Picks a logged-in clone for Baseplate executor testing, falling back to the first available clone. */
+    fun pickBestTestClone(): CloneSlot? {
+        val all = discoverClones()
+        return all.firstOrNull {
+            it.status != "EMPTY" && it.status != "LOGGED_OUT" && it.status != "REVOKED"
+        } ?: all.firstOrNull()
+    }
+
+    /** Force-stops a single clone and launches it directly into a specific Place ID (e.g., Baseplate). */
+    fun launchSingleCloneToPlace(ctx: Context, pkg: String, placeId: String) {
+        deployBridgeLua(ctx, loadConfig(ctx))
+        SuShell.exec("am force-stop $pkg")
+        runCatching { Thread.sleep(1200) }
+        val uri = "roblox://experiences/start?placeId=$placeId"
+        SuShell.exec("am start -p $pkg -a android.intent.action.VIEW -d '$uri' >/dev/null 2>&1")
+        slots[pkg]?.apply {
+            lastLaunchMs = System.currentTimeMillis()
+            lastPingMs = 0L
+        }
+    }
+
     fun onBridgePing(ctx: Context, user: String, placeId: String, fps: Int): String {
         val now = System.currentTimeMillis()
+        lastAnyBridgePingMs = now
+        lastPingUser = user
+        lastPingPlaceId = placeId
+
         val matched = slots.values.firstOrNull { it.username.equals(user, ignoreCase = true) }
             ?: slots.values.firstOrNull { it.username.isBlank() }
         if (matched != null) {
@@ -137,7 +167,7 @@ object Rejoiner {
         val cfg = loadConfig(ctx)
         if (cfg.autoGetNousigiKey && !KeyAutomator.isRunning()) {
             val isBanned = reason.contains("ban", true) || reason.contains("blacklist", true)
-            PilotCore.onAlert?.invoke("🚫 Key Error Detected ($user)", "Reason: `$reason` — starting Auto Get Nousigi Key...")
+            PilotCore.onAlert?.invoke("🚫 Key Error Detected ($user)", "Reason: `$reason` — opening Luarmor in Chrome...")
             KeyAutomator.startNousigiRenewal(ctx, blacklistedReset = isBanned)
         }
     }
@@ -199,6 +229,9 @@ object Rejoiner {
     }
 
     private fun tickWatchdog(ctx: Context, cycle: Int) {
+        // Pause normal watchdog restarts while KeyAutomator is running a Baseplate key test
+        if (KeyAutomator.isRunning()) return
+
         val cfg = loadConfig(ctx)
         if (!cfg.enabled) return
         val list = discoverClones()
@@ -252,7 +285,7 @@ object Rejoiner {
                     slot.status = "NO_DELTA_KEY"
                     PilotCore.log("[REJOINER] ${slot.pkg} alive with no ping -> NO DELTA KEY")
                     if (cfg.autoGetDeltaKey && !KeyAutomator.isRunning()) {
-                        PilotCore.onAlert?.invoke("🔑 Delta Key Missing", "Detected missing Delta key on `${slot.pkg}` — starting Auto Get Delta Key...")
+                        PilotCore.onAlert?.invoke("🔑 Delta Key Missing", "Testing executor on Baseplate & starting Delta key helper...")
                         KeyAutomator.startDeltaRenewal(ctx)
                     }
                 } else {
@@ -311,7 +344,7 @@ object Rejoiner {
 
     fun deployBridgeLua(ctx: Context, cfg: RejoinConfig) {
         val lua = """
-            -- Pilot v1.4.1 Bridge (Auto-Ping + Blacklist Detection + FPS Optimizer + Anti-AFK + PilotSnap)
+            -- Pilot v1.4.2 Bridge (Auto-Ping + Blacklist Detection + FPS Optimizer + Anti-AFK + PilotSnap)
             if getgenv().__PILOT_BRIDGE_V14 then return end
             getgenv().__PILOT_BRIDGE_V14 = true
 
