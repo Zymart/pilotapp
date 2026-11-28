@@ -2,7 +2,6 @@ package com.pilot.bot
 
 import android.app.*
 import android.content.*
-import android.database.sqlite.SQLiteDatabase
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Rect
@@ -22,6 +21,9 @@ import java.io.FileOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.URLDecoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.*
 import kotlin.math.abs
 import kotlin.math.max
@@ -29,14 +31,6 @@ import kotlin.math.min
 import kotlin.random.Random
 
 data class AccInfo(val pkg: String, val user: String, val status: String)
-data class ShotRequest(
-    val ch: String,
-    val idx: Int,
-    val acc: AccInfo,
-    val markerPath: String,
-    val latch: CountDownLatch = CountDownLatch(1),
-    @Volatile var capturedFile: File? = null
-)
 
 data class WindowSnapshot(
     val taskId: Int?,
@@ -76,6 +70,9 @@ object SuShell {
             ""
         }
     }
+
+    fun execLines(cmd: String): List<String> =
+        exec(cmd).lines().map { it.trim() }.filter { it.isNotEmpty() }
 
     private fun isAlive(p: java.lang.Process): Boolean = try {
         p.exitValue()
@@ -252,23 +249,52 @@ object AppUpdater {
 }
 
 object PilotCore {
-    const val APP_VERSION = "v1.3.10"
+    const val APP_VERSION = "v1.4.0"
     private const val SHARED_SYNC_PATH = "/sdcard/pilot_sync.txt"
 
     var logs = "Engine $APP_VERSION initialized.\n"
     var onLog: (() -> Unit)? = null
+    @Volatile var onAlert: ((title: String, body: String) -> Unit)? = null
     @Volatile var cachedScan: List<AccInfo> = emptyList()
 
-    val pendingShots = ConcurrentHashMap<String, ShotRequest>()
-    val autoMarkers = ConcurrentHashMap<String, String>()
+    private val logLines = CopyOnWriteArrayList<String>()
+    private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+    val isRunning: Boolean
+        get() = PilotService.isRunning
 
     fun log(msg: String) {
-        logs = (logs + msg + "\n").takeLast(2400)
+        val stamped = "[${timeFmt.format(Date())}] $msg"
+        logLines.add(stamped)
+        while (logLines.size > 150) {
+            runCatching { logLines.removeAt(0) }
+        }
+        logs = (logs + stamped + "\n").takeLast(2800)
         onLog?.invoke()
     }
 
-    private fun prefs(c: Context) = c.getSharedPreferences("pilot_cfg", Context.MODE_PRIVATE)
-    private fun histPrefs(c: Context) = c.getSharedPreferences("pilot_hist", Context.MODE_PRIVATE)
+    fun getLogs(): List<String> = logLines.toList()
+
+    fun prefs(c: Context): SharedPreferences =
+        c.applicationContext.getSharedPreferences("pilot_cfg", Context.MODE_PRIVATE)
+
+    private fun histPrefs(c: Context): SharedPreferences =
+        c.applicationContext.getSharedPreferences("pilot_hist", Context.MODE_PRIVATE)
+
+    fun startService(c: Context) {
+        val app = c.applicationContext
+        val svc = Intent(app, PilotService::class.java)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 26) app.startForegroundService(svc) else app.startService(svc)
+        }
+    }
+
+    fun stopService(c: Context) {
+        val app = c.applicationContext
+        runCatching { app.stopService(Intent(app, PilotService::class.java)) }
+        PilotService.isRunning = false
+        log("[CORE] Service stop requested")
+    }
 
     fun cleanBotToken(raw: String): String {
         return raw.replace("@", "").replace(Regex("""\s+"""), "").trim()
@@ -287,7 +313,7 @@ object PilotCore {
             val t = runCatching { f.readText().trim() }.getOrDefault("")
             if (t.isNotEmpty() && t != "Not Set") return t
         }
-        val saved = prefs(c).getString("cloud", "") ?: ""
+        val saved = prefs(c).getString("cloud", "")?.ifEmpty { prefs(c).getString("cloud_name", "") } ?: ""
         if (saved.isNotEmpty() && saved != "Not Set") return saved
 
         val detected = detectDeviceName(c)
@@ -315,11 +341,14 @@ object PilotCore {
 
     fun setCloudName(c: Context, name: String) {
         val clean = name.trim().ifEmpty { detectDeviceName(c) }
-        prefs(c).edit().putString("cloud", clean).apply()
+        prefs(c).edit().putString("cloud", clean).putString("cloud_name", clean).apply()
         runCatching { File("/sdcard/cloud_name.txt").writeText(clean) }
     }
 
-    fun getToken(c: Context) = cleanBotToken(prefs(c).getString("token", "") ?: "")
+    fun getToken(c: Context): String {
+        val raw = prefs(c).getString("token", "")?.ifEmpty { prefs(c).getString("bot_token", "") } ?: ""
+        return cleanBotToken(raw)
+    }
 
     fun getAllowedIdsRaw(c: Context): String {
         val saved = prefs(c).getString("allowed_ids", "") ?: ""
@@ -328,9 +357,7 @@ object PilotCore {
         return if (legacyUid != 0L) legacyUid.toString() else ""
     }
 
-    fun getAllowedIds(c: Context): Set<String> {
-        return parseAllowedIds(getAllowedIdsRaw(c)).toSet()
-    }
+    fun getAllowedIds(c: Context): Set<String> = parseAllowedIds(getAllowedIdsRaw(c)).toSet()
 
     fun getPrimaryUserId(c: Context): Long {
         val ids = parseAllowedIds(getAllowedIdsRaw(c))
@@ -339,7 +366,7 @@ object PilotCore {
 
     fun isAuthorized(c: Context, userId: String, roles: JSONArray?): Boolean {
         val allowed = getAllowedIds(c)
-        if (allowed.isEmpty()) return false
+        if (allowed.isEmpty()) return true // Allow if no ID restriction configured yet
         if (userId.isNotEmpty() && userId in allowed) return true
         if (roles != null) {
             for (i in 0 until roles.length()) {
@@ -372,7 +399,9 @@ object PilotCore {
 
         val edit = prefs(c).edit()
             .putString("cloud", cl)
+            .putString("cloud_name", cl)
             .putString("token", cleanTok)
+            .putString("bot_token", cleanTok)
             .putString("allowed_ids", joinedIds)
             .putLong("user_id", primaryUid)
             .putString("upd_url", updUrl.trim())
@@ -383,14 +412,14 @@ object PilotCore {
     }
 
     private fun writeSharedBackup(c: Context) {
-        if (getToken(c).isEmpty() || getAllowedIds(c).isEmpty()) return
+        if (getToken(c).isEmpty()) return
         val code = makeCode(c, autoRoot = true)
         runCatching { File(SHARED_SYNC_PATH).writeText(code) }
         SuShell.exec("printf '%s' '$code' > $SHARED_SYNC_PATH && chmod 666 $SHARED_SYNC_PATH")
     }
 
     fun tryAutoSeedFromDisk(c: Context): Boolean {
-        if (getToken(c).isNotEmpty() && getAllowedIds(c).isNotEmpty()) {
+        if (getToken(c).isNotEmpty()) {
             writeSharedBackup(c)
             return true
         }
@@ -441,6 +470,7 @@ object PilotCore {
 
         val edit = prefs(c).edit()
             .putString("token", tok)
+            .putString("bot_token", tok)
             .putString("allowed_ids", joinedIds)
             .putLong("user_id", primaryUid)
 
@@ -455,12 +485,9 @@ object PilotCore {
         var started = false
         if (autoRoot) {
             autoGrantRootAndPerms(c)
-            if (startSvc && getToken(c).isNotEmpty() && getAllowedIds(c).isNotEmpty()) {
-                val svc = Intent(c, PilotService::class.java)
-                runCatching {
-                    if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(svc) else c.startService(svc)
-                    started = true
-                }
+            if (startSvc && getToken(c).isNotEmpty()) {
+                startService(c)
+                started = true
             }
         }
         return true to started
@@ -490,26 +517,8 @@ object PilotCore {
 
     @Synchronized
     fun installAutoExec(c: Context) {
-        val lua = Rejoiner.buildBridgeLua()
-        runCatching {
-            val tmp = File(c.filesDir, "pilot_bridge.lua")
-            tmp.writeText(lua)
-
-            val sh = """
-                mkdir -p /storage/emulated/0/Delta/AutoExcecute /storage/emulated/0/Delta/Autoexecute 2>/dev/null
-                find -L /storage/emulated/0 /data/data -maxdepth 6 -type d \( -iname '*autoexecute*' -o -iname '*autoexcecute*' \) 2>/dev/null
-            """.trimIndent()
-            val found = SuShell.exec(sh).lines().map { it.trim() }.filter { it.isNotEmpty() }
-            val dirs = (listOf(
-                "/storage/emulated/0/Delta/AutoExcecute",
-                "/storage/emulated/0/Delta/Autoexecute"
-            ) + found).toSet()
-
-            for (d in dirs) {
-                SuShell.exec("mkdir -p '$d' && cp '${tmp.absolutePath}' '$d/pilot_bridge.lua' && chmod 666 '$d/pilot_bridge.lua'")
-            }
-            log("[AUTOEXEC] Ready in ${dirs.size} folder(s)")
-        }
+        Rejoiner.deployBridgeLua(c, Rejoiner.loadConfig(c))
+        log("[AUTOEXEC] Deployed pilot_bridge.lua")
     }
 
     fun getDisplaySize(): Pair<Int, Int> {
@@ -570,7 +579,6 @@ object PilotCore {
                     val w = r - l
                     val h = b - t
                     if (w < 140 || h < 140) continue
-                    if (w >= fullW - 24 && h >= fullH - 96) continue
 
                     val area = w * h
                     if (area > bestArea) {
@@ -580,101 +588,63 @@ object PilotCore {
                 }
             }
         }
-
-        if (bestOuter == null) {
-            val actDump = SuShell.exec("dumpsys activity activities 2>/dev/null")
-            if (actDump.isNotEmpty()) {
-                for (block in actDump.split("Task{")) {
-                    if (!pkgRx.containsMatchIn(block)) continue
-                    val bm = Regex("""\b(?:mBounds|bounds)=\[(\d+),(\d+)\]\[(\d+),(\d+)\]""").find(block) ?: continue
-                    val l = bm.groupValues[1].toIntOrNull() ?: 0
-                    val t = bm.groupValues[2].toIntOrNull() ?: 0
-                    val r = bm.groupValues[3].toIntOrNull() ?: 0
-                    val b = bm.groupValues[4].toIntOrNull() ?: 0
-                    val w = r - l
-                    val h = b - t
-                    if (w >= 140 && h >= 140 && !(w >= fullW - 24 && h >= fullH - 96)) {
-                        val area = w * h
-                        if (area > bestArea) {
-                            bestArea = area
-                            bestOuter = Rect(l, t, r, b)
-                        }
-                    }
-                }
-            }
-        }
         return bestOuter
     }
 
+    /** Locates the title-bar [□] Maximize/Restore button right next to [✕] via UIAutomator with DPI fallback. */
+    private fun findTitleBarMaximizeButton(win: Rect, fullW: Int, fullH: Int): Pair<Int, Int> {
+        SuShell.exec("uiautomator dump /sdcard/pilot_ui.xml >/dev/null 2>&1")
+        val xml = SuShell.exec("cat /sdcard/pilot_ui.xml 2>/dev/null")
+        val rx = Regex("""<node[^>]*?(?:resource-id|content-desc)="([^"]*)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"[^>]*?>""")
+        for (m in rx.findAll(xml)) {
+            val tag = m.groupValues[1].lowercase()
+            if (tag.contains("maximize") || tag.contains("restore")) {
+                val cx = (m.groupValues[2].toInt() + m.groupValues[4].toInt()) / 2
+                val cy = (m.groupValues[3].toInt() + m.groupValues[5].toInt()) / 2
+                if (cx in win.left..win.right && cy in win.top..(win.top + 90)) {
+                    return cx to cy
+                }
+            }
+        }
+        val fallbackX = (win.right - 56).coerceIn(10, fullW - 10)
+        val fallbackY = (win.top + 22).coerceIn(8, fullH - 10)
+        return fallbackX to fallbackY
+    }
+
+    /**
+     * Expands a 2x2 floating clone by tapping ONLY its title-bar [□] maximize button
+     * (never calling `am task resize`, so tapping [□] again snaps it cleanly back to 2x2).
+     */
     @Synchronized
     fun expandRobloxFullTab(pkg: String): WindowSnapshot {
+        Rejoiner.hold3dRenderForScreenshot(6000L)
         val (fullW, fullH) = getDisplaySize()
         val preBounds = findOuterWindowBounds(pkg, fullW, fullH)
         val taskId = findTaskId(pkg)
-
-        if (taskId != null) {
-            SuShell.exec(
-                "am task resizeable $taskId 2 >/dev/null 2>&1; " +
-                "am task set-windowing-mode $taskId 1 >/dev/null 2>&1; " +
-                "am task resize $taskId 0 0 $fullW $fullH >/dev/null 2>&1; " +
-                "cmd activity task resize $taskId 0 0 $fullW $fullH >/dev/null 2>&1; " +
-                "am stack move-task $taskId 1 true >/dev/null 2>&1"
-            )
-        }
-
-        val resolvedAct = SuShell.exec("cmd package resolve-activity --brief $pkg 2>/dev/null | tail -n 1").trim()
-        if (resolvedAct.contains("/")) {
-            SuShell.exec("am start -n '$resolvedAct' --activity-reorder-to-front --windowingMode 1 >/dev/null 2>&1")
-        } else {
-            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
-        }
-
-        runCatching { Thread.sleep(450) }
-
         var tappedMaxBtn: Pair<Int, Int>? = null
-        val afterBounds = findOuterWindowBounds(pkg, fullW, fullH) ?: preBounds
-        if (afterBounds != null && (afterBounds.width() < fullW - 60 || afterBounds.height() < fullH - 120)) {
-            val maxBtnX = (afterBounds.right - 46).coerceIn(10, fullW - 10)
-            val maxBtnY = (afterBounds.top + 17).coerceIn(8, fullH - 10)
-            SuShell.exec("input tap $maxBtnX $maxBtnY")
-            tappedMaxBtn = maxBtnX to maxBtnY
-            runCatching { Thread.sleep(650) }
-        }
 
-        log("[FULLTAB] Expanded $pkg (task=${taskId ?: -1}, ${fullW}x${fullH})")
+        if (preBounds != null && (preBounds.width() < fullW - 60 || preBounds.height() < fullH - 120)) {
+            val (mx, my) = findTitleBarMaximizeButton(preBounds, fullW, fullH)
+            SuShell.exec("input tap $mx $my")
+            tappedMaxBtn = mx to my
+            runCatching { Thread.sleep(750) }
+            log("[FULLTAB] Tapped [□] maximize for $pkg at ($mx, $my)")
+        } else if (preBounds == null) {
+            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+            runCatching { Thread.sleep(1000) }
+        }
         return WindowSnapshot(taskId, preBounds, fullW, fullH, tappedMaxBtn)
     }
 
     @Synchronized
     fun restoreRobloxWindow(pkg: String, snap: WindowSnapshot) {
-        val b = snap.preBounds
-        if (b != null) {
-            if (snap.tappedMaxBtn != null) {
-                val restoreX = (snap.fullW - 46).coerceIn(10, snap.fullW - 10)
-                val restoreY = 17
-                SuShell.exec("input tap $restoreX $restoreY")
-                runCatching { Thread.sleep(250) }
-            }
-            if (snap.taskId != null) {
-                SuShell.exec(
-                    "am task set-windowing-mode ${snap.taskId} 5 >/dev/null 2>&1; " +
-                    "am task resize ${snap.taskId} ${b.left} ${b.top} ${b.right} ${b.bottom} >/dev/null 2>&1; " +
-                    "cmd activity task resize ${snap.taskId} ${b.left} ${b.top} ${b.right} ${b.bottom} >/dev/null 2>&1"
-                )
-            }
-            log("[FULLTAB] Restored $pkg back to floating window")
-        } else {
-            if (snap.tappedMaxBtn != null) {
-                val restoreX = (snap.fullW - 46).coerceIn(10, snap.fullW - 10)
-                val restoreY = 17
-                SuShell.exec("input tap $restoreX $restoreY")
-                runCatching { Thread.sleep(200) }
-            }
-            if (snap.taskId != null) {
-                SuShell.exec("am task set-windowing-mode ${snap.taskId} 5 >/dev/null 2>&1")
-            }
-            SuShell.exec("am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1")
-            log("[FULLTAB] Minimized $pkg back to background")
+        if (snap.tappedMaxBtn != null) {
+            val fullWin = findOuterWindowBounds(pkg, snap.fullW, snap.fullH)
+                ?: Rect(0, 0, snap.fullW, snap.fullH)
+            val (rx, ry) = findTitleBarMaximizeButton(fullWin, snap.fullW, snap.fullH)
+            SuShell.exec("input tap $rx $ry")
+            runCatching { Thread.sleep(300) }
+            log("[FULLTAB] Tapped [□] restore for $pkg at ($rx, $ry) -> snapped back to 2x2")
         }
     }
 
@@ -693,9 +663,8 @@ object PilotCore {
         val bracketRx = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
         val surfaceRectRx = Regex("""rect=\((-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)\)\s+(\d+)\s*x\s*(\d+)""")
 
-        fun isFullDisplayContainer(w: Int, h: Int): Boolean {
-            return w >= fullW - 24 && h >= fullH - 96
-        }
+        fun isFullDisplayContainer(w: Int, h: Int): Boolean =
+            w >= fullW - 24 && h >= fullH - 96
 
         var bestSurfaceRect: Rect? = null
         var bestSurfaceArea = 0
@@ -778,6 +747,7 @@ object PilotCore {
 
     @Synchronized
     fun captureScreen(c: Context, pkg: String? = null, tapInsideFirst: Boolean = false): Pair<File?, Boolean> {
+        Rejoiner.hold3dRenderForScreenshot(5000L)
         val rawPath = File(c.cacheDir, "raw.png").absolutePath
         val outPath = File(c.cacheDir, "crop.jpg").absolutePath
 
@@ -799,9 +769,7 @@ object PilotCore {
         if (pkg.isNullOrEmpty()) return rawFile to true
 
         return runCatching {
-            val opts = BitmapFactory.Options().apply {
-                inPreferredConfig = Bitmap.Config.RGB_565
-            }
+            val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
             val full = BitmapFactory.decodeFile(rawPath, opts) ?: return rawFile to false
             val w = full.width
             val h = full.height
@@ -859,6 +827,10 @@ object PilotCore {
                 val u = m.groupValues[1]
                 if (hp.getString(pkg, null) != u) { edit.putString(pkg, u); changed = true }
                 res.add(AccInfo(pkg, u, "ACTIVE"))
+                Rejoiner.slots.getOrPut(pkg) { CloneSlot(pkg) }.apply {
+                    if (username != u) username = u
+                    if (!paused && status != "ACTIVE") status = "ACTIVE"
+                }
             } else {
                 val old = hp.getString(pkg, null)
                 if (!old.isNullOrEmpty()) res.add(AccInfo(pkg, old, "LOGGED OUT"))
@@ -871,10 +843,18 @@ object PilotCore {
         return sorted
     }
 
-    fun wipe(c: Context, pkg: String, clearHist: Boolean) {
-        SuShell.exec("am force-stop $pkg && rm -rf /data/data/$pkg/app_webview/Default/Cookies* /data/data/$pkg/shared_prefs/* /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/*")
-        if (clearHist) histPrefs(c).edit().remove(pkg).apply()
+    /** Full 3-step purge: revokes server token via Roblox v2/logout, deletes SessionVault snapshot, and wipes clone. */
+    fun wipe(c: Context, pkg: String, clearHist: Boolean): Boolean {
+        val revoked = SessionVault.fullLogoutAndWipe(c, pkg)
+        SuShell.exec("rm -rf /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/*")
+        if (clearHist) {
+            histPrefs(c).edit().remove(pkg).apply()
+            Rejoiner.slots[pkg]?.apply { username = ""; status = "EMPTY"; placeId = "" }
+        } else {
+            Rejoiner.slots[pkg]?.status = "LOGGED_OUT"
+        }
         scanRbx(c)
+        return revoked
     }
 
     @Synchronized
@@ -951,179 +931,50 @@ object PilotCore {
         val count = Regex("""RESTORED:(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         if (ok && username.isNotEmpty() && username != "Empty") {
             histPrefs(c).edit().putString(dstPkg, username).apply()
+            SessionVault.snapshot(c, dstPkg, username)
         }
         scanRbx(c)
         return ok to count
     }
 
-    @Synchronized
-    fun injectCookie(
-        c: Context,
-        pkg: String,
-        rawCookie: String,
-        knownUser: String = "",
-        knownUserId: Long = 0L
-    ): Pair<Boolean, String> {
-        val clean = AccountLaunchManager.sanitizeCookie(rawCookie)
-        if (clean.length < 50) {
-            return false to "Cookie is too short or invalid."
-        }
+    fun arrange2x2(): Int {
+        val (rawW, rawH) = getDisplaySize()
+        val w = max(rawW, rawH)
+        val h = min(rawW, rawH)
+        val topOffset = 42
+        val halfW = w / 2
+        val halfH = (h - topOffset) / 2
 
-        val pkgCheck = SuShell.exec("[ -d '/data/data/$pkg' ] && echo OK").trim()
-        if (pkgCheck != "OK") {
-            return false to "Package `$pkg` is not installed on this cloud phone."
-        }
-
-        // Stop clone and clear old local user cache so Roblox re-authenticates from WebView Cookies
-        SuShell.exec(
-            "am force-stop $pkg && " +
-            "rm -rf /data/data/$pkg/files/LocalStorage/* /data/data/$pkg/files/appData/LocalStorage/* " +
-            "/data/data/$pkg/shared_prefs/com.roblox.*.xml /data/data/$pkg/shared_prefs/Rbx*.xml"
+        val quadrants = listOf(
+            Rect(0, topOffset, halfW, topOffset + halfH),
+            Rect(halfW, topOffset, w, topOffset + halfH),
+            Rect(0, topOffset + halfH, halfW, h),
+            Rect(halfW, topOffset + halfH, w, h)
         )
 
-        fun findCookieDbs(): List<String> = SuShell.exec(
-            "find /data/data/$pkg/app_webview -maxdepth 3 -type f -name 'Cookies' 2>/dev/null"
-        ).lines().map { it.trim() }.filter { it.isNotEmpty() }
-
-        var cookiePaths = findCookieDbs()
-        if (cookiePaths.isEmpty()) {
-            // Launch once so Android WebView initializes its exact Cookies SQLite schema
-            SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 && sleep 5 && am force-stop $pkg")
-            cookiePaths = findCookieDbs()
-        }
-
-        if (cookiePaths.isEmpty()) {
-            return false to "Could not find WebView `Cookies` database under `/data/data/$pkg/app_webview/`."
-        }
-
-        var patchedCount = 0
-        for ((idx, cookiePath) in cookiePaths.withIndex()) {
-            val cookieDir = cookiePath.substringBeforeLast("/")
-            val tmpDb = File(c.cacheDir, "ck_${System.nanoTime()}_$idx.db")
-
-            SuShell.exec(
-                "cp '$cookiePath' '${tmpDb.absolutePath}' 2>/dev/null; " +
-                "cp '${cookiePath}-wal' '${tmpDb.absolutePath}-wal' 2>/dev/null; " +
-                "cp '${cookiePath}-shm' '${tmpDb.absolutePath}-shm' 2>/dev/null; " +
-                "cp '${cookiePath}-journal' '${tmpDb.absolutePath}-journal' 2>/dev/null; " +
-                "chmod 666 '${tmpDb.absolutePath}'* 2>/dev/null"
-            )
-
-            if (!tmpDb.exists() || tmpDb.length() == 0L) continue
-
-            val writeOk = runCatching {
-                val db = SQLiteDatabase.openDatabase(tmpDb.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
-                val cols = HashSet<String>()
-                db.rawQuery("PRAGMA table_info(cookies)", null).use { cur ->
-                    while (cur.moveToNext()) {
-                        cols.add(cur.getString(1).lowercase())
-                    }
-                }
-                if (cols.isEmpty()) {
-                    db.close()
-                    return@runCatching false
-                }
-
-                db.delete("cookies", "name = ? AND host_key LIKE ?", arrayOf(".ROBLOSECURITY", "%roblox.com"))
-
-                val nowMicros = (System.currentTimeMillis() / 1000L + 11644473600L) * 1_000_000L
-                val expMicros = nowMicros + (365L * 86400L * 1_000_000L)
-
-                val cv = ContentValues().apply {
-                    if ("creation_utc" in cols) put("creation_utc", nowMicros)
-                    if ("host_key" in cols) put("host_key", ".roblox.com")
-                    if ("top_frame_site_key" in cols) put("top_frame_site_key", "")
-                    if ("name" in cols) put("name", ".ROBLOSECURITY")
-                    if ("value" in cols) put("value", clean)
-                    if ("encrypted_value" in cols) put("encrypted_value", ByteArray(0))
-                    if ("path" in cols) put("path", "/")
-                    if ("expires_utc" in cols) put("expires_utc", expMicros)
-                    if ("is_secure" in cols) put("is_secure", 1)
-                    if ("is_httponly" in cols) put("is_httponly", 1)
-                    if ("last_access_utc" in cols) put("last_access_utc", nowMicros)
-                    if ("has_expires" in cols) put("has_expires", 1)
-                    if ("is_persistent" in cols) put("is_persistent", 1)
-                    if ("priority" in cols) put("priority", 1)
-                    if ("samesite" in cols) put("samesite", 1)
-                    if ("source_scheme" in cols) put("source_scheme", 2)
-                    if ("source_port" in cols) put("source_port", 443)
-                    if ("last_update_utc" in cols) put("last_update_utc", nowMicros)
-                    if ("source_type" in cols) put("source_type", 0)
-                    if ("has_cross_site_ancestor" in cols) put("has_cross_site_ancestor", 0)
-                }
-
-                db.insertOrThrow("cookies", null, cv)
-
-                // Flush WAL pages directly into the main Cookies file before copying back
-                db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { it.moveToFirst() }
-                db.rawQuery("PRAGMA journal_mode=DELETE", null).use { it.moveToFirst() }
-
-                var verifiedRows = 0
-                db.rawQuery(
-                    "SELECT COUNT(*) FROM cookies WHERE name = ? AND value = ?",
-                    arrayOf(".ROBLOSECURITY", clean)
-                ).use { cur ->
-                    if (cur.moveToFirst()) verifiedRows = cur.getInt(0)
-                }
-                db.close()
-                verifiedRows > 0
-            }.getOrDefault(false)
-
-            if (writeOk) {
-                val restoreSh = """
-                    mkdir -p '$cookieDir'
-                    rm -f '${cookiePath}-wal' '${cookiePath}-shm' '${cookiePath}-journal'
-                    cp '${tmpDb.absolutePath}' '$cookiePath'
-                    chmod 600 '$cookiePath'
-                    uid=${'$'}(stat -c '%u:%g' /data/data/$pkg 2>/dev/null)
-                    if [ -n "${'$'}uid" ]; then
-                      chown -R ${'$'}uid /data/data/$pkg/app_webview 2>/dev/null
-                    fi
-                    restorecon -RF /data/data/$pkg/app_webview 2>/dev/null
-                    [ -s '$cookiePath' ] && echo OK
-                """.trimIndent()
-                if (SuShell.exec(restoreSh).contains("OK")) {
-                    patchedCount++
-                    log("[LAUNCH] Patched cookie DB: $cookiePath")
-                }
-            }
-
-            c.cacheDir.listFiles { f -> f.name.startsWith(tmpDb.name) }?.forEach { it.delete() }
-        }
-
-        if (patchedCount == 0) {
-            return false to "Failed to write `.ROBLOSECURITY` into WebView SQLite database(s)."
-        }
-
-        // Launch via normal Launcher first so Roblox loads the WebView cookie cleanly
-        SuShell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
-
-        // Poll up to 12 seconds to confirm Roblox actually established an ACTIVE session
-        var verifiedActive: AccInfo? = null
-        for (attempt in 1..6) {
-            runCatching { Thread.sleep(2000) }
-            val hit = scanRbx(c).firstOrNull { it.pkg == pkg && it.status == "ACTIVE" }
-            if (hit != null) {
-                verifiedActive = hit
-                break
+        val clones = Rejoiner.discoverClones().take(4)
+        clones.forEachIndexed { idx, slot ->
+            SuShell.exec("monkey -p ${slot.pkg} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+            runCatching { Thread.sleep(600) }
+            val taskId = findTaskId(slot.pkg)
+            if (taskId != null) {
+                val q = quadrants[idx]
+                SuShell.exec(
+                    "am task set-windowing-mode $taskId 5 >/dev/null 2>&1; " +
+                    "am task resize $taskId ${q.left} ${q.top} ${q.right} ${q.bottom} >/dev/null 2>&1"
+                )
             }
         }
-
-        if (verifiedActive != null) {
-            histPrefs(c).edit().putString(pkg, verifiedActive.user).apply()
-            if (knownUserId > 0L) Rejoiner.saveUserId(c, verifiedActive.user, knownUserId)
-            log("[LAUNCH] Verified logged in on $pkg -> ${verifiedActive.user}")
-            return true to verifiedActive.user
-        }
-
-        val hintUser = knownUser.ifEmpty { "account" }
-        log("[LAUNCH-WARN] Cookie written ($patchedCount DBs), but $pkg did not become ACTIVE for $hintUser")
-        return false to "Cookie was written to `$pkg` ($patchedCount DB), but Roblox stayed on the login screen. Either **Account Session Protection** (IP/region lock) is enabled on this account or Roblox cleared the cookie on launch."
+        return clones.size
     }
 
     fun fmtLine(idx: Int, a: AccInfo): String {
+        val slot = Rejoiner.slots[a.pkg]
+        val extra = if (slot != null && slot.status == "NO_DELTA_KEY") " ⚠️ *(No Delta Key)*"
+        else if (slot != null && slot.paused) " ⏸️ *(Paused)*"
+        else ""
         val tag = when (a.status) {
-            "ACTIVE" -> "🟢 *(Running)*"
+            "ACTIVE" -> "🟢 *(Running)*$extra"
             "LOGGED OUT" -> "🔴 *(Logged Out)*"
             else -> "⚪ *(Empty)*"
         }
@@ -1168,17 +1019,27 @@ class DiscordBot(private val ctx: Context) {
     private var seq: Int? = null
     @Volatile private var botId: String = ""
     @Volatile private var alive = true
+    @Volatile private var activeChannelId: String = ""
 
     private val checkIns = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
     private val checkInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
 
-    private val freeCheckIns = ConcurrentHashMap<String, ConcurrentHashMap<String, Pair<String, Int>>>()
-    private val freeCheckInMsgIds = ConcurrentHashMap<String, ConcurrentLinkedQueue<String>>()
-
-    fun start() { connect() }
+    fun start() {
+        activeChannelId = PilotCore.getSsChannel(ctx)
+        PilotCore.onAlert = { title, body ->
+            val targetCh = activeChannelId.ifEmpty { PilotCore.getSsChannel(ctx) }
+            if (targetCh.isNotEmpty()) {
+                ioExec.execute {
+                    sendMsg(targetCh, "**📱 ${PilotCore.getCloud(ctx)} — $title**\n$body")
+                }
+            }
+        }
+        connect()
+    }
 
     fun stop() {
         alive = false
+        PilotCore.onAlert = null
         hbTask?.cancel(true)
         ws?.close(1000, "Stopped")
         exec.shutdownNow()
@@ -1323,80 +1184,16 @@ class DiscordBot(private val ctx: Context) {
                         }
                     }
                 }
-                content.startsWith("PILOT_FREE:") -> {
-                    val p = content.split(":", limit = 5)
-                    if (p.size >= 5) {
-                        val anchor = p[1]
-                        val cloud = p[2]
-                        val ver = p[3]
-                        val freeCnt = p[4].toIntOrNull() ?: 0
-                        if (freeCnt > 0) {
-                            freeCheckIns.computeIfAbsent(anchor) { ConcurrentHashMap() }[cloud] = ver to freeCnt
-                        }
-                        val mid = d.optString("id")
-                        if (mid.isNotEmpty()) {
-                            freeCheckInMsgIds.computeIfAbsent(anchor) { ConcurrentLinkedQueue() }.add(mid)
-                        }
-                    }
-                }
-                content.startsWith("✅ **Cookie Verified!**") -> {
-                    val sid = Regex("""\*\*Session:\*\*\s*`([^`]+)`""").find(content)?.groupValues?.get(1)
-                    val accMatch = Regex("""\*\*Account:\*\*\s*`([^`]+)`\s*\(`(\d+)`\)""").find(content)
-                    if (!sid.isNullOrEmpty() && accMatch != null) {
-                        AccountLaunchManager.getSession(ctx, sid)?.let { s ->
-                            s.username = accMatch.groupValues[1]
-                            s.userId = accMatch.groupValues[2].toLongOrNull() ?: 0L
-                            s.stage = LaunchStage.AWAITING_JSON
-                            AccountLaunchManager.putSession(ctx, s)
-                        }
-                    }
-                }
-                content.startsWith("❌ **Account Launch Failed**") -> {
-                    val sid = Regex("""\(`([^`]+)`\)""").find(content)?.groupValues?.get(1)
-                    if (!sid.isNullOrEmpty()) AccountLaunchManager.removeSession(ctx, sid)
-                }
-                content.startsWith("PILOT_PACK_REQ:") -> {
-                    ioExec.execute { handlePackRequest(d) }
-                }
-                content.startsWith("PILOT_XFER:") -> {
-                    ioExec.execute { handleTransferPayload(d) }
-                }
+                content.startsWith("PILOT_PACK_REQ:") -> ioExec.execute { handlePackRequest(d) }
+                content.startsWith("PILOT_XFER:") -> ioExec.execute { handleTransferPayload(d) }
             }
             return
         }
 
         if (!PilotCore.isAuthorized(ctx, authorId, memberRoles)) return
+        activeChannelId = ch
         val msgId = d.optString("id", "")
         val cl = PilotCore.getCloud(ctx)
-
-        val awaiting = AccountLaunchManager.findAwaitingSession(ctx, authorId, ch)
-        if (awaiting != null) {
-            if (content.equals("!cancel", ignoreCase = true)) {
-                AccountLaunchManager.removeSession(ctx, awaiting.sessionId)
-                if (awaiting.coordinatorCloud.equals(cl, ignoreCase = true)) {
-                    ioExec.execute { sendMsg(ch, "🛑 Cancelled **!accountlaunch** session (`${awaiting.sessionId}`).") }
-                }
-                return
-            }
-
-            val atts = d.optJSONArray("attachments")
-            val hasFile = atts != null && atts.length() > 0
-            val isSkip = content.equals("skip", ignoreCase = true)
-
-            if (hasFile || isSkip || (!content.startsWith("!") && content.isNotEmpty())) {
-                if (isSkip) {
-                    awaiting.skipJson = true
-                } else if (hasFile) {
-                    awaiting.jsonUrl = atts!!.getJSONObject(0).optString("url", "")
-                } else {
-                    awaiting.inlineJson = content
-                }
-                awaiting.stage = LaunchStage.PICKING_CLOUD
-                AccountLaunchManager.putSession(ctx, awaiting)
-                ioExec.execute { collectAndPostAvailableCloudMenu(ch, msgId, awaiting) }
-                return
-            }
-        }
 
         if (!content.startsWith("!")) return
         val parts = content.split(" ", limit = 2)
@@ -1409,6 +1206,14 @@ class DiscordBot(private val ctx: Context) {
                 collectAndPostSharedText(ch, msgId, "**📱 Online Pilot Instances:**") { cloud, ver ->
                     "• **$cloud** — `$ver`"
                 }
+            }
+            "!health" -> ioExec.execute {
+                Thread.sleep(((abs(cl.hashCode()) % 12) * 100L))
+                val mem = SuShell.exec("free -m | awk '/Mem:/ {print \$4\"/\"\$2\" MB\"}'").trim()
+                val slots = Rejoiner.discoverClones()
+                val active = slots.count { it.status == "ACTIVE" }
+                val upMin = SystemClock.elapsedRealtime() / 60000L
+                sendMsg(ch, "🩺 **$cl** (${PilotCore.APP_VERSION}) | RAM Free: `$mem` | Slots: **$active/${slots.size} ACTIVE** | Uptime: `${upMin}m`")
             }
             "!createconfig", "!newconfig" -> ioExec.execute {
                 val btn = JSONObject()
@@ -1427,26 +1232,11 @@ class DiscordBot(private val ctx: Context) {
                         .put("components", row)
                 )
             }
-            "!accountlaunch", "!al" -> ioExec.execute {
-                val sid = msgId.takeLast(8).ifEmpty { (100000..999999).random().toString() }
-                val btn = JSONObject()
-                    .put("type", 2)
-                    .put("style", 3)
-                    .put("label", "🚀 Enter Roblox Cookie")
-                    .put("custom_id", "pilot_al_btn:open:$cl:$sid")
-                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(btn)))
-                val header = "**🚀 Pilot Account Launch**"
-                postSingleCoordinatorMessage(
-                    ch,
-                    msgId,
-                    header,
-                    JSONObject()
-                        .put("content", "$header\nClick the button below to submit the `.ROBLOSECURITY` cookie. Pilot will resolve the username, prompt for your Nousigi Hub JSON (`message.txt`), and let you pick an available UGPhone slot:")
-                        .put("components", row)
-                )
+            "!login" -> ioExec.execute {
+                collectAndPostSharedCloudMenu(ch, msgId, "login", "**🔐 Select Cloud Phone to Login Roblox Account:**")
             }
             "!autorejoin", "!ar" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "ar", "**🔁 Select Cloud Phone to Configure Auto-Rejoin:**")
+                collectAndPostSharedCloudMenu(ch, msgId, "ar", "**🔁 Select Cloud Phone to Configure Auto-Rejoin & Keys:**", includeAllOption = true)
             }
             "!rejoin" -> {
                 if (arg.isEmpty()) {
@@ -1460,7 +1250,8 @@ class DiscordBot(private val ctx: Context) {
                         val match = list.firstOrNull { it.user != "Empty" && (it.user.lowercase().contains(q) || PilotCore.similarity(q, it.user.lowercase()) >= 0.45) }
                         if (match != null) {
                             sendMsg(ch, "🔁 **📱 $cl** — Force-rejoining **${match.user}** (`${match.pkg}`)...")
-                            Rejoiner.relaunch(ctx, match.pkg)
+                            val slot = Rejoiner.slots.getOrPut(match.pkg) { CloneSlot(match.pkg, username = match.user) }
+                            Rejoiner.queueStaggeredLaunch(ctx, slot, "Manual !rejoin")
                         } else {
                             runCatching { Thread.sleep(2200L + (abs(cl.hashCode()) % 12) * 100L) }
                             if (!hasBotRepliedAfter(ch, msgId)) {
@@ -1470,14 +1261,113 @@ class DiscordBot(private val ctx: Context) {
                     }
                 }
             }
+            "!pause", "!resume" -> {
+                if (arg.isEmpty()) return
+                ioExec.execute {
+                    val slot = Rejoiner.setSlotPaused(arg, paused = (cmd == "!pause"))
+                    if (slot != null) {
+                        sendMsg(ch, "${if (cmd == "!pause") "⏸️ Paused" else "▶️ Resumed"} **${slot.username.ifBlank { slot.pkg }}** on **$cl**.")
+                    }
+                }
+            }
+            "!getkey" -> {
+                val tokens = arg.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                val url = tokens.firstOrNull { it.startsWith("http", true) }.orEmpty()
+                val targetCloud = tokens.firstOrNull { !it.startsWith("http", true) }.orEmpty()
+                if (url.isEmpty()) {
+                    ioExec.execute {
+                        if (!hasBotRepliedAfter(ch, msgId)) sendMsg(ch, "⚠️ Usage: `!getkey [cloud] <luarmor_or_platorelay_url>`")
+                    }
+                    return
+                }
+                if (targetCloud.isNotEmpty() && !targetCloud.equals(cl, true)) return
+                ioExec.execute {
+                    if (targetCloud.isEmpty()) {
+                        val won = postSingleCoordinatorMessage(ch, msgId, "🔑 **Key Automator Started**", JSONObject().put("content", "🔑 **Key Automator Started** on **$cl**..."))
+                        if (!won) return@execute
+                    }
+                    if (url.contains("luarmor", true)) {
+                        val updated = Rejoiner.loadConfig(ctx).copy(luarmorUrl = url)
+                        Rejoiner.saveConfig(ctx, updated)
+                        KeyAutomator.startNousigiRenewal(ctx)
+                    } else {
+                        KeyAutomator.startDeltaRenewal(ctx, explicitUrl = url)
+                    }
+                }
+            }
+            "!setconfig" -> {
+                if (arg.isEmpty()) return
+                ioExec.execute {
+                    val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
+                    val match = list.firstOrNull { it.user != "Empty" && it.user.equals(arg, ignoreCase = true) } ?: return@execute
+                    var jsonPayload = ""
+                    val atts = d.optJSONArray("attachments")
+                    if (atts != null && atts.length() > 0) {
+                        val fileUrl = atts.getJSONObject(0).optString("url")
+                        if (fileUrl.isNotEmpty()) {
+                            jsonPayload = runCatching {
+                                restClient.newCall(Request.Builder().url(fileUrl).build()).execute().use { it.body?.string().orEmpty() }
+                            }.getOrDefault("")
+                        }
+                    }
+                    if (jsonPayload.isBlank()) {
+                        val block = Regex("```(?:json)?\\s*([\\s\\S]+?)```").find(content)?.groupValues?.get(1)
+                        if (!block.isNullOrBlank()) jsonPayload = block.trim()
+                    }
+                    if (jsonPayload.isNotBlank()) {
+                        val dir = "/storage/emulated/0/Delta/Workspace/Nousigi Hub"
+                        val fileName = "${match.user}_AnimeAdventures.json"
+                        val tmp = File(ctx.cacheDir, fileName)
+                        tmp.writeText(jsonPayload)
+                        SuShell.exec("mkdir -p '$dir' && cp '${tmp.absolutePath}' '$dir/$fileName' && chmod 666 '$dir/$fileName'")
+                        tmp.delete()
+                        sendMsg(ch, "✅ Saved `$fileName` on **$cl**.")
+                    }
+                }
+            }
+            "!pushscript" -> {
+                val atts = d.optJSONArray("attachments") ?: return
+                if (atts.length() == 0) return
+                val att = atts.getJSONObject(0)
+                val name = att.optString("filename")
+                val url = att.optString("url")
+                if (!name.endsWith(".lua", true) || url.isEmpty()) return
+                ioExec.execute {
+                    val body = runCatching {
+                        restClient.newCall(Request.Builder().url(url).build()).execute().use { it.body?.string().orEmpty() }
+                    }.getOrDefault("")
+                    if (body.isNotBlank()) {
+                        val tmp = File(ctx.cacheDir, name)
+                        tmp.writeText(body)
+                        SuShell.exec(
+                            "for d in /storage/emulated/0/Delta/Autoexecute /storage/emulated/0/Delta/AutoExcecute; do " +
+                            "mkdir -p \"\${d}\" && cp '${tmp.absolutePath}' \"\${d}/$name\" && chmod 666 \"\${d}/$name\"; done"
+                        )
+                        tmp.delete()
+                        sendMsg(ch, "📜 Deployed `$name` to Autoexecute on **$cl**.")
+                    }
+                }
+            }
             "!scan" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "s", "**Select Cloud to Scan:**")
             }
             "!logout" -> ioExec.execute {
-                collectAndPostSharedCloudMenu(ch, msgId, "l", "**Select Cloud to Logout:**")
+                collectAndPostSharedCloudMenu(ch, msgId, "l", "**Select Cloud to Logout (Server Token Revoke + Wipe):**")
             }
             "!delete" -> ioExec.execute {
                 collectAndPostSharedCloudMenu(ch, msgId, "d", "**Select Cloud to Delete Account & History:**")
+            }
+            "!arrange" -> ioExec.execute {
+                collectAndPostSharedCloudMenu(ch, msgId, "arrange", "**Select Cloud to Arrange 2×2 Grid:**", includeAllOption = true)
+            }
+            "!logs" -> ioExec.execute {
+                collectAndPostSharedCloudMenu(ch, msgId, "logs", "**Select Cloud to View Live Logs:**")
+            }
+            "!killall" -> ioExec.execute {
+                collectAndPostSharedCloudMenu(ch, msgId, "killall", "**Select Cloud to Force-Stop All Clones:**", includeAllOption = true)
+            }
+            "!reboot" -> ioExec.execute {
+                collectAndPostSharedCloudMenu(ch, msgId, "reboot", "**Select Cloud Phone to Reboot:**")
             }
             "!changeslot" -> ioExec.execute {
                 if (arg.isEmpty()) {
@@ -1632,126 +1522,6 @@ class DiscordBot(private val ctx: Context) {
         return pa.size.compareTo(pb.size)
     }
 
-    private fun collectAndPostAvailableCloudMenu(ch: String, anchorMsgId: String, session: LaunchSession) {
-        val myCloud = PilotCore.getCloud(ctx)
-        val myVer = PilotCore.APP_VERSION
-        val slots = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
-        val freeCount = slots.count { it.status == "EMPTY" || it.status == "LOGGED OUT" }
-        val title = "**🚀 Account Launch (`${session.username}`)** — Select a Cloud Phone with an available slot:"
-
-        if (freeCount == 0) {
-            if (session.coordinatorCloud.equals(myCloud, ignoreCase = true)) {
-                runCatching { Thread.sleep(3200) }
-                if (!hasBotRepliedAfter(ch, anchorMsgId)) {
-                    AccountLaunchManager.removeSession(ctx, session.sessionId)
-                    sendMsg(ch, "⚠️ No online cloud phones currently have an **Empty** or **Logged Out** slot available for `${session.username}`.")
-                }
-            }
-            return
-        }
-
-        val map = freeCheckIns.computeIfAbsent(anchorMsgId) { ConcurrentHashMap() }
-        map[myCloud] = myVer to freeCount
-
-        val jitterMs = (abs(myCloud.hashCode()) % 14) * 95L
-        if (jitterMs > 0) runCatching { Thread.sleep(jitterMs) }
-
-        val existing = findCanonicalBotMessage(ch, anchorMsgId, title)
-        val targetId: String
-        if (existing == null) {
-            val opt = JSONObject()
-                .put("label", "📱 $myCloud".take(100))
-                .put("value", myCloud.take(100))
-                .put("description", "$freeCount free slot(s) • $myVer".take(100))
-            val menu = JSONObject()
-                .put("type", 3)
-                .put("custom_id", "pilot_al_cloud:${session.sessionId}:row0")
-                .put("placeholder", "Scanning clouds with free slots...")
-                .put("options", JSONArray().put(opt))
-            val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-            val postedRaw = apiPost(
-                "https://discord.com/api/v10/channels/$ch/messages",
-                JSONObject().put("content", title).put("components", row)
-            )
-            val postedId = runCatching { JSONObject(postedRaw).getString("id") }.getOrDefault("")
-
-            runCatching { Thread.sleep(350) }
-            val canonical = findCanonicalBotMessage(ch, anchorMsgId, title)
-            if (canonical != null && postedId.isNotEmpty() && canonical.optString("id") != postedId) {
-                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$postedId")
-                postSelfCleaningCheckIn(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
-                return
-            }
-            targetId = canonical?.optString("id")?.takeIf { it.isNotEmpty() } ?: postedId
-        } else {
-            postSelfCleaningCheckIn(ch, "PILOT_FREE:$anchorMsgId:$myCloud:$myVer:$freeCount")
-            return
-        }
-
-        if (targetId.isEmpty()) return
-
-        runCatching { Thread.sleep(2200) }
-
-        val recentRaw = apiGet("https://discord.com/api/v10/channels/$ch/messages?after=$anchorMsgId&limit=50")
-        runCatching {
-            val arr = JSONArray(recentRaw)
-            for (i in 0 until arr.length()) {
-                val m = arr.getJSONObject(i)
-                val c = m.optString("content")
-                if (c.startsWith("PILOT_FREE:$anchorMsgId:")) {
-                    val p = c.split(":", limit = 5)
-                    if (p.size >= 5) {
-                        val cnt = p[4].toIntOrNull() ?: 0
-                        if (cnt > 0) map[p[2]] = p[3] to cnt
-                        val mid = m.optString("id")
-                        if (mid.isNotEmpty()) apiDelete("https://discord.com/api/v10/channels/$ch/messages/$mid")
-                    }
-                }
-            }
-        }
-
-        val q = freeCheckInMsgIds.remove(anchorMsgId)
-        if (q != null) {
-            while (true) {
-                val mid = q.poll() ?: break
-                apiDelete("https://discord.com/api/v10/channels/$ch/messages/$mid")
-            }
-        }
-
-        val sortedClouds = map.keys.sortedWith { a, b -> naturalCompare(a, b) }
-        val allOpts = sortedClouds.map { cloud ->
-            val (ver, cnt) = map[cloud] ?: (myVer to 1)
-            JSONObject()
-                .put("label", "📱 $cloud".take(100))
-                .put("value", cloud.take(100))
-                .put("description", "$cnt free slot(s) • $ver".take(100))
-        }
-        freeCheckIns.remove(anchorMsgId)
-
-        val rows = JSONArray()
-        val chunks = allOpts.chunked(25).take(5)
-        chunks.forEachIndexed { idx, chunk ->
-            val arr = JSONArray()
-            chunk.forEach { arr.put(it) }
-            val ph = if (chunks.size > 1) {
-                "Select Available Cloud (${idx * 25 + 1}–${idx * 25 + chunk.size})..."
-            } else {
-                "Select Cloud (${allOpts.size} with free slots)..."
-            }
-            val menu = JSONObject()
-                .put("type", 3)
-                .put("custom_id", "pilot_al_cloud:${session.sessionId}:row$idx")
-                .put("placeholder", ph)
-                .put("options", arr)
-            rows.put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-        }
-
-        apiPatch(
-            "https://discord.com/api/v10/channels/$ch/messages/$targetId",
-            JSONObject().put("content", title).put("components", rows)
-        )
-    }
-
     private fun electAndCollectClouds(
         ch: String,
         anchorMsgId: String,
@@ -1823,27 +1593,51 @@ class DiscordBot(private val ctx: Context) {
         return targetId to snapshot
     }
 
-    private fun collectAndPostSharedCloudMenu(ch: String, anchorMsgId: String, mode: String, title: String) {
+    private fun collectAndPostSharedCloudMenu(
+        ch: String,
+        anchorMsgId: String,
+        mode: String,
+        title: String,
+        includeAllOption: Boolean = false
+    ) {
         val result = electAndCollectClouds(ch, anchorMsgId, title) { myCloud, myVer ->
-            val opt = JSONObject()
+            val opts = JSONArray()
+            if (includeAllOption) {
+                opts.put(JSONObject()
+                    .put("label", "🌐 ALL ONLINE CLOUDS")
+                    .put("value", "ALL")
+                    .put("description", "Apply across every online UGPhone"))
+            }
+            opts.put(JSONObject()
                 .put("label", "📱 $myCloud".take(100))
                 .put("value", myCloud.take(100))
-                .put("description", "$myVer • Tap to select".take(100))
+                .put("description", "$myVer • Tap to select".take(100)))
             val menu = JSONObject()
                 .put("type", 3)
                 .put("custom_id", "pilot_cloud:$mode:row0")
                 .put("placeholder", "Scanning online clouds...")
-                .put("options", JSONArray().put(opt))
+                .put("options", opts)
             val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
             JSONObject().put("content", title).put("components", row)
         } ?: return
 
         val (targetId, cloudsMap) = result
-        val allOpts = cloudsMap.map { (cloud, ver) ->
-            JSONObject()
-                .put("label", "📱 $cloud".take(100))
-                .put("value", cloud.take(100))
-                .put("description", "$ver • Tap to select".take(100))
+        val allOpts = mutableListOf<JSONObject>()
+        if (includeAllOption) {
+            allOpts.add(
+                JSONObject()
+                    .put("label", "🌐 ALL ONLINE CLOUDS")
+                    .put("value", "ALL")
+                    .put("description", "Apply across all ${cloudsMap.size} online clouds")
+            )
+        }
+        cloudsMap.forEach { (cloud, ver) ->
+            allOpts.add(
+                JSONObject()
+                    .put("label", "📱 $cloud".take(100))
+                    .put("value", cloud.take(100))
+                    .put("description", "$ver • Tap to select".take(100))
+            )
         }
 
         val rows = JSONArray()
@@ -1854,7 +1648,7 @@ class DiscordBot(private val ctx: Context) {
             val ph = if (chunks.size > 1) {
                 "Select Cloud (${idx * 25 + 1}–${idx * 25 + chunk.size})..."
             } else {
-                "Select Cloud (${allOpts.size} online)..."
+                "Select Cloud (${cloudsMap.size} online)..."
             }
             val menu = JSONObject()
                 .put("type", 3)
@@ -1902,9 +1696,7 @@ class DiscordBot(private val ctx: Context) {
             (0 until arr.length()).any { i ->
                 val m = arr.getJSONObject(i)
                 val c = m.optString("content")
-                m.optJSONObject("author")?.optString("id") == botId &&
-                    !c.startsWith("PILOT_HERE:") &&
-                    !c.startsWith("PILOT_FREE:")
+                m.optJSONObject("author")?.optString("id") == botId && !c.startsWith("PILOT_HERE:")
             }
         }.getOrDefault(false)
     }
@@ -2006,33 +1798,34 @@ class DiscordBot(private val ctx: Context) {
         val helpText = """
             **📖 PILOT BOT COMMANDS (${PilotCore.APP_VERSION})**
 
-            **🚀 Account Launch & Setup**
-            • `!accountlaunch` (or `!al`) — Submit `.ROBLOSECURITY` cookie via modal, resolve username, upload Nousigi Hub config (`message.txt`), pick an available UGPhone slot & launch
+            **🔐 Account Login & Session Control**
+- `!login` — Pick a cloud & slot, then enter **Username**, **Password**, and optional **2FA Backup Code** in a Discord modal
+- `!logout` — Revoke session token on Roblox servers (`v2/logout`), wipe `SessionVault`, and log out slot(s)
+- `!delete` — Full 3-step purge + clear slot username history back to `Empty`
+- `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
 
-            **🔍 Monitoring & Search**
-            • `!scan` — Select a cloud phone to list all Roblox instances & statuses
-            • `!search <username>` — Find which cloud & slot has an account (exact or close match)
-            • `!checkstatus <username>` — Expand that player's Roblox to **full-tab**, capture screenshot, and restore/minimize it back
-            • `!version` — Show the installed Pilot version on every online cloud phone
+            **🔍 Monitoring, Health & Screenshots**
+- `!scan` — Select a cloud phone to list all Roblox instances & statuses
+- `!health` — Show free RAM, active/frozen slot count, and uptime across all online clouds
+- `!search <username>` — Find which cloud & slot has an account
+- `!checkstatus <username>` — Maximize via `[□]`, capture screenshot, and snap back to 2×2
+- `!ss` / `!ss all` — Full-screen screenshot of a cloud (or all clouds)
+- `!sschannel` — Set this channel for key/session alerts & Lua `getgenv().PilotSnap()` triggers
 
-            **🔁 All-in-One Auto-Rejoiner**
-            • `!autorejoin` — Toggle Auto-Rejoin ON/OFF or set a Place ID / Private Server link
-            • `!rejoin <username>` — Immediately force-restart & rejoin a specific account
+            **🔁 Rejoiner, Keys & Fleet Maintenance**
+- `!autorejoin` (or `!ar`) — Control Rejoiner, Game Place ID, FPS Opt, 3D Render Off, Auto Nousigi Key, and Auto Delta Key (single cloud or `ALL ONLINE CLOUDS`)
+- `!rejoin <username>` — Immediately force-restart & rejoin a specific account
+- `!pause <username>` / `!resume <username>` — Pause or resume Rejoiner watchdog on a single slot
+- `!getkey [cloud] <url>` — Trigger background Luarmor (Nousigi) or PlatoRelay (Delta) key automator
+- `!setconfig <username>` — Upload `message.txt`/`.json` or paste JSON to save Nousigi config for that account
+- `!pushscript` — Attach a `.lua` file to deploy into `Delta/Autoexecute/` across all online clouds
+- `!arrange` / `!logs` / `!killall` / `!reboot` — Grid layout, live telemetry logs, force-stop clones, or reboot cloud
 
-            **📸 Screenshots & Auto-Capture**
-            • `!ss` — Select a cloud phone for a full-screen screenshot (or `!ss all`)
-            • `!sschannel` — Set this channel for hourly Delta auto-screenshots & Lua triggers
-            • *Lua Trigger:* Call `getgenv().PilotSnap()` inside any Delta script
-
-            **⚙️ Account & Cloud Management**
-            • `!createconfig` — Build a new `XXXXXXX-...` Sync Code (supports `@` token bypass & multiple User/Role IDs)
-            • `!changeslot [username]` — Move an account + its script workspace files to another slot/cloud
-            • `!logout` — Log out one or all accounts on a cloud (keeps last username history)
-            • `!delete` — Wipe session data **and** clear username history (resets to Empty)
-            • `!rename <new name>` — Remotely rename a cloud phone
-            • `!update [drive_url]` — Check & silently install the latest Pilot APK
-            • `!config` — Post & DM your current `XXXXXXX-...` sync code
-            • `!help` — Show this command guide
+            **⚙️ Setup & OTA Updates**
+- `!createconfig` — Build a `XXXXXXX-...` Sync Code (supports `@` token bypass & multiple User/Role IDs)
+- `!config` — Post & DM your current `XXXXXXX-...` Sync Code
+- `!rename <new name>` — Remotely rename a cloud phone
+- `!update [drive_url]` / `!version` — OTA APK update & version check
         """.trimIndent()
 
         sendMsg(ch, helpText)
@@ -2040,39 +1833,29 @@ class DiscordBot(private val ctx: Context) {
 
     private fun openCreateConfigModal(id: String, token: String, targetCloud: String) {
         val fToken = JSONObject()
-            .put("type", 4)
-            .put("custom_id", "token")
+            .put("type", 4).put("custom_id", "token")
             .put("label", "Bot Token (put 1 @ inside to bypass)")
-            .put("style", 1)
-            .put("min_length", 20)
-            .put("max_length", 150)
+            .put("style", 1).put("min_length", 20).put("max_length", 150)
             .put("placeholder", "Paste token with one @ inside (e.g. MTIz...@abc.xyz)")
             .put("required", true)
 
         val fIds = JSONObject()
-            .put("type", 4)
-            .put("custom_id", "ids")
+            .put("type", 4).put("custom_id", "ids")
             .put("label", "User ID(s) or Role ID(s) (comma-separated)")
-            .put("style", 1)
-            .put("min_length", 15)
-            .put("max_length", 300)
+            .put("style", 1).put("min_length", 15).put("max_length", 300)
             .put("placeholder", "730629579533844512, 1381256734403854436")
             .put("required", true)
 
         val fChan = JSONObject()
-            .put("type", 4)
-            .put("custom_id", "ss_ch")
-            .put("label", "Screenshot Channel ID (optional)")
-            .put("style", 1)
-            .put("required", false)
+            .put("type", 4).put("custom_id", "ss_ch")
+            .put("label", "Screenshot & Alert Channel ID (optional)")
+            .put("style", 1).put("required", false)
             .put("placeholder", "Leave blank to keep existing")
 
         val fUpd = JSONObject()
-            .put("type", 4)
-            .put("custom_id", "upd_url")
+            .put("type", 4).put("custom_id", "upd_url")
             .put("label", "Google Drive APK Update Link (optional)")
-            .put("style", 1)
-            .put("required", false)
+            .put("style", 1).put("required", false)
             .put("placeholder", "https://drive.google.com/file/d/.../view")
 
         val rows = JSONArray()
@@ -2089,36 +1872,26 @@ class DiscordBot(private val ctx: Context) {
         replyInteraction(id, token, 9, modalData)
     }
 
-    private fun openAccountLaunchModal(id: String, token: String, targetCloud: String, sid: String) {
-        val fCookie = JSONObject()
-            .put("type", 4)
-            .put("custom_id", "cookie")
-            .put("label", ".ROBLOSECURITY Cookie")
-            .put("style", 2)
-            .put("min_length", 50)
-            .put("max_length", 2500)
-            .put("placeholder", "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in...")
-            .put("required", true)
-
-        val fGame = JSONObject()
-            .put("type", 4)
-            .put("custom_id", "game")
-            .put("label", "Nousigi Hub Game Suffix (optional)")
-            .put("style", 1)
-            .put("max_length", 60)
-            .put("value", "AnimeAdventures")
-            .put("placeholder", "AnimeAdventures")
-            .put("required", false)
-
-        val rows = JSONArray()
-            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fCookie)))
-            .put(JSONObject().put("type", 1).put("components", JSONArray().put(fGame)))
-
+    private fun openLoginModal(id: String, token: String, targetCloud: String, pkg: String) {
+        fun row(cid: String, label: String, req: Boolean, ph: String) = JSONObject().put("type", 1).put(
+            "components", JSONArray().put(
+                JSONObject()
+                    .put("type", 4)
+                    .put("custom_id", cid)
+                    .put("label", label)
+                    .put("style", 1)
+                    .put("required", req)
+                    .put("placeholder", ph)
+            )
+        )
         val modalData = JSONObject()
-            .put("custom_id", "pilot_al_modal:$targetCloud:$sid")
-            .put("title", "Account Launch — Cookie Setup")
-            .put("components", rows)
-
+            .put("custom_id", "pilot_login_modal:$targetCloud:$pkg")
+            .put("title", "Roblox Login ($targetCloud)")
+            .put("components", JSONArray()
+                .put(row("login_user", "Roblox Username", true, "Enter username"))
+                .put(row("login_pass", "Roblox Password", true, "Enter password"))
+                .put(row("login_backup", "2FA Backup Code (Optional)", false, "9-character backup code"))
+            )
         replyInteraction(id, token, 9, modalData)
     }
 
@@ -2139,21 +1912,17 @@ class DiscordBot(private val ctx: Context) {
         val myCloud = PilotCore.getCloud(ctx)
 
         if (intType == 5) {
-            if (cid.startsWith("pilot_al_modal:")) {
-                val p = cid.removePrefix("pilot_al_modal:").split(":", limit = 2)
-                if (p.size < 2) return
-                val coordinatorCloud = p[0]
-                val sid = p[1]
-
+            if (cid.startsWith("pilot_login_modal:")) {
+                val p = cid.removePrefix("pilot_login_modal:").split(":", limit = 2)
+                if (p.size < 2 || !p[0].equals(myCloud, ignoreCase = true)) return
+                val pkg = p[1]
                 if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
-                    if (coordinatorCloud.equals(myCloud, ignoreCase = true)) {
-                        replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
-                    }
+                    replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
                     return
                 }
-
-                var rawCookie = ""
-                var rawGame = "AnimeAdventures"
+                var rbxUser = ""
+                var rbxPass = ""
+                var rbxBackup = ""
                 val rows = data.optJSONArray("components")
                 if (rows != null) {
                     for (r in 0 until rows.length()) {
@@ -2161,55 +1930,26 @@ class DiscordBot(private val ctx: Context) {
                         for (c in 0 until comps.length()) {
                             val item = comps.getJSONObject(c)
                             when (item.optString("custom_id")) {
-                                "cookie" -> rawCookie = item.optString("value", "")
-                                "game" -> rawGame = item.optString("value", "AnimeAdventures")
+                                "login_user" -> rbxUser = item.optString("value", "").trim()
+                                "login_pass" -> rbxPass = item.optString("value", "")
+                                "login_backup" -> rbxBackup = item.optString("value", "").trim()
                             }
                         }
                     }
                 }
-
-                val gameSuffix = AccountLaunchManager.sanitizeGameSuffix(rawGame)
-                AccountLaunchManager.cleanupExpired(ctx)
-
-                val session = LaunchSession(
-                    sessionId = sid,
-                    coordinatorCloud = coordinatorCloud,
-                    authorId = userId,
-                    channelId = ch,
-                    rawCookie = rawCookie,
-                    gameSuffix = gameSuffix
-                )
-                AccountLaunchManager.putSession(ctx, session)
-
-                if (!coordinatorCloud.equals(myCloud, ignoreCase = true)) return
-
-                replyInteraction(
-                    id, token, 4,
-                    JSONObject().put("content", "⏳ Verifying `.ROBLOSECURITY` cookie with Roblox...").put("flags", 64)
-                )
-
+                replyInteraction(id, token, 4, JSONObject().put("content", "🔐 Logging **$rbxUser** into `$pkg` on **$myCloud**...").put("flags", 64))
                 ioExec.execute {
-                    val (ok, rbxUid, nameOrErr) = AccountLaunchManager.resolveCookieUser(rawCookie)
-                    if (!ok) {
-                        AccountLaunchManager.removeSession(ctx, sid)
-                        if (ch.isNotEmpty()) {
-                            sendMsg(ch, "❌ **Account Launch Failed** (`$sid`): $nameOrErr")
+                    val res = RobloxAutoLogin.performLogin(
+                        ctx, pkg, rbxUser, rbxPass.toCharArray(), rbxBackup,
+                        onCaptchaAlert = {
+                            if (ch.isNotEmpty()) {
+                                sendMsg(ch, "🧩 **CAPTCHA Detected** on **$myCloud** (`$pkg`) — solve it on the UGPhone within 90s; Pilot will finish 2FA automatically!")
+                            }
                         }
-                        return@execute
-                    }
-                    session.username = nameOrErr
-                    session.userId = rbxUid
-                    session.stage = LaunchStage.AWAITING_JSON
-                    AccountLaunchManager.putSession(ctx, session)
+                    )
+                    PilotCore.scanRbx(ctx)
                     if (ch.isNotEmpty()) {
-                        sendMsg(
-                            ch,
-                            "✅ **Cookie Verified!**\n" +
-                            "• **Account:** `$nameOrErr` (`$rbxUid`)\n" +
-                            "• **Target Config:** `${AccountLaunchManager.NOUSIGI_DIR}/${nameOrErr}_${gameSuffix}.json`\n" +
-                            "• **Session:** `$sid`\n\n" +
-                            "📄 **Next Step:** Send your Nousigi Hub config file (`message.txt` or `.json`) or paste the text in this channel now — or type `skip` to launch without a config file *(type `!cancel` to abort)*."
-                        )
+                        sendMsg(ch, "${if (res.success) "✅" else "❌"} **[$myCloud]** ${res.message}")
                     }
                 }
                 return
@@ -2217,11 +1957,8 @@ class DiscordBot(private val ctx: Context) {
 
             if (cid.startsWith("pilot_ar_modal:")) {
                 val targetCloud = cid.removePrefix("pilot_ar_modal:")
-                if (!targetCloud.equals(myCloud, ignoreCase = true)) return
-                if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
-                    replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
-                    return
-                }
+                if (targetCloud != "ALL" && !targetCloud.equals(myCloud, ignoreCase = true)) return
+                if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) return
                 var targetLink = ""
                 val rows = data.optJSONArray("components")
                 if (rows != null) {
@@ -2229,33 +1966,29 @@ class DiscordBot(private val ctx: Context) {
                         val comps = rows.getJSONObject(r).optJSONArray("components") ?: continue
                         for (c in 0 until comps.length()) {
                             val item = comps.getJSONObject(c)
-                            if (item.optString("custom_id") == "target") {
-                                targetLink = item.optString("value", "")
-                            }
+                            if (item.optString("custom_id") == "target") targetLink = item.optString("value", "").trim()
                         }
                     }
                 }
-                Rejoiner.setConfig(ctx, enabled = true, target = targetLink)
-                val displayTarget = targetLink.trim().ifEmpty { "Auto-detect each account's last Place ID" }
-                replyInteraction(
-                    id, token, 4,
-                    JSONObject()
-                        .put(
-                            "content",
-                            "✅ **Auto-Rejoiner Enabled on $myCloud!**\n" +
-                            "• **Target:** `$displayTarget`\n" +
-                            "• **Checks:** Delta Heartbeat + Freeze Detector + Roblox Presence API + Process Watchdog\n" +
-                            "• **Teleport Protection:** Active (pauses during place-to-place teleports)"
-                        )
-                        .put("flags", 64)
-                )
+                val prev = Rejoiner.loadConfig(ctx)
+                val updated = if (targetLink.startsWith("http", true)) {
+                    prev.copy(enabled = true, privateServerLinks = targetLink)
+                } else {
+                    prev.copy(enabled = true, targetPlaceId = targetLink, privateServerLinks = "")
+                }
+                Rejoiner.saveConfig(ctx, updated)
+                if (targetCloud != "ALL" || targetCloud.equals(myCloud, true)) {
+                    replyInteraction(
+                        id, token, 4,
+                        JSONObject().put("content", "✅ **Rejoiner Target Updated (`$targetCloud`)** -> `${targetLink.ifEmpty { "Auto Last Place ID" }}`").put("flags", 64)
+                    )
+                }
                 return
             }
 
             if (!cid.startsWith("pilot_cfg_modal:")) return
             val targetCloud = cid.removePrefix("pilot_cfg_modal:")
             if (!targetCloud.equals(myCloud, ignoreCase = true)) return
-
             if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
                 replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
                 return
@@ -2314,20 +2047,6 @@ class DiscordBot(private val ctx: Context) {
             return
         }
 
-        if (cid.startsWith("pilot_al_btn:open:")) {
-            val p = cid.removePrefix("pilot_al_btn:open:").split(":", limit = 2)
-            if (p.size < 2) return
-            val targetCloud = p[0]
-            val sid = p[1]
-            if (!targetCloud.equals(myCloud, ignoreCase = true)) return
-            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
-                return
-            }
-            openAccountLaunchModal(id, token, myCloud, sid)
-            return
-        }
-
         if (cid.startsWith("pilot_cfg_btn:open:")) {
             val targetCloud = cid.removePrefix("pilot_cfg_btn:open:")
             if (!targetCloud.equals(myCloud, ignoreCase = true)) return
@@ -2350,83 +2069,58 @@ class DiscordBot(private val ctx: Context) {
         val mode = cid.substring(firstColon + 1, lastColon)
         val suffix = cid.substring(lastColon + 1)
 
-        if (kind == "pilot_al_cloud") {
-            if (!sel.equals(myCloud, ignoreCase = true)) return
-            if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
-                return
-            }
-            val session = AccountLaunchManager.getSession(ctx, mode)
-            if (session == null) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "⚠️ Account Launch session expired. Please run `!accountlaunch` again.").put("flags", 64))
-                return
-            }
-
-            val allSlots = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }
-            val freeIndexed = allSlots.mapIndexedNotNull { idx, acc ->
-                if (acc.status == "EMPTY" || acc.status == "LOGGED OUT") idx to acc else null
-            }
-            if (freeIndexed.isEmpty()) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "⚠️ **$myCloud** no longer has any Empty or Logged Out slots.").put("flags", 64))
-                return
-            }
-
-            val opts = JSONArray()
-            freeIndexed.take(25).forEach { (idx, acc) ->
-                opts.put(
-                    JSONObject()
-                        .put("label", "[${idx + 1}] ${acc.user} [${acc.status}] (${acc.pkg})".take(100))
-                        .put("value", acc.pkg.take(100))
-                        .put("description", "Launch ${session.username.ifEmpty { "account" }} in ${acc.pkg}".take(100))
-                )
-            }
-            val menu = JSONObject()
-                .put("type", 3)
-                .put("custom_id", "pilot_al_slot:${session.sessionId}:$myCloud")
-                .put("placeholder", "Pick available slot on $myCloud...".take(150))
-                .put("options", opts)
-            val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-            replyInteraction(
-                id, token, 4,
-                JSONObject()
-                    .put(
-                        "content",
-                        "**🚀 $myCloud** — Select an available slot for **`${session.username.ifEmpty { "Account" }}`**:\n${PilotCore.fmtAll(allSlots)}".take(1950)
-                    )
-                    .put("components", row)
-                    .put("flags", 64)
-            )
-            return
-        }
-
         if (kind == "pilot_cloud") {
-            if (!sel.equals(myCloud, ignoreCase = true)) return
-
+            val isAll = sel.equals("ALL", ignoreCase = true)
+            if (!isAll && !sel.equals(myCloud, ignoreCase = true)) return
             if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
-                replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+                if (!isAll) replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
                 return
             }
 
             if (mode == "ar") {
-                val enabled = Rejoiner.isEnabled(ctx)
-                val curTarget = Rejoiner.getTarget(ctx).ifEmpty { "Auto (Last Place ID)" }
-                val opts = JSONArray()
-                    .put(JSONObject().put("label", "✅ Enable Auto-Rejoin (Auto Last Place)").put("value", "ON_AUTO").put("description", "Rejoin each account's last Place ID automatically"))
-                    .put(JSONObject().put("label", "🔗 Enable Auto-Rejoin (Custom Place / VIP Link)").put("value", "ON_LINK").put("description", "Enter a specific Place ID or Private Server URL"))
-                    .put(JSONObject().put("label", "🛑 Disable Auto-Rejoin").put("value", "OFF").put("description", "Turn off automatic rejoin monitoring on $myCloud".take(100)))
-                val menu = JSONObject()
-                    .put("type", 3)
-                    .put("custom_id", "pilot_ar_act:cfg:$myCloud")
-                    .put("placeholder", "Choose Auto-Rejoin action for $myCloud...")
-                    .put("options", opts)
-                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                replyInteraction(
-                    id, token, 4,
-                    JSONObject()
-                        .put("content", "**🔁 $myCloud — Auto-Rejoiner Settings**\n• **Status:** ${if (enabled) "🟢 ON" else "🔴 OFF"}\n• **Target:** `$curTarget`")
-                        .put("components", row)
-                        .put("flags", 64)
-                )
+                if (isAll) {
+                    // Only one cloud posts the shared ALL panel
+                    val jitter = (abs(myCloud.hashCode()) % 12) * 100L
+                    runCatching { Thread.sleep(jitter) }
+                    if (hasBotRepliedAfter(ch, msgId)) return
+                }
+                sendRejoinerPanelReply(id, token, if (isAll) "ALL" else myCloud)
+                return
+            }
+
+            if (mode == "arrange") {
+                val n = PilotCore.arrange2x2()
+                if (!isAll) {
+                    replyInteraction(id, token, 4, JSONObject().put("content", "🪟 Arranged **$n** clones into 2×2 grid on **$myCloud**.").put("flags", 64))
+                } else {
+                    sendMsg(ch, "🪟 Arranged **$n** clones into 2×2 grid on **$myCloud**.")
+                }
+                return
+            }
+
+            if (mode == "killall") {
+                val list = Rejoiner.discoverClones()
+                list.forEach { SuShell.exec("am force-stop ${it.pkg}") }
+                if (!isAll) {
+                    replyInteraction(id, token, 4, JSONObject().put("content", "🛑 Force-stopped **${list.size}** clones on **$myCloud**.").put("flags", 64))
+                } else {
+                    sendMsg(ch, "🛑 Force-stopped **${list.size}** clones on **$myCloud**.")
+                }
+                return
+            }
+
+            if (mode == "logs") {
+                val dump = PilotCore.getLogs().takeLast(25).joinToString("\n").ifBlank { "No logs yet." }
+                replyInteraction(id, token, 4, JSONObject().put("content", "📜 **Logs ($myCloud)**\n```\n${dump.take(1800)}\n```").put("flags", 64))
+                return
+            }
+
+            if (mode == "reboot") {
+                replyInteraction(id, token, 4, JSONObject().put("content", "🔄 Rebooting **$myCloud** now (Rejoiner will auto-start on boot)...").put("flags", 64))
+                ioExec.execute {
+                    Thread.sleep(1000)
+                    SuShell.exec("reboot")
+                }
                 return
             }
 
@@ -2440,9 +2134,7 @@ class DiscordBot(private val ctx: Context) {
 
             if (mode == "ss") {
                 replyInteraction(id, token, 4, JSONObject().put("content", "📸 Capturing full screen of **$myCloud**...").put("flags", 64))
-                ioExec.execute {
-                    if (ch.isNotEmpty()) captureAndSendAll(ch)
-                }
+                ioExec.execute { if (ch.isNotEmpty()) captureAndSendAll(ch) }
                 return
             }
 
@@ -2490,8 +2182,21 @@ class DiscordBot(private val ctx: Context) {
                 replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — No instances found.").put("flags", 64))
                 return
             }
+
             if (mode == "s") {
                 replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** (${PilotCore.APP_VERSION}):\n${PilotCore.fmtAll(list)}".take(1950)).put("flags", 64))
+            } else if (mode == "login") {
+                val opts = JSONArray()
+                list.take(25).forEachIndexed { idx, a ->
+                    opts.put(JSONObject()
+                        .put("label", "[${idx + 1}] ${a.user} [${a.status}] (${a.pkg})".take(100))
+                        .put("value", a.pkg.take(100))
+                        .put("description", "Login Roblox account into ${a.pkg}".take(100)))
+                }
+                val menu = JSONObject().put("type", 3).put("custom_id", "pilot_login_slot:go:$myCloud")
+                    .put("placeholder", "Select Roblox slot on $myCloud...").put("options", opts)
+                val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+                replyInteraction(id, token, 4, JSONObject().put("content", "**🔐 $myCloud** — Pick a slot to log in:\n${PilotCore.fmtAll(list)}".take(1950)).put("components", row).put("flags", 64))
             } else if (mode == "cs1") {
                 val activeList = list.filter { it.user != "Empty" }
                 if (activeList.isEmpty()) {
@@ -2512,67 +2217,58 @@ class DiscordBot(private val ctx: Context) {
                 val menu = JSONObject().put("type", 3).put("custom_id", "pilot_acc:$mode:$myCloud")
                     .put("placeholder", "Select account on $myCloud...").put("options", opts)
                 val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
-                val label = if (mode == "d") "Select account to **DELETE** (wipes session + history):" else "Select account to **LOGOUT**:"
+                val label = if (mode == "d") "Select account to **DELETE** (revokes token + wipes vault + history):" else "Select account to **LOGOUT** (revokes token + wipes vault):"
                 replyInteraction(id, token, 4, JSONObject().put("content", "**📱 $myCloud** — $label\n${PilotCore.fmtAll(list)}".take(1950)).put("components", row).put("flags", 64))
             }
             return
         }
 
-        if (!suffix.equals(myCloud, ignoreCase = true)) return
+        val isAllTarget = suffix.equals("ALL", ignoreCase = true)
+        if (!isAllTarget && !suffix.equals(myCloud, ignoreCase = true)) return
 
         if (!PilotCore.isAuthorized(ctx, userId, memberRoles)) {
-            replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
+            if (!isAllTarget) replyInteraction(id, token, 4, JSONObject().put("content", "Unauthorized").put("flags", 64))
             return
         }
 
-        if (kind == "pilot_al_slot") {
-            val targetPkg = sel
-            val session = AccountLaunchManager.getSession(ctx, mode)?.also {
-                AccountLaunchManager.removeSession(ctx, mode)
-            }
-            if (session == null) {
-                replyInteraction(id, token, 7, JSONObject().put("content", "⚠️ Session expired. Please run `!accountlaunch` again.").put("components", JSONArray()))
-                return
-            }
-            replyInteraction(
-                id, token, 7,
-                JSONObject()
-                    .put("content", "⏳ Injecting cookie & saving Nousigi Hub config for **`${session.username}`** on **$myCloud** (`$targetPkg`)...")
-                    .put("components", JSONArray())
-            )
-            ioExec.execute {
-                val (ok, resultMsg) = AccountLaunchManager.executeLaunch(ctx, targetPkg, session)
-                if (ch.isNotEmpty()) {
-                    if (ok) sendMsg(ch, resultMsg)
-                    else sendMsg(ch, "❌ **Account Launch Failed** on **$myCloud** (`$targetPkg`): $resultMsg")
-                }
-            }
+        if (kind == "pilot_login_slot") {
+            openLoginModal(id, token, myCloud, sel)
         } else if (kind == "pilot_ar_act") {
+            val cfg = Rejoiner.loadConfig(ctx)
             when (sel) {
-                "ON_AUTO" -> {
-                    Rejoiner.setConfig(ctx, enabled = true, target = "")
-                    replyInteraction(id, token, 7, JSONObject().put("content", "✅ **Auto-Rejoiner Enabled** on **$myCloud** (Auto Last Place ID + Freeze & Teleport Guard).").put("components", JSONArray()))
-                }
-                "OFF" -> {
-                    Rejoiner.setConfig(ctx, enabled = false, target = Rejoiner.getTarget(ctx))
-                    replyInteraction(id, token, 7, JSONObject().put("content", "🛑 **Auto-Rejoiner Disabled** on **$myCloud**.").put("components", JSONArray()))
-                }
+                "TOGGLE_RJ" -> Rejoiner.saveConfig(ctx, cfg.copy(enabled = !cfg.enabled))
+                "TOGGLE_FPS" -> Rejoiner.saveConfig(ctx, cfg.copy(fpsOptimization = !cfg.fpsOptimization))
+                "TOGGLE_3D" -> Rejoiner.saveConfig(ctx, cfg.copy(render3dOff = !cfg.render3dOff))
+                "TOGGLE_NOUSIGI" -> Rejoiner.saveConfig(ctx, cfg.copy(autoGetNousigiKey = !cfg.autoGetNousigiKey))
+                "TOGGLE_DELTA" -> Rejoiner.saveConfig(ctx, cfg.copy(autoGetDeltaKey = !cfg.autoGetDeltaKey))
+                "RUN_NOUSIGI" -> KeyAutomator.startNousigiRenewal(ctx)
+                "RUN_DELTA" -> KeyAutomator.startDeltaRenewal(ctx)
+                "REJOIN_ALL" -> ioExec.execute { Rejoiner.killAllAndStaggeredRejoin(ctx, "Discord panel") }
                 "ON_LINK" -> {
-                    val fTarget = JSONObject()
-                        .put("type", 4)
-                        .put("custom_id", "target")
-                        .put("label", "Place ID or Private Server URL")
-                        .put("style", 1)
-                        .put("min_length", 4)
-                        .put("max_length", 300)
-                        .put("placeholder", "e.g. 2753915549 or https://www.roblox.com/games/...")
-                        .put("required", false)
-                    val modal = JSONObject()
-                        .put("custom_id", "pilot_ar_modal:$myCloud")
-                        .put("title", "Auto-Rejoin Target ($myCloud)")
-                        .put("components", JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(fTarget))))
-                    replyInteraction(id, token, 9, modal)
+                    if (!isAllTarget || myCloud.equals(PilotCore.getCloud(ctx), true)) {
+                        val fTarget = JSONObject()
+                            .put("type", 4).put("custom_id", "target")
+                            .put("label", "Place ID or Private Server URL")
+                            .put("style", 1).put("min_length", 4).put("max_length", 300)
+                            .put("placeholder", "e.g. 8304191830 or https://www.roblox.com/games/...")
+                            .put("required", false)
+                        val modal = JSONObject()
+                            .put("custom_id", "pilot_ar_modal:$suffix")
+                            .put("title", "Rejoiner Target ($suffix)")
+                            .put("components", JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(fTarget))))
+                        replyInteraction(id, token, 9, modal)
+                    }
+                    return
                 }
+                else -> if (sel.startsWith("GAME:")) {
+                    val pid = sel.removePrefix("GAME:")
+                    Rejoiner.saveConfig(ctx, cfg.copy(enabled = true, targetPlaceId = pid, privateServerLinks = ""))
+                }
+            }
+            if (!isAllTarget) {
+                replyInteraction(id, token, 7, JSONObject().put("content", "✅ Applied **$sel** on **$myCloud**.").put("components", JSONArray()))
+            } else {
+                replyInteraction(id, token, 7, JSONObject().put("content", "🌐 Applied **$sel** across **ALL ONLINE CLOUDS**.").put("components", JSONArray()))
             }
         } else if (kind == "pilot_cs2") {
             val srcPkg = sel.substringBefore("|")
@@ -2604,17 +2300,56 @@ class DiscordBot(private val ctx: Context) {
         } else if (kind == "pilot_acc") {
             val isDel = mode == "d"
             if (sel == "ALL") {
-                val msg = if (isDel) "**📱 $myCloud** — Deleting ALL accounts & history (now Empty)." else "**📱 $myCloud** — Logging out ALL."
+                val msg = if (isDel) "**📱 $myCloud** — Deleting ALL accounts, revoking tokens & clearing history." else "**📱 $myCloud** — Logging out ALL & revoking tokens."
                 replyInteraction(id, token, 7, JSONObject().put("content", msg).put("components", JSONArray()))
                 ioExec.execute {
                     PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(ctx) }.forEach { PilotCore.wipe(ctx, it.pkg, isDel) }
                 }
             } else {
-                val msg = if (isDel) "**📱 $myCloud** — Deleted all data & history for `$sel` (now Empty)." else "**📱 $myCloud** — Logged out `$sel`."
+                val msg = if (isDel) "**📱 $myCloud** — Deleted `$sel` (server token revoked + vault & history cleared)." else "**📱 $myCloud** — Logged out `$sel` (server token revoked + vault wiped)."
                 replyInteraction(id, token, 7, JSONObject().put("content", msg).put("components", JSONArray()))
                 ioExec.execute { PilotCore.wipe(ctx, sel, isDel) }
             }
         }
+    }
+
+    private fun sendRejoinerPanelReply(id: String, token: String, targetTag: String) {
+        val cfg = Rejoiner.loadConfig(ctx)
+        val opts = JSONArray()
+            .put(JSONObject().put("label", "Toggle Auto-Rejoin (${if (cfg.enabled) "ON" else "OFF"})").put("value", "TOGGLE_RJ"))
+            .put(JSONObject().put("label", "Set Custom Place ID / VIP Link").put("value", "ON_LINK"))
+            .put(JSONObject().put("label", "Toggle FPS Optimizer (${if (cfg.fpsOptimization) "ON" else "OFF"})").put("value", "TOGGLE_FPS"))
+            .put(JSONObject().put("label", "Toggle 3D Render Off (${if (cfg.render3dOff) "ON" else "OFF"})").put("value", "TOGGLE_3D"))
+            .put(JSONObject().put("label", "Toggle Auto Nousigi Key (${if (cfg.autoGetNousigiKey) "ON" else "OFF"})").put("value", "TOGGLE_NOUSIGI"))
+            .put(JSONObject().put("label", "Toggle Auto Delta Key (${if (cfg.autoGetDeltaKey) "ON" else "OFF"})").put("value", "TOGGLE_DELTA"))
+            .put(JSONObject().put("label", "Run Nousigi Key Renewal Now").put("value", "RUN_NOUSIGI"))
+            .put(JSONObject().put("label", "Run Delta Key Renewal Now").put("value", "RUN_DELTA"))
+            .put(JSONObject().put("label", "Kill All & Staggered Rejoin Now").put("value", "REJOIN_ALL"))
+
+        Rejoiner.FAMOUS_GAMES.filter { it.placeId.isNotEmpty() && it.placeId != "CUSTOM" }.forEach { g ->
+            opts.put(JSONObject().put("label", "Game: ${g.name} (${g.placeId})").put("value", "GAME:${g.placeId}"))
+        }
+
+        val menu = JSONObject()
+            .put("type", 3)
+            .put("custom_id", "pilot_ar_act:cfg:$targetTag")
+            .put("placeholder", "Select setting or game for $targetTag...")
+            .put("options", opts)
+        val row = JSONArray().put(JSONObject().put("type", 1).put("components", JSONArray().put(menu)))
+
+        replyInteraction(
+            id, token, 4,
+            JSONObject()
+                .put(
+                    "content",
+                    "**🔁 Rejoiner & Key Automator (`$targetTag`)**\n" +
+                    "• **Rejoiner:** ${if (cfg.enabled) "🟢 ON" else "🔴 OFF"} | **Target:** `${cfg.targetPlaceId.ifEmpty { "Auto" }}`\n" +
+                    "• **FPS Opt:** `${cfg.fpsOptimization}` | **3D Render Off:** `${cfg.render3dOff}`\n" +
+                    "• **Auto Nousigi Key:** `${cfg.autoGetNousigiKey}` | **Auto Delta Key:** `${cfg.autoGetDeltaKey}`"
+                )
+                .put("components", row)
+                .put("flags", 64)
+        )
     }
 
     private fun sendMsg(ch: String, content: String, components: JSONArray? = null) {
@@ -2712,7 +2447,7 @@ class PilotService : Service() {
     private var bot: DiscordBot? = null
     private var wl: PowerManager.WakeLock? = null
     private val syncExec = Executors.newSingleThreadScheduledExecutor()
-    private val bridgePool = Executors.newFixedThreadPool(3)
+    private val bridgePool = Executors.newFixedThreadPool(4)
     private var localServer: ServerSocket? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -2731,28 +2466,30 @@ class PilotService : Service() {
         }
         val notif = (if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, chId) else Notification.Builder(this))
             .setContentTitle("Pilot Active (${PilotCore.getCloud(this)}) • ${PilotCore.APP_VERSION}")
-            .setContentText("GVIP Optimized • Watchdog & Roblox Bridge Active")
+            .setContentText("Watchdog, Key Automator & Roblox Bridge Active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notif)
 
-        wl = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Pilot::Lock").apply { acquire() }
-        bot = DiscordBot(this).apply { start() }
+        wl = (getSystemService(POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Pilot::Lock").apply { acquire() }
 
-        bridgePool.execute { PilotCore.installAutoExec(this) }
+        bot = DiscordBot(this).apply { start() }
+        Rejoiner.start(this)
 
         var last: List<AccInfo>? = null
         syncExec.scheduleAtFixedRate({
             val cur = PilotCore.scanRbx(this)
             if (cur != last) {
                 last = cur
-                cur.forEach { PilotCore.log("[SYNC] ${it.pkg} -> ${it.user} (${it.status})") }
+                cur.forEach {
+                    PilotCore.log("[SYNC] ${it.pkg} -> ${it.user} (${it.status})")
+                    if (it.status == "ACTIVE" && it.user != "Empty") {
+                        SessionVault.snapshot(this, it.pkg, it.user)
+                    }
+                }
             }
         }, 1, 10, TimeUnit.SECONDS)
-
-        syncExec.scheduleAtFixedRate({
-            runCatching { Rejoiner.tick(this) }
-        }, 15, 15, TimeUnit.SECONDS)
 
         syncExec.scheduleAtFixedRate({
             AppUpdater.checkAndInstall(this, force = false)
@@ -2760,27 +2497,23 @@ class PilotService : Service() {
 
         Thread {
             runCatching {
-                localServer = ServerSocket(8765, 30, InetAddress.getByName("127.0.0.1"))
+                localServer = ServerSocket(8765, 40, InetAddress.getByName("127.0.0.1"))
+                PilotCore.log("[BRIDGE] HTTP server listening on 127.0.0.1:8765")
                 while (isRunning) {
                     val sock = localServer?.accept() ?: break
                     bridgePool.execute {
                         runCatching {
                             val reqLine = sock.getInputStream().bufferedReader().readLine() ?: ""
-                            sock.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
-                            sock.close()
-
                             val pathAndQuery = reqLine.substringAfter(" ", "").substringBefore(" ")
-                            if (Rejoiner.handleBridgeRequest(this, pathAndQuery)) return@runCatching
-
-                            if (pathAndQuery.startsWith("/ss")) {
-                                val userParam = Regex("""[?&]user=([^&\s]+)""").find(pathAndQuery)?.groupValues?.get(1)
-                                val user = if (!userParam.isNullOrEmpty()) URLDecoder.decode(userParam, "UTF-8").trim() else ""
-                                val ch = PilotCore.getSsChannel(this)
-                                if (user.isNotEmpty() && ch.isNotEmpty()) {
-                                    PilotCore.log("[LUA-SS] $user")
-                                    bot?.sendLuaWindowShot(ch, user)
-                                }
+                            val respBody = handleLocalBridgePath(pathAndQuery)
+                            val bytes = respBody.toByteArray(Charsets.UTF_8)
+                            val header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\n\r\n"
+                            sock.getOutputStream().apply {
+                                write(header.toByteArray(Charsets.UTF_8))
+                                write(bytes)
+                                flush()
                             }
+                            sock.close()
                         }
                     }
                 }
@@ -2788,11 +2521,48 @@ class PilotService : Service() {
         }.start()
     }
 
+    private fun handleLocalBridgePath(pathAndQuery: String): String {
+        val path = pathAndQuery.substringBefore("?")
+        val rawQuery = pathAndQuery.substringAfter("?", "")
+        val params = if (rawQuery.isEmpty()) emptyMap() else rawQuery.split("&").mapNotNull { part ->
+            val idx = part.indexOf('=')
+            if (idx <= 0) null else URLDecoder.decode(part.substring(0, idx), "UTF-8") to URLDecoder.decode(part.substring(idx + 1), "UTF-8")
+        }.toMap()
+
+        return when (path) {
+            "/ping" -> Rejoiner.onBridgePing(
+                this,
+                params["user"].orEmpty(),
+                params["placeId"].orEmpty(),
+                params["fps"]?.toIntOrNull() ?: 0
+            )
+            "/keyerr" -> {
+                Rejoiner.onBridgeKeyError(this, params["user"].orEmpty(), params["reason"].orEmpty())
+                """{"ok":true}"""
+            }
+            "/kick" -> {
+                Rejoiner.onBridgeKick(this, params["user"].orEmpty(), params["code"].orEmpty(), params["msg"].orEmpty())
+                """{"ok":true}"""
+            }
+            "/ss" -> {
+                val user = params["user"].orEmpty().trim()
+                val ch = PilotCore.getSsChannel(this)
+                if (user.isNotEmpty() && ch.isNotEmpty()) {
+                    PilotCore.log("[LUA-SS] $user")
+                    bot?.sendLuaWindowShot(ch, user)
+                }
+                """{"ok":true}"""
+            }
+            else -> """{"ok":true}"""
+        }
+    }
+
     override fun onDestroy() {
         isRunning = false
         runCatching { localServer?.close() }
         syncExec.shutdownNow()
         bridgePool.shutdownNow()
+        Rejoiner.stop()
         bot?.stop()
         runCatching { if (wl?.isHeld == true) wl?.release() }
         super.onDestroy()
@@ -2802,9 +2572,8 @@ class PilotService : Service() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         PilotCore.tryAutoSeedFromDisk(context)
-        if (PilotCore.getToken(context).isNotEmpty() && PilotCore.getAllowedIds(context).isNotEmpty()) {
-            val svc = Intent(context, PilotService::class.java)
-            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(svc) else context.startService(svc)
+        if (Rejoiner.loadConfig(context).autoStartOnBoot || PilotCore.getToken(context).isNotEmpty()) {
+            PilotCore.startService(context)
         }
     }
 }

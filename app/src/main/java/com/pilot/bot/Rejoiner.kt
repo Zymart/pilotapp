@@ -1,365 +1,446 @@
 package com.pilot.bot
 
 import android.content.Context
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
-import java.net.URLDecoder
+import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
-import kotlin.math.max
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
-data class RejoinState(
+data class FamousGame(val name: String, val placeId: String)
+
+data class CloneSlot(
     val pkg: String,
-    @Volatile var user: String = "",
-    @Volatile var userId: Long = 0L,
-    @Volatile var placeId: Long = 0L,
-    @Volatile var lastHbMs: Long = 0L,
-    @Volatile var lastFrame: Long = -1L,
-    @Volatile var lastFrameAdvanceMs: Long = 0L,
-    @Volatile var teleportingUntilMs: Long = 0L,
-    @Volatile var lastRelaunchMs: Long = 0L,
-    @Volatile var presenceOfflineStrikes: Int = 0
+    @Volatile var username: String = "",
+    @Volatile var status: String = "IDLE", // ACTIVE, FROZEN, NO_DELTA_KEY, LOGGED_OUT, PAUSED, REVOKED, EMPTY
+    @Volatile var placeId: String = "",
+    @Volatile var fps: Int = 0,
+    @Volatile var lastPingMs: Long = 0L,
+    @Volatile var lastLaunchMs: Long = 0L,
+    @Volatile var lastKickReason: String = "",
+    @Volatile var paused: Boolean = false
+)
+
+data class RejoinConfig(
+    val enabled: Boolean = true,
+    val autoStartOnBoot: Boolean = true,
+    val targetPlaceId: String = "8304191830",
+    val privateServerLinks: String = "",
+    val fpsOptimization: Boolean = true,
+    val render3dOff: Boolean = false,
+    val autoGetNousigiKey: Boolean = false,
+    val luarmorUrl: String = "https://ads.luarmor.net/get_key?for=-dkAHbyOeBCOT",
+    val lvEmail: String = "",
+    val lvPassword: String = "",
+    val autoGetDeltaKey: Boolean = false,
+    val deltaPlatoUrl: String = "",
+    val pingTimeoutSec: Int = 95,
+    val staggerDelaySec: Int = 13
 )
 
 object Rejoiner {
-    val states = ConcurrentHashMap<String, RejoinState>()
+    val FAMOUS_GAMES = listOf(
+        FamousGame("Anime Adventures", "8304191830"),
+        FamousGame("Blox Fruits", "2753915549"),
+        FamousGame("Anime Vanguards", "16146832113"),
+        FamousGame("Fisch", "16732694052"),
+        FamousGame("Pet Simulator 99", "8737899170"),
+        FamousGame("Steal a Brainrot", "109983668079237"),
+        FamousGame("Grow a Garden", "126884695634066"),
+        FamousGame("Auto (Last Place ID)", ""),
+        FamousGame("Custom Place ID / VIP", "CUSTOM")
+    )
 
-    private val apiHttp = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
+    val slots = ConcurrentHashMap<String, CloneSlot>()
+    private val running = AtomicBoolean(false)
+    private val launchExec = Executors.newSingleThreadExecutor()
+    private var watchdogThread: Thread? = null
+    @Volatile private var vipIndex = 0
+    @Volatile private var screenshot3dHoldUntilMs = 0L
 
-    private fun prefs(c: Context) = c.getSharedPreferences("pilot_cfg", Context.MODE_PRIVATE)
-    private fun histPrefs(c: Context) = c.getSharedPreferences("pilot_hist", Context.MODE_PRIVATE)
+    fun loadConfig(ctx: Context): RejoinConfig {
+        val p = PilotCore.prefs(ctx)
+        return RejoinConfig(
+            enabled = p.getBoolean("rj_enabled", true),
+            autoStartOnBoot = p.getBoolean("rj_boot", true),
+            targetPlaceId = p.getString("rj_place", "8304191830").orEmpty(),
+            privateServerLinks = p.getString("rj_vip", "").orEmpty(),
+            fpsOptimization = p.getBoolean("rj_fps", true),
+            render3dOff = p.getBoolean("rj_3doff", false),
+            autoGetNousigiKey = p.getBoolean("rj_auto_nousigi", false),
+            luarmorUrl = p.getString("rj_luarmor_url", "https://ads.luarmor.net/get_key?for=-dkAHbyOeBCOT").orEmpty(),
+            lvEmail = p.getString("rj_lv_email", "").orEmpty(),
+            lvPassword = p.getString("rj_lv_pass", "").orEmpty(),
+            autoGetDeltaKey = p.getBoolean("rj_auto_delta", false),
+            deltaPlatoUrl = p.getString("rj_delta_url", "").orEmpty(),
+            pingTimeoutSec = p.getInt("rj_ping_timeout", 95),
+            staggerDelaySec = p.getInt("rj_stagger_sec", 13)
+        )
+    }
 
-    fun isEnabled(c: Context): Boolean = prefs(c).getBoolean("ar_enabled", false)
-    fun getTarget(c: Context): String = prefs(c).getString("ar_target", "") ?: ""
-
-    fun setConfig(c: Context, enabled: Boolean, target: String) {
-        prefs(c).edit()
-            .putBoolean("ar_enabled", enabled)
-            .putString("ar_target", target.trim())
+    fun saveConfig(ctx: Context, cfg: RejoinConfig) {
+        PilotCore.prefs(ctx).edit()
+            .putBoolean("rj_enabled", cfg.enabled)
+            .putBoolean("rj_boot", cfg.autoStartOnBoot)
+            .putString("rj_place", cfg.targetPlaceId.trim())
+            .putString("rj_vip", cfg.privateServerLinks.trim())
+            .putBoolean("rj_fps", cfg.fpsOptimization)
+            .putBoolean("rj_3doff", cfg.render3dOff)
+            .putBoolean("rj_auto_nousigi", cfg.autoGetNousigiKey)
+            .putString("rj_luarmor_url", cfg.luarmorUrl.trim())
+            .putString("rj_lv_email", cfg.lvEmail.trim())
+            .putString("rj_lv_pass", cfg.lvPassword)
+            .putBoolean("rj_auto_delta", cfg.autoGetDeltaKey)
+            .putString("rj_delta_url", cfg.deltaPlatoUrl.trim())
+            .putInt("rj_ping_timeout", cfg.pingTimeoutSec)
+            .putInt("rj_stagger_sec", cfg.staggerDelaySec)
             .apply()
-        PilotCore.log("[REJOIN] ${if (enabled) "ENABLED" else "DISABLED"} | Target: ${target.trim().ifEmpty { "Auto (Last Place)" }}")
+        deployBridgeLua(ctx, cfg)
     }
 
-    fun getSavedPlaceId(c: Context, pkg: String): Long = prefs(c).getLong("last_place_$pkg", 0L)
-    fun savePlaceId(c: Context, pkg: String, placeId: Long) {
-        if (placeId > 0L) prefs(c).edit().putLong("last_place_$pkg", placeId).apply()
+    fun discoverClones(): List<CloneSlot> {
+        val pkgs = SuShell.execLines("pm list packages | grep 'com.roblox.clien' | sed 's/package://' | sort")
+            .filter { it.startsWith("com.roblox.clien") }
+        pkgs.forEach { pkg -> slots.putIfAbsent(pkg, CloneSlot(pkg)) }
+        return pkgs.mapNotNull { slots[it] }
     }
 
-    fun getSavedUserId(c: Context, user: String): Long =
-        if (user.isEmpty() || user == "Empty") 0L else histPrefs(c).getLong("uid_${user.lowercase()}", 0L)
+    /** Called by PilotEngine HTTP server (127.0.0.1:8765/ping) whenever pilot_bridge.lua ticks. */
+    fun onBridgePing(ctx: Context, user: String, placeId: String, fps: Int): String {
+        val now = System.currentTimeMillis()
+        val matched = slots.values.firstOrNull { it.username.equals(user, ignoreCase = true) }
+            ?: slots.values.firstOrNull { it.username.isBlank() }
+        if (matched != null) {
+            val prevUser = matched.username
+            if (prevUser.isNotBlank() && !prevUser.equals(user, ignoreCase = true)) {
+                PilotCore.log("[REJOINER] Instant account swap detected on ${matched.pkg}: $prevUser -> $user")
+            }
+            matched.username = user
+            matched.placeId = placeId
+            matched.fps = fps
+            matched.lastPingMs = now
+            if (!matched.paused) matched.status = "ACTIVE"
+        }
+        val cfg = loadConfig(ctx)
+        val want3dOff = cfg.render3dOff && now > screenshot3dHoldUntilMs
+        return """{"ok":true,"fpsOpt":${cfg.fpsOptimization},"render3dOff":$want3dOff}"""
+    }
 
-    fun saveUserId(c: Context, user: String, uid: Long) {
-        if (user.isNotEmpty() && user != "Empty" && uid > 0L) {
-            histPrefs(c).edit().putLong("uid_${user.lowercase()}", uid).apply()
+    /** Temporarily turns 3D rendering ON for clean screenshots when 3D Render Off mode is enabled. */
+    fun hold3dRenderForScreenshot(ms: Long = 5000L) {
+        screenshot3dHoldUntilMs = System.currentTimeMillis() + ms
+    }
+
+    /** Called by PilotEngine HTTP server (/keyerr?reason=blacklisted) from pilot_bridge.lua. */
+    fun onBridgeKeyError(ctx: Context, user: String, reason: String) {
+        PilotCore.log("[REJOINER] Key error reported by $user: $reason")
+        val cfg = loadConfig(ctx)
+        if (cfg.autoGetNousigiKey && !KeyAutomator.isRunning()) {
+            val isBanned = reason.contains("ban", true) || reason.contains("blacklist", true)
+            PilotCore.onAlert?.invoke("🚫 Key Error Detected ($user)", "Reason: `$reason` — starting Auto Get Nousigi Key...")
+            KeyAutomator.startNousigiRenewal(ctx, blacklistedReset = isBanned)
         }
     }
 
-    /**
-     * Lua script deployed into Delta's Autoexecute folder.
-     * Reports heartbeats, frame ticks (freeze detection), place teleports, and kick prompts to Pilot.
-     */
-    fun buildBridgeLua(): String = """
-        repeat task.wait(0.5) until game:IsLoaded()
-        local Players = game:GetService("Players")
-        local HttpService = game:GetService("HttpService")
-        local RunService = game:GetService("RunService")
-        local GuiService = game:GetService("GuiService")
-        local TeleportService = game:GetService("TeleportService")
+    /** Called by PilotEngine HTTP server (/kick?user=...&code=...) from pilot_bridge.lua. */
+    fun onBridgeKick(ctx: Context, user: String, code: String, msg: String) {
+        val slot = slots.values.firstOrNull { it.username.equals(user, ignoreCase = true) } ?: return
+        slot.lastKickReason = "$code: $msg"
+        PilotCore.log("[REJOINER] $user disconnected ($code): $msg")
 
-        local lp = Players.LocalPlayer
-        while not lp do
-            task.wait(0.5)
-            lp = Players.LocalPlayer
-        end
-
-        local req = request or http_request or (syn and syn.request)
-        if not req then return end
-
-        local frameCount = 0
-        local teleporting = false
-        local lastTpAt = 0
-
-        RunService.Heartbeat:Connect(function()
-            frameCount = frameCount + 1
-        end)
-
-        local function ping(path)
-            pcall(function()
-                req({
-                    Url = "http://127.0.0.1:8765" .. path,
-                    Method = "GET"
-                })
-            end)
-        end
-
-        local function sendHeartbeat(tpFlag)
-            local u = HttpService:UrlEncode(lp.Name)
-            local url = string.format(
-                "/hb?user=%s&uid=%d&place=%d&frame=%d&tp=%d",
-                u, lp.UserId, game.PlaceId, frameCount, tpFlag and 1 or 0
-            )
-            ping(url)
-        end
-
-        -- Teleport shield: prevents false rejoins while moving between places/sub-places
-        lp.OnTeleport:Connect(function(state)
-            if state == Enum.TeleportState.Started
-                or state == Enum.TeleportState.WaitingForServer
-                or state == Enum.TeleportState.InProgress then
-                teleporting = true
-                lastTpAt = os.clock()
-                ping("/tp?user=" .. HttpService:UrlEncode(lp.Name) .. "&state=1")
-            elseif state == Enum.TeleportState.Failed then
-                teleporting = false
-                ping("/tp?user=" .. HttpService:UrlEncode(lp.Name) .. "&state=0")
-            end
-        end)
-
-        TeleportService.TeleportInitFailed:Connect(function()
-            teleporting = false
-            ping("/tp?user=" .. HttpService:UrlEncode(lp.Name) .. "&state=0")
-        end)
-
-        -- Catch Roblox kick/disconnect error prompts immediately
-        pcall(function()
-            GuiService.ErrorMessageChanged:Connect(function()
-                local msg = GuiService:GetErrorMessage()
-                if msg and msg ~= "" then
-                    ping("/err?user=" .. HttpService:UrlEncode(lp.Name) .. "&msg=" .. HttpService:UrlEncode(msg))
-                end
-            end)
-        end)
-
-        local function snapMe()
-            ping("/ss?user=" .. HttpService:UrlEncode(lp.Name))
-        end
-
-        getgenv().PilotSnap = snapMe
-
-        -- Heartbeat loop (every 4s) for freeze + place + teleport tracking
-        task.spawn(function()
-            sendHeartbeat(false)
-            while task.wait(4) do
-                if teleporting and (os.clock() - lastTpAt) > 45 then
-                    teleporting = false
-                end
-                sendHeartbeat(teleporting)
-            end
-        end)
-
-        -- Hourly auto-screenshot loop
-        task.spawn(function()
-            task.wait(6)
-            snapMe()
-            while task.wait(3600) do
-                snapMe()
-            end
-        end)
-    """.trimIndent()
-
-    /**
-     * Handles `/hb`, `/tp`, and `/err` routes from `pilot_bridge.lua`.
-     * Returns true if the request was handled by Rejoiner.
-     */
-    fun handleBridgeRequest(c: Context, pathAndQuery: String): Boolean {
-        if (!pathAndQuery.startsWith("/hb") && !pathAndQuery.startsWith("/tp") && !pathAndQuery.startsWith("/err")) {
-            return false
+        if (code == "273" || msg.contains("same account", true)) {
+            slot.paused = true
+            slot.status = "PAUSED"
+            PilotCore.onAlert?.invoke("⏸️ Slot Paused (Error 273)", "**$user** was opened on another device. Use `!resume $user` when done.")
         }
-        val userParam = Regex("""[?&]user=([^&\s]+)""").find(pathAndQuery)?.groupValues?.get(1) ?: return true
-        val user = runCatching { URLDecoder.decode(userParam, "UTF-8").trim() }.getOrDefault("")
-        if (user.isEmpty()) return true
+    }
 
-        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(c) }
-        val pkg = list.firstOrNull { it.user.equals(user, ignoreCase = true) }?.pkg ?: return true
+    fun setSlotPaused(userOrPkg: String, paused: Boolean): CloneSlot? {
+        val s = slots.values.firstOrNull {
+            it.username.equals(userOrPkg, true) || it.pkg.equals(userOrPkg, true)
+        } ?: return null
+        s.paused = paused
+        s.status = if (paused) "PAUSED" else "IDLE"
+        return s
+    }
+
+    fun forceRescanSlot(ctx: Context, pkg: String) {
+        val slot = slots.getOrPut(pkg) { CloneSlot(pkg) }
+        val cookie = SessionVault.extractCookie(pkg)
+        val live = SessionVault.validateCookie(cookie)
+        if (!live.isNullOrBlank()) {
+            slot.username = live
+            slot.status = "ACTIVE"
+            SessionVault.snapshot(ctx, pkg, live)
+        } else {
+            slot.status = "LOGGED_OUT"
+        }
+    }
+
+    fun start(ctx: Context) {
+        if (!running.compareAndSet(false, true)) return
+        val cfg = loadConfig(ctx)
+        deployBridgeLua(ctx, cfg)
+        discoverClones()
+
+        watchdogThread = Thread {
+            PilotCore.log("[REJOINER] Watchdog started (${slots.size} clones found)")
+            var cycle = 0
+            while (running.get()) {
+                runCatching { tickWatchdog(ctx, cycle++) }
+                try { Thread.sleep(10_000L) } catch (_: InterruptedException) { break }
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
+    fun stop() {
+        running.set(false)
+        watchdogThread?.interrupt()
+        watchdogThread = null
+    }
+
+    private fun tickWatchdog(ctx: Context, cycle: Int) {
+        val cfg = loadConfig(ctx)
+        if (!cfg.enabled) return
+        val list = discoverClones()
         val now = System.currentTimeMillis()
 
-        when {
-            pathAndQuery.startsWith("/hb") -> {
-                val uid = Regex("""[?&]uid=(\d+)""").find(pathAndQuery)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                val place = Regex("""[?&]place=(\d+)""").find(pathAndQuery)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                val frame = Regex("""[?&]frame=(\d+)""").find(pathAndQuery)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-                val tp = Regex("""[?&]tp=(\d+)""").find(pathAndQuery)?.groupValues?.get(1) == "1"
-
-                val st = states.computeIfAbsent(pkg) { RejoinState(pkg, user) }
-                st.user = user
-                if (uid > 0L) {
-                    st.userId = uid
-                    saveUserId(c, user, uid)
-                }
-                if (place > 0L) {
-                    st.placeId = place
-                    savePlaceId(c, pkg, place)
-                }
-                st.lastHbMs = now
-                if (frame != st.lastFrame) {
-                    st.lastFrame = frame
-                    st.lastFrameAdvanceMs = now
-                }
-                if (tp) {
-                    st.teleportingUntilMs = max(st.teleportingUntilMs, now + 45_000L)
-                }
-            }
-
-            pathAndQuery.startsWith("/tp") -> {
-                val stateFlag = Regex("""[?&]state=(\d+)""").find(pathAndQuery)?.groupValues?.get(1)
-                val st = states.computeIfAbsent(pkg) { RejoinState(pkg, user) }
-                if (stateFlag == "1") {
-                    st.teleportingUntilMs = now + 45_000L
-                    PilotCore.log("[TP] $user teleporting (45s rejoin pause)")
-                } else {
-                    st.teleportingUntilMs = 0L
-                }
-            }
-
-            pathAndQuery.startsWith("/err") -> {
-                if (isEnabled(c)) {
-                    val st = states.computeIfAbsent(pkg) { RejoinState(pkg, user) }
-                    if (now >= st.teleportingUntilMs && (now - st.lastRelaunchMs) > 25_000L) {
-                        PilotCore.log("[REJOIN] $user kicked/disconnected -> rejoining...")
-                        relaunch(c, pkg, st)
-                    }
-                }
-            }
-        }
-        return true
-    }
-
-    /**
-     * All-in-One Rejoin Watchdog:
-     * 1. Delta Lua Heartbeat + Frame Counter (freeze detection)
-     * 2. Roblox Presence API (`presence.roblox.com/v1/presence/users`)
-     * 3. Android OS Process Check (`pidof <pkg>`)
-     * 4. Teleport Guard (`teleportingUntilMs`)
-     */
-    fun tick(c: Context) {
-        if (!isEnabled(c)) return
-        val now = System.currentTimeMillis()
-        val list = PilotCore.cachedScan.ifEmpty { PilotCore.scanRbx(c) }
-        val activeAccs = list.filter { it.status == "ACTIVE" && it.user != "Empty" }
-        if (activeAccs.isEmpty()) return
-
-        val uidToPkg = HashMap<Long, String>()
-        for (acc in activeAccs) {
-            val st = states.computeIfAbsent(acc.pkg) { RejoinState(acc.pkg, acc.user) }
-            st.user = acc.user
-            val uid = if (st.userId > 0L) st.userId else getSavedUserId(c, acc.user)
-            if (uid > 0L) {
-                st.userId = uid
-                uidToPkg[uid] = acc.pkg
-            }
+        // Periodic storage & log cleanup every ~30 minutes
+        if (cycle > 0 && cycle % 180 == 0) {
+            list.forEach { SuShell.exec("rm -rf /data/data/${it.pkg}/files/logs/* /data/data/${it.pkg}/cache/* 2>/dev/null") }
         }
 
-        val presenceMap = if (uidToPkg.isNotEmpty()) fetchRobloxPresences(uidToPkg.keys.toList()) else emptyMap()
-
-        for (acc in activeAccs) {
-            val st = states.computeIfAbsent(acc.pkg) { RejoinState(acc.pkg, acc.user) }
-
-            if (now < st.teleportingUntilMs) continue
-            if (now - st.lastRelaunchMs < 35_000L) continue
-
-            val pid = SuShell.exec("pidof ${acc.pkg}").trim()
-            if (pid.isEmpty()) {
-                PilotCore.log("[REJOIN] ${acc.user} (${acc.pkg}) closed/crashed -> relaunching...")
-                relaunch(c, acc.pkg, st)
+        for (slot in list) {
+            if (slot.paused) {
+                slot.status = "PAUSED"
                 continue
             }
 
-            if (st.lastHbMs > 0L) {
-                val sinceHb = now - st.lastHbMs
-                val sinceFrameMove = if (st.lastFrameAdvanceMs > 0L) now - st.lastFrameAdvanceMs else 0L
-                if (sinceFrameMove > 20_000L && sinceHb > 18_000L) {
-                    PilotCore.log("[REJOIN] ${acc.user} (${acc.pkg}) FROZEN (${sinceFrameMove / 1000}s) -> restarting...")
-                    relaunch(c, acc.pkg, st)
-                    continue
-                }
-            }
-
-            val pType = if (st.userId > 0L) presenceMap[st.userId] else null
-            if (pType != null) {
-                if (pType == 2) {
-                    st.presenceOfflineStrikes = 0
-                } else {
-                    st.presenceOfflineStrikes++
-                    if (st.presenceOfflineStrikes >= 2 && (now - st.lastHbMs) > 15_000L) {
-                        st.presenceOfflineStrikes = 0
-                        PilotCore.log("[REJOIN] ${acc.user} (${acc.pkg}) Roblox API status=$pType (not in-game) -> rejoining...")
-                        relaunch(c, acc.pkg, st)
-                        continue
+            if (cycle % 3 == 0) {
+                val cookie = SessionVault.extractCookie(slot.pkg)
+                if (cookie.isBlank()) {
+                    val (res, oldUser) = SessionVault.tryRestore(ctx, slot.pkg)
+                    when (res) {
+                        SessionVault.RestoreResult.RESTORED -> {
+                            slot.username = oldUser
+                            slot.status = "ACTIVE"
+                            queueStaggeredLaunch(ctx, slot, "Vault restored")
+                        }
+                        SessionVault.RestoreResult.REVOKED -> {
+                            slot.status = "REVOKED"
+                            PilotCore.onAlert?.invoke("🔒 Session Revoked", "**$oldUser** (`${slot.pkg}`) password changed or signed out.")
+                        }
+                        SessionVault.RestoreResult.NO_BACKUP -> slot.status = "LOGGED_OUT"
                     }
+                    continue
+                } else if (slot.username.isNotBlank() && cycle % 30 == 0) {
+                    SessionVault.snapshot(ctx, slot.pkg, slot.username)
+                }
+            }
+
+            val pid = SuShell.exec("pidof ${slot.pkg}").trim()
+            if (pid.isBlank()) {
+                if (now - slot.lastLaunchMs > 30_000L && slot.status != "LOGGED_OUT" && slot.status != "EMPTY" && slot.status != "REVOKED") {
+                    slot.status = "OFFLINE"
+                    queueStaggeredLaunch(ctx, slot, "Process closed")
+                }
+                continue
+            }
+
+            val sinceLaunch = now - slot.lastLaunchMs
+            val sincePing = if (slot.lastPingMs == 0L) sinceLaunch else (now - slot.lastPingMs)
+            if (sinceLaunch > cfg.pingTimeoutSec * 1000L && sincePing > cfg.pingTimeoutSec * 1000L) {
+                if (isDeltaKeyMissingOnScreen()) {
+                    slot.status = "NO_DELTA_KEY"
+                    PilotCore.log("[REJOINER] ${slot.pkg} alive with no ping -> NO DELTA KEY")
+                    if (cfg.autoGetDeltaKey && !KeyAutomator.isRunning()) {
+                        PilotCore.onAlert?.invoke("🔑 Delta Key Missing", "Detected missing Delta key on `${slot.pkg}` — starting Auto Get Delta Key...")
+                        KeyAutomator.startDeltaRenewal(ctx)
+                    }
+                } else {
+                    slot.status = "FROZEN"
+                    PilotCore.log("[REJOINER] ${slot.pkg} stopped pinging (frozen) -> restarting")
+                    queueStaggeredLaunch(ctx, slot, "Frozen / no executor ping")
                 }
             }
         }
     }
 
-    private fun fetchRobloxPresences(userIds: List<Long>): Map<Long, Int> {
-        val out = HashMap<Long, Int>()
-        runCatching {
-            val arr = JSONArray()
-            userIds.take(50).forEach { arr.put(it) }
-            val payload = JSONObject().put("userIds", arr).toString()
-            val req = Request.Builder()
-                .url("https://presence.roblox.com/v1/presence/users")
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .post(payload.toRequestBody("application/json".toMediaType()))
-                .build()
-            apiHttp.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use
-                val body = resp.body?.string() ?: return@use
-                val list = JSONObject(body).optJSONArray("userPresences") ?: return@use
-                for (i in 0 until list.length()) {
-                    val item = list.getJSONObject(i)
-                    val uid = item.optLong("userId", 0L)
-                    val pType = item.optInt("userPresenceType", -1)
-                    if (uid > 0L && pType >= 0) out[uid] = pType
-                }
-            }
-        }
-        return out
+    private fun isDeltaKeyMissingOnScreen(): Boolean {
+        SuShell.exec("uiautomator dump /sdcard/pilot_ui.xml >/dev/null 2>&1")
+        val xml = SuShell.exec("cat /sdcard/pilot_ui.xml 2>/dev/null").lowercase()
+        return xml.contains("receive key") || xml.contains("enter key") || xml.contains("delta key")
     }
 
-    fun buildLaunchUri(c: Context, pkg: String, st: RejoinState?): String {
-        val customTarget = getTarget(c).trim()
-        if (customTarget.isNotEmpty()) {
-            if (customTarget.startsWith("roblox://", ignoreCase = true)) return customTarget
-            val codeMatch = Regex("""(?:privateServerLinkCode=|code=)([a-zA-Z0-9_-]+)""").find(customTarget)
-            val placeMatch = Regex("""(?:games/|placeId=)(\d+)""").find(customTarget)
-            val pid = placeMatch?.groupValues?.get(1)?.toLongOrNull()
-                ?: customTarget.toLongOrNull()
-                ?: st?.placeId?.takeIf { it > 0L }
-                ?: getSavedPlaceId(c, pkg)
-            if (pid > 0L && codeMatch != null) {
-                return "roblox://placeId=$pid&linkCode=${codeMatch.groupValues[1]}"
-            }
-            if (pid > 0L) return "roblox://placeId=$pid"
-        }
+    fun queueStaggeredLaunch(ctx: Context, slot: CloneSlot, reason: String) {
+        launchExec.execute {
+            val cfg = loadConfig(ctx)
+            PilotCore.log("[REJOINER] Launching ${slot.pkg} ($reason)")
+            SuShell.exec("am force-stop ${slot.pkg}")
+            Thread.sleep(1200)
 
-        val lastPid = st?.placeId?.takeIf { it > 0L } ?: getSavedPlaceId(c, pkg)
-        return if (lastPid > 0L) "roblox://placeId=$lastPid" else ""
+            val deepLink = buildLaunchUri(cfg, slot)
+            if (deepLink.isNotBlank()) {
+                SuShell.exec("am start -p ${slot.pkg} -a android.intent.action.VIEW -d '$deepLink' >/dev/null 2>&1")
+            } else {
+                SuShell.exec("monkey -p ${slot.pkg} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")
+            }
+            slot.lastLaunchMs = System.currentTimeMillis()
+            slot.lastPingMs = 0L
+            Thread.sleep((cfg.staggerDelaySec.coerceIn(5, 30)) * 1000L)
+        }
     }
 
-    @Synchronized
-    fun relaunch(c: Context, pkg: String, st: RejoinState? = null) {
-        val state = st ?: states.computeIfAbsent(pkg) { RejoinState(pkg) }
-        state.lastRelaunchMs = System.currentTimeMillis()
-        state.lastHbMs = 0L
-        state.lastFrame = -1L
-        state.lastFrameAdvanceMs = 0L
-        state.presenceOfflineStrikes = 0
+    fun killAllAndStaggeredRejoin(ctx: Context, reason: String = "Manual rejoin") {
+        val list = discoverClones()
+        PilotCore.log("[REJOINER] Killing all ${list.size} clones ($reason)...")
+        list.forEach { SuShell.exec("am force-stop ${it.pkg}") }
+        list.filter { !it.paused && it.status != "LOGGED_OUT" && it.status != "REVOKED" && it.status != "EMPTY" }
+            .forEach { queueStaggeredLaunch(ctx, it, reason) }
+    }
 
-        val uri = buildLaunchUri(c, pkg, state)
-        val cmd = if (uri.isNotEmpty()) {
-            "am force-stop $pkg && sleep 1 && am start -a android.intent.action.VIEW -d '$uri' -p $pkg >/dev/null 2>&1"
-        } else {
-            "am force-stop $pkg && sleep 1 && monkey -p $pkg -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1"
+    private fun buildLaunchUri(cfg: RejoinConfig, slot: CloneSlot): String {
+        val vips = cfg.privateServerLinks.split(",", "\n").map { it.trim() }.filter { it.isNotBlank() }
+        if (vips.isNotEmpty()) {
+            val pick = vips[vipIndex++ % vips.size]
+            if (pick.startsWith("http", true)) return pick
         }
-        SuShell.exec(cmd)
+        val pid = cfg.targetPlaceId.ifBlank { slot.placeId }
+        return if (pid.all { it.isDigit() } && pid.isNotBlank()) {
+            "roblox://experiences/start?placeId=$pid"
+        } else ""
+    }
+
+    /** Writes Pilot's auto-execute Lua bridge into Delta/Autoexecute/. */
+    fun deployBridgeLua(ctx: Context, cfg: RejoinConfig) {
+        val lua = """
+            -- Pilot v1.4.0 Bridge (Auto-Ping + Blacklist Detection + FPS Optimizer + Anti-AFK + PilotSnap)
+            if getgenv().__PILOT_BRIDGE_V14 then return end
+            getgenv().__PILOT_BRIDGE_V14 = true
+
+            local Players = game:GetService("Players")
+            local RunService = game:GetService("RunService")
+            local GuiService = game:GetService("GuiService")
+            local VirtualUser = game:GetService("VirtualUser")
+            local Lighting = game:GetService("Lighting")
+            local HttpService = game:GetService("HttpService")
+            local CoreGui = game:GetService("CoreGui")
+
+            local req = (syn and syn.request) or http_request or request
+            if not req then return end
+
+            repeat task.wait(0.5) until Players.LocalPlayer
+            local lp = Players.LocalPlayer
+
+            local function enc(s) return HttpService:UrlEncode(tostring(s or "")) end
+
+            getgenv().PilotSnap = function()
+                pcall(function()
+                    req({ Url = "http://127.0.0.1:8765/ss?user=" .. enc(lp.Name), Method = "GET" })
+                end)
+            end
+
+            -- Anti-AFK (prevents Error 278 idle kicks)
+            lp.Idled:Connect(function()
+                pcall(function()
+                    VirtualUser:CaptureController()
+                    VirtualUser:ClickButton2(Vector2.new())
+                end)
+            end)
+
+            -- FPS Optimizer (ON by default)
+            local fpsApplied = false
+            local function applyFpsBoost()
+                if fpsApplied then return end
+                fpsApplied = true
+                pcall(function()
+                    settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+                    Lighting.GlobalShadows = false
+                    Lighting.FogEnd = 9e9
+                    Lighting.Brightness = 1
+                    for _, v in ipairs(Lighting:GetChildren()) do
+                        if v:IsA("PostEffect") or v:IsA("Atmosphere") then v.Enabled = false end
+                    end
+                    for _, d in ipairs(workspace:GetDescendants()) do
+                        if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") then
+                            d.Enabled = false
+                        elseif d:IsA("BasePart") then
+                            d.CastShadow = false
+                        end
+                    end
+                end)
+            end
+            if ${cfg.fpsOptimization} then applyFpsBoost() end
+
+            -- Disconnect / Blacklisted Key Hook
+            local function checkAuthMessage(msg)
+                local low = string.lower(tostring(msg or ""))
+                if string.find(low, "blacklisted") or string.find(low, "key has been banned") or string.find(low, "invalid key") or string.find(low, "key expired") then
+                    pcall(function()
+                        req({ Url = "http://127.0.0.1:8765/keyerr?user=" .. enc(lp.Name) .. "&reason=" .. enc(msg), Method = "GET" })
+                    end)
+                end
+            end
+
+            GuiService.ErrorMessageChanged:Connect(function(msg)
+                local code = ""
+                pcall(function() code = tostring(GuiService:GetErrorCode().Value) end)
+                checkAuthMessage(msg)
+                pcall(function()
+                    req({ Url = "http://127.0.0.1:8765/kick?user=" .. enc(lp.Name) .. "&code=" .. enc(code) .. "&msg=" .. enc(msg), Method = "GET" })
+                end)
+            end)
+
+            -- Watch CoreGui / RobloxPromptGui for Nousigi Authenticate System blacklisted popup
+            task.spawn(function()
+                while true do
+                    pcall(function()
+                        local pg = CoreGui:FindFirstChild("RobloxPromptGui")
+                        if pg then
+                            for _, obj in ipairs(pg:GetDescendants()) do
+                                if obj:IsA("TextLabel") and obj.Text ~= "" then
+                                    checkAuthMessage(obj.Text)
+                                end
+                            end
+                        end
+                    end)
+                    task.wait(6)
+                end
+            end)
+
+            -- FPS sampler + /ping heartbeat every 8s
+            local frames = 0
+            RunService.RenderStepped:Connect(function() frames += 1 end)
+
+            task.spawn(function()
+                while true do
+                    local fps = math.floor(frames / 8)
+                    frames = 0
+                    local ok, res = pcall(function()
+                        return req({
+                            Url = "http://127.0.0.1:8765/ping?user=" .. enc(lp.Name) .. "&placeId=" .. enc(game.PlaceId) .. "&fps=" .. fps,
+                            Method = "GET"
+                        })
+                    end)
+                    if ok and res and res.Body then
+                        pcall(function()
+                            local data = HttpService:JSONDecode(res.Body)
+                            if data.fpsOpt then applyFpsBoost() end
+                            pcall(function() RunService:Set3dRenderingEnabled(not data.render3dOff) end)
+                        end)
+                    end
+                    task.wait(8)
+                end
+            end)
+        """.trimIndent()
+
+        val tmp = File(ctx.cacheDir, "pilot_bridge.lua")
+        FileOutputStream(tmp).use { it.write(lua.toByteArray(Charsets.UTF_8)) }
+        SuShell.exec(
+            "for d in /storage/emulated/0/Delta/Autoexecute /storage/emulated/0/Delta/AutoExcecute; do " +
+            "mkdir -p \"${'$'}d\" && cp '${tmp.absolutePath}' \"${'$'}d/pilot_bridge.lua\" && chmod 666 \"${'$'}d/pilot_bridge.lua\"; " +
+            "done"
+        )
+        tmp.delete()
     }
 }
